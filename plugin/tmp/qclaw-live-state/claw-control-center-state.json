@@ -1,0 +1,1224 @@
+{
+  "sessions": {
+    "agent:main:dashboard:4d7dd9c9-56d5-4743-a5d4-c481ca85e767": {
+      "session": {
+        "id": "agent:main:dashboard:4d7dd9c9-56d5-4743-a5d4-c481ca85e767",
+        "title": "Codex event probe",
+        "status": "completed",
+        "hostKind": "qclaw",
+        "runnerCommand": "openclaw-gateway",
+        "createdAt": "2026-05-19T03:45:35.984Z",
+        "updatedAt": "2026-05-19T03:45:44.423Z",
+        "lastEventSeq": 0
+      },
+      "messages": [],
+      "events": []
+    },
+    "agent:main:dashboard:d7a6ca7a-4232-4339-84f2-4353c8f65d40": {
+      "session": {
+        "id": "agent:main:dashboard:d7a6ca7a-4232-4339-84f2-4353c8f65d40",
+        "title": "Codex test session",
+        "status": "completed",
+        "hostKind": "qclaw",
+        "runnerCommand": "openclaw-gateway",
+        "createdAt": "2026-05-19T03:45:21.777Z",
+        "updatedAt": "2026-05-19T03:45:26.813Z",
+        "lastEventSeq": 0
+      },
+      "messages": [],
+      "events": []
+    },
+    "agent:main:session-1779094791865-0bcy89:heartbeat": {
+      "session": {
+        "id": "agent:main:session-1779094791865-0bcy89:heartbeat",
+        "title": "agent:main:session-1779094791865-0bcy89:heartbeat",
+        "status": "completed",
+        "hostKind": "qclaw",
+        "runnerCommand": "openclaw-gateway",
+        "createdAt": "2026-05-18T09:47:45.039Z",
+        "updatedAt": "2026-05-18T09:47:57.472Z",
+        "lastEventSeq": 0
+      },
+      "messages": [],
+      "events": []
+    },
+    "agent:main:session-1779094791865-0bcy89": {
+      "session": {
+        "id": "agent:main:session-1779094791865-0bcy89",
+        "title": "npm install @53ai/53ai-opencla... [0bcy89]",
+        "status": "completed",
+        "hostKind": "qclaw",
+        "runnerCommand": "openclaw-gateway",
+        "createdAt": "2026-05-18T09:39:46.794Z",
+        "updatedAt": "2026-05-18T09:47:25.943Z",
+        "lastEventSeq": 0
+      },
+      "messages": [],
+      "events": []
+    },
+    "agent:main:53aihub:group:12345678": {
+      "session": {
+        "id": "agent:main:53aihub:group:12345678",
+        "title": "53aihub:g-12345678",
+        "status": "idle",
+        "hostKind": "qclaw",
+        "runnerCommand": "openclaw-gateway",
+        "createdAt": "2026-05-18T09:17:35.080Z",
+        "updatedAt": "2026-05-18T09:17:35.080Z",
+        "lastEventSeq": 0
+      },
+      "messages": [],
+      "events": []
+    },
+    "agent:main:53aihub:group:1": {
+      "session": {
+        "id": "agent:main:53aihub:group:1",
+        "title": "53aihub:g-1",
+        "status": "idle",
+        "hostKind": "qclaw",
+        "runnerCommand": "openclaw-gateway",
+        "createdAt": "2026-05-18T09:16:45.860Z",
+        "updatedAt": "2026-05-18T09:16:45.860Z",
+        "lastEventSeq": 0
+      },
+      "messages": [],
+      "events": []
+    },
+    "agent:main:53aihub:group:test": {
+      "session": {
+        "id": "agent:main:53aihub:group:test",
+        "title": "53aihub:g-test",
+        "status": "idle",
+        "hostKind": "qclaw",
+        "runnerCommand": "openclaw-gateway",
+        "createdAt": "2026-05-18T09:13:34.809Z",
+        "updatedAt": "2026-05-18T09:13:34.809Z",
+        "lastEventSeq": 0
+      },
+      "messages": [],
+      "events": []
+    },
+    "agent:main:session-1779089037009-jk1bu5:heartbeat": {
+      "session": {
+        "id": "agent:main:session-1779089037009-jk1bu5:heartbeat",
+        "title": "agent:main:session-1779089037009-jk1bu5:heartbeat",
+        "status": "completed",
+        "hostKind": "qclaw",
+        "runnerCommand": "openclaw-gateway",
+        "createdAt": "2026-05-18T08:43:39.165Z",
+        "updatedAt": "2026-05-18T08:43:57.543Z",
+        "lastEventSeq": 0
+      },
+      "messages": [],
+      "events": []
+    },
+    "agent:main:session-1779089037009-jk1bu5": {
+      "session": {
+        "id": "agent:main:session-1779089037009-jk1bu5",
+        "title": "应用配置\n接入配置\nBot ID\neWI6l8\nSecret... [jk1bu5]",
+        "status": "running",
+        "hostKind": "qclaw",
+        "runnerCommand": "openclaw-gateway",
+        "createdAt": "2026-05-18T08:29:39.811Z",
+        "updatedAt": "2026-05-18T08:43:31.730Z",
+        "lastEventSeq": 0
+      },
+      "messages": [],
+      "events": []
+    },
+    "agent:main:openclaw-weixin:direct:o9cq804dr5zoo52kn3ofcziejzwg@im.wechat": {
+      "session": {
+        "id": "agent:main:openclaw-weixin:direct:o9cq804dr5zoo52kn3ofcziejzwg@im.wechat",
+        "title": "o9cq804Dr5zOo52KN3ofCZIEjzWg@im.wechat",
+        "status": "completed",
+        "hostKind": "qclaw",
+        "runnerCommand": "openclaw-gateway",
+        "createdAt": "2026-05-18T07:43:38.305Z",
+        "updatedAt": "2026-05-18T07:44:31.517Z",
+        "lastEventSeq": 0
+      },
+      "messages": [],
+      "events": []
+    },
+    "agent:main:main": {
+      "session": {
+        "id": "agent:main:main",
+        "title": "请解释什么是skill？说明如何安装skill？ [n:main]",
+        "status": "idle",
+        "hostKind": "qclaw",
+        "runnerCommand": "openclaw-gateway",
+        "createdAt": "2026-05-18T07:43:34.906Z",
+        "updatedAt": "2026-05-18T07:43:34.906Z",
+        "lastEventSeq": 0
+      },
+      "messages": [],
+      "events": []
+    },
+    "agent:main:dashboard:da4c535e-5fd6-4a5e-9519-0d6d7509f285": {
+      "session": {
+        "id": "agent:main:dashboard:da4c535e-5fd6-4a5e-9519-0d6d7509f285",
+        "title": "Live gateway validation",
+        "status": "completed",
+        "hostKind": "qclaw",
+        "runnerCommand": "openclaw-gateway",
+        "createdAt": "2026-05-19T04:00:17.185Z",
+        "updatedAt": "2026-05-19T04:00:20.117Z",
+        "lastEventSeq": 0
+      },
+      "messages": [
+        {
+          "id": "user-7161150e-9435-411a-859a-18fbb5aa66c2",
+          "sessionId": "agent:main:dashboard:da4c535e-5fd6-4a5e-9519-0d6d7509f285",
+          "role": "user",
+          "content": "Say hello in one short sentence.",
+          "createdAt": "2026-05-19T04:00:16.801Z"
+        },
+        {
+          "id": "assistant-2",
+          "sessionId": "agent:main:dashboard:da4c535e-5fd6-4a5e-9519-0d6d7509f285",
+          "role": "assistant",
+          "content": "Hello from QClaw! 🐾",
+          "createdAt": "2026-05-19T04:00:17.203Z"
+        },
+        {
+          "id": "assistant-8",
+          "sessionId": "agent:main:dashboard:da4c535e-5fd6-4a5e-9519-0d6d7509f285",
+          "role": "assistant",
+          "content": "Hello from QClaw! 🐾",
+          "createdAt": "2026-05-19T04:00:19.980Z"
+        }
+      ],
+      "events": [
+        {
+          "id": "agent:main:dashboard:da4c535e-5fd6-4a5e-9519-0d6d7509f285:status:1",
+          "sessionId": "agent:main:dashboard:da4c535e-5fd6-4a5e-9519-0d6d7509f285",
+          "seq": 1,
+          "kind": "status.update",
+          "payload": {
+            "sessionKey": "agent:main:dashboard:da4c535e-5fd6-4a5e-9519-0d6d7509f285",
+            "reason": "create",
+            "ts": 1779163216801,
+            "updatedAt": 1779163216761,
+            "sessionId": "d78710c8-6fba-48fd-9e22-893c4437b505",
+            "kind": "direct",
+            "label": "Live gateway validation",
+            "displayName": "Live gateway validation",
+            "totalTokensFresh": false,
+            "contextTokens": 200000,
+            "modelProvider": "qclaw",
+            "model": "modelroute"
+          },
+          "createdAt": "2026-05-19T04:00:16.761Z"
+        },
+        {
+          "id": "agent:main:dashboard:da4c535e-5fd6-4a5e-9519-0d6d7509f285:status:2",
+          "sessionId": "agent:main:dashboard:da4c535e-5fd6-4a5e-9519-0d6d7509f285",
+          "seq": 2,
+          "kind": "status.update",
+          "payload": {
+            "sessionKey": "agent:main:dashboard:da4c535e-5fd6-4a5e-9519-0d6d7509f285",
+            "phase": "message",
+            "ts": 1779163216814,
+            "messageSeq": 0,
+            "session": {
+              "key": "agent:main:dashboard:da4c535e-5fd6-4a5e-9519-0d6d7509f285",
+              "kind": "direct",
+              "label": "Live gateway validation",
+              "displayName": "Live gateway validation",
+              "updatedAt": 1779163216761,
+              "sessionId": "d78710c8-6fba-48fd-9e22-893c4437b505",
+              "totalTokensFresh": false,
+              "modelProvider": "qclaw",
+              "model": "modelroute",
+              "contextTokens": 200000
+            },
+            "updatedAt": 1779163216761,
+            "sessionId": "d78710c8-6fba-48fd-9e22-893c4437b505",
+            "kind": "direct",
+            "label": "Live gateway validation",
+            "displayName": "Live gateway validation",
+            "totalTokensFresh": false,
+            "contextTokens": 200000,
+            "modelProvider": "qclaw",
+            "model": "modelroute"
+          },
+          "createdAt": "2026-05-19T04:00:16.761Z"
+        },
+        {
+          "id": "agent:main:dashboard:da4c535e-5fd6-4a5e-9519-0d6d7509f285:status:3",
+          "sessionId": "agent:main:dashboard:da4c535e-5fd6-4a5e-9519-0d6d7509f285",
+          "seq": 3,
+          "kind": "run.started",
+          "payload": {
+            "sessionKey": "agent:main:dashboard:da4c535e-5fd6-4a5e-9519-0d6d7509f285",
+            "phase": "start",
+            "runId": "1122b36e-31cc-4120-be39-e068772499d6",
+            "ts": 1779163217185,
+            "session": {
+              "key": "agent:main:dashboard:da4c535e-5fd6-4a5e-9519-0d6d7509f285",
+              "kind": "direct",
+              "label": "Live gateway validation",
+              "displayName": "Live gateway validation",
+              "chatType": "direct",
+              "origin": {
+                "label": "Claw Control Center",
+                "provider": "webchat",
+                "surface": "webchat",
+                "chatType": "direct"
+              },
+              "updatedAt": 1779163217185,
+              "sessionId": "d78710c8-6fba-48fd-9e22-893c4437b505",
+              "systemSent": true,
+              "abortedLastRun": false,
+              "totalTokensFresh": false,
+              "status": "running",
+              "startedAt": 1779163217185,
+              "modelProvider": "qclaw",
+              "model": "modelroute",
+              "contextTokens": 200000,
+              "deliveryContext": {
+                "channel": "webchat"
+              },
+              "lastChannel": "webchat"
+            },
+            "updatedAt": 1779163217185,
+            "sessionId": "d78710c8-6fba-48fd-9e22-893c4437b505",
+            "kind": "direct",
+            "chatType": "direct",
+            "origin": {
+              "label": "Claw Control Center",
+              "provider": "webchat",
+              "surface": "webchat",
+              "chatType": "direct"
+            },
+            "label": "Live gateway validation",
+            "displayName": "Live gateway validation",
+            "deliveryContext": {
+              "channel": "webchat"
+            },
+            "systemSent": true,
+            "lastChannel": "webchat",
+            "totalTokensFresh": false,
+            "contextTokens": 200000,
+            "modelProvider": "qclaw",
+            "model": "modelroute",
+            "status": "running",
+            "startedAt": 1779163217185,
+            "abortedLastRun": false
+          },
+          "createdAt": "2026-05-19T04:00:17.185Z"
+        },
+        {
+          "id": "agent:main:dashboard:da4c535e-5fd6-4a5e-9519-0d6d7509f285:status:4",
+          "sessionId": "agent:main:dashboard:da4c535e-5fd6-4a5e-9519-0d6d7509f285",
+          "seq": 4,
+          "kind": "status.update",
+          "payload": {
+            "sessionKey": "agent:main:dashboard:da4c535e-5fd6-4a5e-9519-0d6d7509f285",
+            "phase": "message",
+            "ts": 1779163217198,
+            "messageId": "3c6b2b7d",
+            "messageSeq": 0,
+            "session": {
+              "key": "agent:main:dashboard:da4c535e-5fd6-4a5e-9519-0d6d7509f285",
+              "kind": "direct",
+              "label": "Live gateway validation",
+              "displayName": "Live gateway validation",
+              "chatType": "direct",
+              "origin": {
+                "label": "Claw Control Center",
+                "provider": "webchat",
+                "surface": "webchat",
+                "chatType": "direct"
+              },
+              "updatedAt": 1779163216930,
+              "sessionId": "d78710c8-6fba-48fd-9e22-893c4437b505",
+              "systemSent": true,
+              "abortedLastRun": false,
+              "totalTokensFresh": false,
+              "modelProvider": "qclaw",
+              "model": "modelroute",
+              "contextTokens": 200000,
+              "deliveryContext": {
+                "channel": "webchat"
+              },
+              "lastChannel": "webchat"
+            },
+            "updatedAt": 1779163216930,
+            "sessionId": "d78710c8-6fba-48fd-9e22-893c4437b505",
+            "kind": "direct",
+            "chatType": "direct",
+            "origin": {
+              "label": "Claw Control Center",
+              "provider": "webchat",
+              "surface": "webchat",
+              "chatType": "direct"
+            },
+            "label": "Live gateway validation",
+            "displayName": "Live gateway validation",
+            "deliveryContext": {
+              "channel": "webchat"
+            },
+            "systemSent": true,
+            "abortedLastRun": false,
+            "lastChannel": "webchat",
+            "totalTokensFresh": false,
+            "contextTokens": 200000,
+            "modelProvider": "qclaw",
+            "model": "modelroute"
+          },
+          "createdAt": "2026-05-19T04:00:16.930Z"
+        },
+        {
+          "id": "agent:main:dashboard:da4c535e-5fd6-4a5e-9519-0d6d7509f285:chat:5",
+          "sessionId": "agent:main:dashboard:da4c535e-5fd6-4a5e-9519-0d6d7509f285",
+          "seq": 5,
+          "kind": "assistant.delta",
+          "payload": {
+            "content": "Hello from QCl",
+            "state": "delta",
+            "runId": "1122b36e-31cc-4120-be39-e068772499d6"
+          },
+          "createdAt": "2026-05-19T04:00:19.589Z"
+        },
+        {
+          "id": "agent:main:dashboard:da4c535e-5fd6-4a5e-9519-0d6d7509f285:chat:7",
+          "sessionId": "agent:main:dashboard:da4c535e-5fd6-4a5e-9519-0d6d7509f285",
+          "seq": 7,
+          "kind": "assistant.delta",
+          "payload": {
+            "content": "Hello from QClaw! 🐾",
+            "state": "delta",
+            "runId": "1122b36e-31cc-4120-be39-e068772499d6"
+          },
+          "createdAt": "2026-05-19T04:00:19.816Z"
+        },
+        {
+          "id": "agent:main:dashboard:da4c535e-5fd6-4a5e-9519-0d6d7509f285:status:8",
+          "sessionId": "agent:main:dashboard:da4c535e-5fd6-4a5e-9519-0d6d7509f285",
+          "seq": 8,
+          "kind": "status.update",
+          "payload": {
+            "sessionKey": "agent:main:dashboard:da4c535e-5fd6-4a5e-9519-0d6d7509f285",
+            "phase": "message",
+            "ts": 1779163219980,
+            "messageId": "db7ac14c",
+            "messageSeq": 2,
+            "session": {
+              "key": "agent:main:dashboard:da4c535e-5fd6-4a5e-9519-0d6d7509f285",
+              "kind": "direct",
+              "label": "Live gateway validation",
+              "displayName": "Live gateway validation",
+              "chatType": "direct",
+              "origin": {
+                "label": "Claw Control Center",
+                "provider": "webchat",
+                "surface": "webchat",
+                "chatType": "direct"
+              },
+              "updatedAt": 1779163217211,
+              "sessionId": "d78710c8-6fba-48fd-9e22-893c4437b505",
+              "systemSent": true,
+              "abortedLastRun": false,
+              "totalTokensFresh": false,
+              "estimatedCostUsd": 0,
+              "status": "running",
+              "startedAt": 1779163217185,
+              "modelProvider": "qclaw",
+              "model": "modelroute",
+              "contextTokens": 200000,
+              "deliveryContext": {
+                "channel": "webchat"
+              },
+              "lastChannel": "webchat"
+            },
+            "updatedAt": 1779163217211,
+            "sessionId": "d78710c8-6fba-48fd-9e22-893c4437b505",
+            "kind": "direct",
+            "chatType": "direct",
+            "origin": {
+              "label": "Claw Control Center",
+              "provider": "webchat",
+              "surface": "webchat",
+              "chatType": "direct"
+            },
+            "label": "Live gateway validation",
+            "displayName": "Live gateway validation",
+            "deliveryContext": {
+              "channel": "webchat"
+            },
+            "systemSent": true,
+            "abortedLastRun": false,
+            "lastChannel": "webchat",
+            "totalTokensFresh": false,
+            "contextTokens": 200000,
+            "estimatedCostUsd": 0,
+            "modelProvider": "qclaw",
+            "model": "modelroute",
+            "status": "running",
+            "startedAt": 1779163217185
+          },
+          "createdAt": "2026-05-19T04:00:17.211Z"
+        },
+        {
+          "id": "agent:main:dashboard:da4c535e-5fd6-4a5e-9519-0d6d7509f285:status:9",
+          "sessionId": "agent:main:dashboard:da4c535e-5fd6-4a5e-9519-0d6d7509f285",
+          "seq": 9,
+          "kind": "run.completed",
+          "payload": {
+            "sessionKey": "agent:main:dashboard:da4c535e-5fd6-4a5e-9519-0d6d7509f285",
+            "phase": "end",
+            "runId": "1122b36e-31cc-4120-be39-e068772499d6",
+            "ts": 1779163219980,
+            "session": {
+              "key": "agent:main:dashboard:da4c535e-5fd6-4a5e-9519-0d6d7509f285",
+              "kind": "direct",
+              "label": "Live gateway validation",
+              "displayName": "Live gateway validation",
+              "chatType": "direct",
+              "origin": {
+                "label": "Claw Control Center",
+                "provider": "webchat",
+                "surface": "webchat",
+                "chatType": "direct"
+              },
+              "updatedAt": 1779163219980,
+              "sessionId": "d78710c8-6fba-48fd-9e22-893c4437b505",
+              "systemSent": true,
+              "abortedLastRun": false,
+              "totalTokensFresh": false,
+              "estimatedCostUsd": 0,
+              "status": "done",
+              "startedAt": 1779163217185,
+              "endedAt": 1779163219980,
+              "runtimeMs": 2795,
+              "modelProvider": "qclaw",
+              "model": "modelroute",
+              "contextTokens": 200000,
+              "deliveryContext": {
+                "channel": "webchat"
+              },
+              "lastChannel": "webchat"
+            },
+            "updatedAt": 1779163219980,
+            "sessionId": "d78710c8-6fba-48fd-9e22-893c4437b505",
+            "kind": "direct",
+            "chatType": "direct",
+            "origin": {
+              "label": "Claw Control Center",
+              "provider": "webchat",
+              "surface": "webchat",
+              "chatType": "direct"
+            },
+            "label": "Live gateway validation",
+            "displayName": "Live gateway validation",
+            "deliveryContext": {
+              "channel": "webchat"
+            },
+            "systemSent": true,
+            "lastChannel": "webchat",
+            "totalTokensFresh": false,
+            "contextTokens": 200000,
+            "estimatedCostUsd": 0,
+            "modelProvider": "qclaw",
+            "model": "modelroute",
+            "status": "done",
+            "startedAt": 1779163217185,
+            "endedAt": 1779163219980,
+            "runtimeMs": 2795,
+            "abortedLastRun": false
+          },
+          "createdAt": "2026-05-19T04:00:19.980Z"
+        }
+      ]
+    },
+    "agent:main:dashboard:e5176c85-efdc-4943-9e0c-214d95607fa6": {
+      "session": {
+        "id": "agent:main:dashboard:e5176c85-efdc-4943-9e0c-214d95607fa6",
+        "title": "Live gateway validation 2",
+        "status": "completed",
+        "hostKind": "qclaw",
+        "runnerCommand": "openclaw-gateway",
+        "createdAt": "2026-05-19T04:01:30.238Z",
+        "updatedAt": "2026-05-19T04:01:35.995Z",
+        "lastEventSeq": 5
+      },
+      "messages": [
+        {
+          "id": "user-545a4cc1-a89a-4cf4-9065-8a96d2ea0137",
+          "sessionId": "agent:main:dashboard:e5176c85-efdc-4943-9e0c-214d95607fa6",
+          "role": "user",
+          "content": "Say hello in one short sentence.",
+          "createdAt": "2026-05-19T04:01:30.244Z"
+        },
+        {
+          "id": "assistant-2",
+          "sessionId": "agent:main:dashboard:e5176c85-efdc-4943-9e0c-214d95607fa6",
+          "role": "assistant",
+          "content": "Hello! Nice to have you here.",
+          "createdAt": "2026-05-19T04:01:30.638Z"
+        }
+      ],
+      "events": [
+        {
+          "id": "agent:main:dashboard:e5176c85-efdc-4943-9e0c-214d95607fa6:status:1",
+          "sessionId": "agent:main:dashboard:e5176c85-efdc-4943-9e0c-214d95607fa6",
+          "seq": 1,
+          "kind": "status.update",
+          "payload": {
+            "sessionKey": "agent:main:dashboard:e5176c85-efdc-4943-9e0c-214d95607fa6",
+            "phase": "message",
+            "ts": 1779163290256,
+            "messageSeq": 0,
+            "session": {
+              "key": "agent:main:dashboard:e5176c85-efdc-4943-9e0c-214d95607fa6",
+              "kind": "direct",
+              "label": "Live gateway validation 2",
+              "displayName": "Live gateway validation 2",
+              "updatedAt": 1779163290197,
+              "sessionId": "d0261396-7c67-4c4c-8e2a-5f9f7782e2ca",
+              "totalTokensFresh": false,
+              "modelProvider": "qclaw",
+              "model": "modelroute",
+              "contextTokens": 200000
+            },
+            "updatedAt": 1779163290197,
+            "sessionId": "d0261396-7c67-4c4c-8e2a-5f9f7782e2ca",
+            "kind": "direct",
+            "label": "Live gateway validation 2",
+            "displayName": "Live gateway validation 2",
+            "totalTokensFresh": false,
+            "contextTokens": 200000,
+            "modelProvider": "qclaw",
+            "model": "modelroute"
+          },
+          "createdAt": "2026-05-19T04:01:30.197Z"
+        },
+        {
+          "id": "agent:main:dashboard:e5176c85-efdc-4943-9e0c-214d95607fa6:status:2",
+          "sessionId": "agent:main:dashboard:e5176c85-efdc-4943-9e0c-214d95607fa6",
+          "seq": 2,
+          "kind": "run.started",
+          "payload": {
+            "sessionKey": "agent:main:dashboard:e5176c85-efdc-4943-9e0c-214d95607fa6",
+            "phase": "start",
+            "runId": "d0e0baa7-b9ff-44b4-ac51-c6a75e80cdee",
+            "ts": 1779163290626,
+            "session": {
+              "key": "agent:main:dashboard:e5176c85-efdc-4943-9e0c-214d95607fa6",
+              "kind": "direct",
+              "label": "Live gateway validation 2",
+              "displayName": "Live gateway validation 2",
+              "chatType": "direct",
+              "origin": {
+                "label": "Claw Control Center",
+                "provider": "webchat",
+                "surface": "webchat",
+                "chatType": "direct"
+              },
+              "updatedAt": 1779163290626,
+              "sessionId": "d0261396-7c67-4c4c-8e2a-5f9f7782e2ca",
+              "systemSent": true,
+              "abortedLastRun": false,
+              "totalTokensFresh": false,
+              "status": "running",
+              "startedAt": 1779163290626,
+              "modelProvider": "qclaw",
+              "model": "modelroute",
+              "contextTokens": 200000,
+              "deliveryContext": {
+                "channel": "webchat"
+              },
+              "lastChannel": "webchat"
+            },
+            "updatedAt": 1779163290626,
+            "sessionId": "d0261396-7c67-4c4c-8e2a-5f9f7782e2ca",
+            "kind": "direct",
+            "chatType": "direct",
+            "origin": {
+              "label": "Claw Control Center",
+              "provider": "webchat",
+              "surface": "webchat",
+              "chatType": "direct"
+            },
+            "label": "Live gateway validation 2",
+            "displayName": "Live gateway validation 2",
+            "deliveryContext": {
+              "channel": "webchat"
+            },
+            "systemSent": true,
+            "lastChannel": "webchat",
+            "totalTokensFresh": false,
+            "contextTokens": 200000,
+            "modelProvider": "qclaw",
+            "model": "modelroute",
+            "status": "running",
+            "startedAt": 1779163290626,
+            "abortedLastRun": false
+          },
+          "createdAt": "2026-05-19T04:01:30.626Z"
+        },
+        {
+          "id": "agent:main:dashboard:e5176c85-efdc-4943-9e0c-214d95607fa6:status:3",
+          "sessionId": "agent:main:dashboard:e5176c85-efdc-4943-9e0c-214d95607fa6",
+          "seq": 3,
+          "kind": "status.update",
+          "payload": {
+            "sessionKey": "agent:main:dashboard:e5176c85-efdc-4943-9e0c-214d95607fa6",
+            "phase": "message",
+            "ts": 1779163290634,
+            "messageId": "043817ef",
+            "messageSeq": 0,
+            "session": {
+              "key": "agent:main:dashboard:e5176c85-efdc-4943-9e0c-214d95607fa6",
+              "kind": "direct",
+              "label": "Live gateway validation 2",
+              "displayName": "Live gateway validation 2",
+              "chatType": "direct",
+              "origin": {
+                "label": "Claw Control Center",
+                "provider": "webchat",
+                "surface": "webchat",
+                "chatType": "direct"
+              },
+              "updatedAt": 1779163290345,
+              "sessionId": "d0261396-7c67-4c4c-8e2a-5f9f7782e2ca",
+              "systemSent": true,
+              "abortedLastRun": false,
+              "totalTokensFresh": false,
+              "modelProvider": "qclaw",
+              "model": "modelroute",
+              "contextTokens": 200000,
+              "deliveryContext": {
+                "channel": "webchat"
+              },
+              "lastChannel": "webchat"
+            },
+            "updatedAt": 1779163290345,
+            "sessionId": "d0261396-7c67-4c4c-8e2a-5f9f7782e2ca",
+            "kind": "direct",
+            "chatType": "direct",
+            "origin": {
+              "label": "Claw Control Center",
+              "provider": "webchat",
+              "surface": "webchat",
+              "chatType": "direct"
+            },
+            "label": "Live gateway validation 2",
+            "displayName": "Live gateway validation 2",
+            "deliveryContext": {
+              "channel": "webchat"
+            },
+            "systemSent": true,
+            "abortedLastRun": false,
+            "lastChannel": "webchat",
+            "totalTokensFresh": false,
+            "contextTokens": 200000,
+            "modelProvider": "qclaw",
+            "model": "modelroute"
+          },
+          "createdAt": "2026-05-19T04:01:30.345Z"
+        },
+        {
+          "id": "agent:main:dashboard:e5176c85-efdc-4943-9e0c-214d95607fa6:status:4",
+          "sessionId": "agent:main:dashboard:e5176c85-efdc-4943-9e0c-214d95607fa6",
+          "seq": 4,
+          "kind": "status.update",
+          "payload": {
+            "sessionKey": "agent:main:dashboard:e5176c85-efdc-4943-9e0c-214d95607fa6",
+            "phase": "message",
+            "ts": 1779163295989,
+            "messageId": "e13d3eda",
+            "messageSeq": 2,
+            "session": {
+              "key": "agent:main:dashboard:e5176c85-efdc-4943-9e0c-214d95607fa6",
+              "kind": "direct",
+              "label": "Live gateway validation 2",
+              "displayName": "Live gateway validation 2",
+              "chatType": "direct",
+              "origin": {
+                "label": "Claw Control Center",
+                "provider": "webchat",
+                "surface": "webchat",
+                "chatType": "direct"
+              },
+              "updatedAt": 1779163290650,
+              "sessionId": "d0261396-7c67-4c4c-8e2a-5f9f7782e2ca",
+              "systemSent": true,
+              "abortedLastRun": false,
+              "totalTokensFresh": false,
+              "estimatedCostUsd": 0,
+              "status": "running",
+              "startedAt": 1779163290626,
+              "modelProvider": "qclaw",
+              "model": "modelroute",
+              "contextTokens": 200000,
+              "deliveryContext": {
+                "channel": "webchat"
+              },
+              "lastChannel": "webchat"
+            },
+            "updatedAt": 1779163290650,
+            "sessionId": "d0261396-7c67-4c4c-8e2a-5f9f7782e2ca",
+            "kind": "direct",
+            "chatType": "direct",
+            "origin": {
+              "label": "Claw Control Center",
+              "provider": "webchat",
+              "surface": "webchat",
+              "chatType": "direct"
+            },
+            "label": "Live gateway validation 2",
+            "displayName": "Live gateway validation 2",
+            "deliveryContext": {
+              "channel": "webchat"
+            },
+            "systemSent": true,
+            "abortedLastRun": false,
+            "lastChannel": "webchat",
+            "totalTokensFresh": false,
+            "contextTokens": 200000,
+            "estimatedCostUsd": 0,
+            "modelProvider": "qclaw",
+            "model": "modelroute",
+            "status": "running",
+            "startedAt": 1779163290626
+          },
+          "createdAt": "2026-05-19T04:01:30.650Z"
+        },
+        {
+          "id": "agent:main:dashboard:e5176c85-efdc-4943-9e0c-214d95607fa6:status:5",
+          "sessionId": "agent:main:dashboard:e5176c85-efdc-4943-9e0c-214d95607fa6",
+          "seq": 5,
+          "kind": "run.completed",
+          "payload": {
+            "sessionKey": "agent:main:dashboard:e5176c85-efdc-4943-9e0c-214d95607fa6",
+            "phase": "end",
+            "runId": "d0e0baa7-b9ff-44b4-ac51-c6a75e80cdee",
+            "ts": 1779163295989,
+            "session": {
+              "key": "agent:main:dashboard:e5176c85-efdc-4943-9e0c-214d95607fa6",
+              "kind": "direct",
+              "label": "Live gateway validation 2",
+              "displayName": "Live gateway validation 2",
+              "chatType": "direct",
+              "origin": {
+                "label": "Claw Control Center",
+                "provider": "webchat",
+                "surface": "webchat",
+                "chatType": "direct"
+              },
+              "updatedAt": 1779163295989,
+              "sessionId": "d0261396-7c67-4c4c-8e2a-5f9f7782e2ca",
+              "systemSent": true,
+              "abortedLastRun": false,
+              "totalTokensFresh": false,
+              "estimatedCostUsd": 0,
+              "status": "done",
+              "startedAt": 1779163290626,
+              "endedAt": 1779163295989,
+              "runtimeMs": 5363,
+              "modelProvider": "qclaw",
+              "model": "modelroute",
+              "contextTokens": 200000,
+              "deliveryContext": {
+                "channel": "webchat"
+              },
+              "lastChannel": "webchat"
+            },
+            "updatedAt": 1779163295989,
+            "sessionId": "d0261396-7c67-4c4c-8e2a-5f9f7782e2ca",
+            "kind": "direct",
+            "chatType": "direct",
+            "origin": {
+              "label": "Claw Control Center",
+              "provider": "webchat",
+              "surface": "webchat",
+              "chatType": "direct"
+            },
+            "label": "Live gateway validation 2",
+            "displayName": "Live gateway validation 2",
+            "deliveryContext": {
+              "channel": "webchat"
+            },
+            "systemSent": true,
+            "lastChannel": "webchat",
+            "totalTokensFresh": false,
+            "contextTokens": 200000,
+            "estimatedCostUsd": 0,
+            "modelProvider": "qclaw",
+            "model": "modelroute",
+            "status": "done",
+            "startedAt": 1779163290626,
+            "endedAt": 1779163295989,
+            "runtimeMs": 5363,
+            "abortedLastRun": false
+          },
+          "createdAt": "2026-05-19T04:01:35.989Z"
+        }
+      ]
+    },
+    "agent:main:dashboard:85be7115-3ee0-493e-bea4-8178dd94fa96": {
+      "session": {
+        "id": "agent:main:dashboard:85be7115-3ee0-493e-bea4-8178dd94fa96",
+        "title": "Session 14",
+        "status": "running",
+        "hostKind": "qclaw",
+        "runnerCommand": "openclaw-gateway",
+        "createdAt": "2026-05-19T04:02:24.707Z",
+        "updatedAt": "2026-05-19T04:28:30.343Z",
+        "lastEventSeq": 62
+      },
+      "messages": [
+        {
+          "id": "user-c6be4513-5d3b-4dc6-b3ef-820c88ef70c5",
+          "sessionId": "agent:main:dashboard:85be7115-3ee0-493e-bea4-8178dd94fa96",
+          "role": "user",
+          "content": "test",
+          "createdAt": "2026-05-19T04:02:30.245Z"
+        },
+        {
+          "id": "assistant-2",
+          "sessionId": "agent:main:dashboard:85be7115-3ee0-493e-bea4-8178dd94fa96",
+          "role": "assistant",
+          "content": "收到测试消息！当前时间 2026-05-19 12:02 GMT+8。系统运行正常，可以随时开始工作。有什么需要我帮忙的吗？",
+          "createdAt": "2026-05-19T04:02:30.597Z"
+        }
+      ],
+      "events": [
+        {
+          "id": "agent:main:dashboard:85be7115-3ee0-493e-bea4-8178dd94fa96:status:1",
+          "sessionId": "agent:main:dashboard:85be7115-3ee0-493e-bea4-8178dd94fa96",
+          "seq": 1,
+          "kind": "status.update",
+          "payload": {
+            "sessionKey": "agent:main:dashboard:85be7115-3ee0-493e-bea4-8178dd94fa96",
+            "phase": "message",
+            "ts": 1779163350271,
+            "messageSeq": 0,
+            "session": {
+              "key": "agent:main:dashboard:85be7115-3ee0-493e-bea4-8178dd94fa96",
+              "kind": "direct",
+              "label": "Session 14",
+              "displayName": "Session 14",
+              "updatedAt": 1779163344657,
+              "sessionId": "0b4f3a46-ece2-410d-8487-afa593b1aa87",
+              "totalTokensFresh": false,
+              "modelProvider": "qclaw",
+              "model": "modelroute",
+              "contextTokens": 200000
+            },
+            "updatedAt": 1779163344657,
+            "sessionId": "0b4f3a46-ece2-410d-8487-afa593b1aa87",
+            "kind": "direct",
+            "label": "Session 14",
+            "displayName": "Session 14",
+            "totalTokensFresh": false,
+            "contextTokens": 200000,
+            "modelProvider": "qclaw",
+            "model": "modelroute"
+          },
+          "createdAt": "2026-05-19T04:02:24.657Z"
+        },
+        {
+          "id": "agent:main:dashboard:85be7115-3ee0-493e-bea4-8178dd94fa96:status:2",
+          "sessionId": "agent:main:dashboard:85be7115-3ee0-493e-bea4-8178dd94fa96",
+          "seq": 2,
+          "kind": "run.started",
+          "payload": {
+            "sessionKey": "agent:main:dashboard:85be7115-3ee0-493e-bea4-8178dd94fa96",
+            "phase": "start",
+            "runId": "2507200a-e8e8-4bc1-9262-26ac566c3160",
+            "ts": 1779163350584,
+            "session": {
+              "key": "agent:main:dashboard:85be7115-3ee0-493e-bea4-8178dd94fa96",
+              "kind": "direct",
+              "label": "Session 14",
+              "displayName": "Session 14",
+              "chatType": "direct",
+              "origin": {
+                "label": "Claw Control Center",
+                "provider": "webchat",
+                "surface": "webchat",
+                "chatType": "direct"
+              },
+              "updatedAt": 1779163350584,
+              "sessionId": "0b4f3a46-ece2-410d-8487-afa593b1aa87",
+              "systemSent": true,
+              "abortedLastRun": false,
+              "totalTokensFresh": false,
+              "status": "running",
+              "startedAt": 1779163350584,
+              "modelProvider": "qclaw",
+              "model": "modelroute",
+              "contextTokens": 200000,
+              "deliveryContext": {
+                "channel": "webchat"
+              },
+              "lastChannel": "webchat"
+            },
+            "updatedAt": 1779163350584,
+            "sessionId": "0b4f3a46-ece2-410d-8487-afa593b1aa87",
+            "kind": "direct",
+            "chatType": "direct",
+            "origin": {
+              "label": "Claw Control Center",
+              "provider": "webchat",
+              "surface": "webchat",
+              "chatType": "direct"
+            },
+            "label": "Session 14",
+            "displayName": "Session 14",
+            "deliveryContext": {
+              "channel": "webchat"
+            },
+            "systemSent": true,
+            "lastChannel": "webchat",
+            "totalTokensFresh": false,
+            "contextTokens": 200000,
+            "modelProvider": "qclaw",
+            "model": "modelroute",
+            "status": "running",
+            "startedAt": 1779163350584,
+            "abortedLastRun": false
+          },
+          "createdAt": "2026-05-19T04:02:30.584Z"
+        },
+        {
+          "id": "agent:main:dashboard:85be7115-3ee0-493e-bea4-8178dd94fa96:status:3",
+          "sessionId": "agent:main:dashboard:85be7115-3ee0-493e-bea4-8178dd94fa96",
+          "seq": 3,
+          "kind": "status.update",
+          "payload": {
+            "sessionKey": "agent:main:dashboard:85be7115-3ee0-493e-bea4-8178dd94fa96",
+            "phase": "message",
+            "ts": 1779163350592,
+            "messageId": "d7185363",
+            "messageSeq": 0,
+            "session": {
+              "key": "agent:main:dashboard:85be7115-3ee0-493e-bea4-8178dd94fa96",
+              "kind": "direct",
+              "label": "Session 14",
+              "displayName": "Session 14",
+              "chatType": "direct",
+              "origin": {
+                "label": "Claw Control Center",
+                "provider": "webchat",
+                "surface": "webchat",
+                "chatType": "direct"
+              },
+              "updatedAt": 1779163350393,
+              "sessionId": "0b4f3a46-ece2-410d-8487-afa593b1aa87",
+              "systemSent": true,
+              "abortedLastRun": false,
+              "totalTokensFresh": false,
+              "modelProvider": "qclaw",
+              "model": "modelroute",
+              "contextTokens": 200000,
+              "deliveryContext": {
+                "channel": "webchat"
+              },
+              "lastChannel": "webchat"
+            },
+            "updatedAt": 1779163350393,
+            "sessionId": "0b4f3a46-ece2-410d-8487-afa593b1aa87",
+            "kind": "direct",
+            "chatType": "direct",
+            "origin": {
+              "label": "Claw Control Center",
+              "provider": "webchat",
+              "surface": "webchat",
+              "chatType": "direct"
+            },
+            "label": "Session 14",
+            "displayName": "Session 14",
+            "deliveryContext": {
+              "channel": "webchat"
+            },
+            "systemSent": true,
+            "abortedLastRun": false,
+            "lastChannel": "webchat",
+            "totalTokensFresh": false,
+            "contextTokens": 200000,
+            "modelProvider": "qclaw",
+            "model": "modelroute"
+          },
+          "createdAt": "2026-05-19T04:02:30.393Z"
+        },
+        {
+          "id": "agent:main:dashboard:85be7115-3ee0-493e-bea4-8178dd94fa96:chat:44",
+          "sessionId": "agent:main:dashboard:85be7115-3ee0-493e-bea4-8178dd94fa96",
+          "seq": 44,
+          "kind": "assistant.delta",
+          "payload": {
+            "content": "收到",
+            "state": "delta",
+            "runId": "2507200a-e8e8-4bc1-9262-26ac566c3160"
+          },
+          "createdAt": "2026-05-19T04:02:36.612Z"
+        },
+        {
+          "id": "agent:main:dashboard:85be7115-3ee0-493e-bea4-8178dd94fa96:status:45",
+          "sessionId": "agent:main:dashboard:85be7115-3ee0-493e-bea4-8178dd94fa96",
+          "seq": 45,
+          "kind": "status.update",
+          "payload": {
+            "sessionKey": "agent:main:dashboard:85be7115-3ee0-493e-bea4-8178dd94fa96",
+            "phase": "message",
+            "ts": 1779163356967,
+            "messageId": "d2cba0a9",
+            "messageSeq": 2,
+            "session": {
+              "key": "agent:main:dashboard:85be7115-3ee0-493e-bea4-8178dd94fa96",
+              "kind": "direct",
+              "label": "Session 14",
+              "displayName": "Session 14",
+              "chatType": "direct",
+              "origin": {
+                "label": "Claw Control Center",
+                "provider": "webchat",
+                "surface": "webchat",
+                "chatType": "direct"
+              },
+              "updatedAt": 1779163350605,
+              "sessionId": "0b4f3a46-ece2-410d-8487-afa593b1aa87",
+              "systemSent": true,
+              "abortedLastRun": false,
+              "totalTokensFresh": false,
+              "estimatedCostUsd": 0,
+              "status": "running",
+              "startedAt": 1779163350584,
+              "modelProvider": "qclaw",
+              "model": "modelroute",
+              "contextTokens": 200000,
+              "deliveryContext": {
+                "channel": "webchat"
+              },
+              "lastChannel": "webchat"
+            },
+            "updatedAt": 1779163350605,
+            "sessionId": "0b4f3a46-ece2-410d-8487-afa593b1aa87",
+            "kind": "direct",
+            "chatType": "direct",
+            "origin": {
+              "label": "Claw Control Center",
+              "provider": "webchat",
+              "surface": "webchat",
+              "chatType": "direct"
+            },
+            "label": "Session 14",
+            "displayName": "Session 14",
+            "deliveryContext": {
+              "channel": "webchat"
+            },
+            "systemSent": true,
+            "abortedLastRun": false,
+            "lastChannel": "webchat",
+            "totalTokensFresh": false,
+            "contextTokens": 200000,
+            "estimatedCostUsd": 0,
+            "modelProvider": "qclaw",
+            "model": "modelroute",
+            "status": "running",
+            "startedAt": 1779163350584
+          },
+          "createdAt": "2026-05-19T04:02:30.605Z"
+        },
+        {
+          "id": "agent:main:dashboard:85be7115-3ee0-493e-bea4-8178dd94fa96:chat:60",
+          "sessionId": "agent:main:dashboard:85be7115-3ee0-493e-bea4-8178dd94fa96",
+          "seq": 60,
+          "kind": "assistant.delta",
+          "payload": {
+            "content": "收到测试消息！当前时间 2026-05-19 12:02 GMT+8。系统运行正常，可以随时开始工作。有什么需要我帮忙的吗？",
+            "state": "delta",
+            "runId": "2507200a-e8e8-4bc1-9262-26ac566c3160"
+          },
+          "createdAt": "2026-05-19T04:02:36.967Z"
+        },
+        {
+          "id": "agent:main:dashboard:85be7115-3ee0-493e-bea4-8178dd94fa96:status:61",
+          "sessionId": "agent:main:dashboard:85be7115-3ee0-493e-bea4-8178dd94fa96",
+          "seq": 61,
+          "kind": "run.completed",
+          "payload": {
+            "sessionKey": "agent:main:dashboard:85be7115-3ee0-493e-bea4-8178dd94fa96",
+            "phase": "end",
+            "runId": "2507200a-e8e8-4bc1-9262-26ac566c3160",
+            "ts": 1779163356967,
+            "session": {
+              "key": "agent:main:dashboard:85be7115-3ee0-493e-bea4-8178dd94fa96",
+              "kind": "direct",
+              "label": "Session 14",
+              "displayName": "Session 14",
+              "chatType": "direct",
+              "origin": {
+                "label": "Claw Control Center",
+                "provider": "webchat",
+                "surface": "webchat",
+                "chatType": "direct"
+              },
+              "updatedAt": 1779163356967,
+              "sessionId": "0b4f3a46-ece2-410d-8487-afa593b1aa87",
+              "systemSent": true,
+              "abortedLastRun": false,
+              "totalTokensFresh": false,
+              "estimatedCostUsd": 0,
+              "status": "done",
+              "startedAt": 1779163350584,
+              "endedAt": 1779163356967,
+              "runtimeMs": 6383,
+              "modelProvider": "qclaw",
+              "model": "modelroute",
+              "contextTokens": 200000,
+              "deliveryContext": {
+                "channel": "webchat"
+              },
+              "lastChannel": "webchat"
+            },
+            "updatedAt": 1779163356967,
+            "sessionId": "0b4f3a46-ece2-410d-8487-afa593b1aa87",
+            "kind": "direct",
+            "chatType": "direct",
+            "origin": {
+              "label": "Claw Control Center",
+              "provider": "webchat",
+              "surface": "webchat",
+              "chatType": "direct"
+            },
+            "label": "Session 14",
+            "displayName": "Session 14",
+            "deliveryContext": {
+              "channel": "webchat"
+            },
+            "systemSent": true,
+            "lastChannel": "webchat",
+            "totalTokensFresh": false,
+            "contextTokens": 200000,
+            "estimatedCostUsd": 0,
+            "modelProvider": "qclaw",
+            "model": "modelroute",
+            "status": "done",
+            "startedAt": 1779163350584,
+            "endedAt": 1779163356967,
+            "runtimeMs": 6383,
+            "abortedLastRun": false
+          },
+          "createdAt": "2026-05-19T04:02:36.967Z"
+        },
+        {
+          "id": "agent:main:dashboard:85be7115-3ee0-493e-bea4-8178dd94fa96:status:62",
+          "sessionId": "agent:main:dashboard:85be7115-3ee0-493e-bea4-8178dd94fa96",
+          "seq": 62,
+          "kind": "status.update",
+          "payload": {
+            "sessionKey": "agent:main:dashboard:85be7115-3ee0-493e-bea4-8178dd94fa96",
+            "reason": "delete",
+            "ts": 1779164910341
+          },
+          "createdAt": "2026-05-19T04:28:30.341Z"
+        }
+      ]
+    }
+  }
+}

@@ -1,0 +1,82 @@
+{
+  "id": "claw-control-center",
+  "name": "Claw Control Center",
+  "description": "QClaw/OpenClaw multi-session control plugin with a local web console.",
+  "activation": {
+    "onStartup": true
+  },
+  "configSchema": {
+    "type": "object",
+    "additionalProperties": false,
+    "properties": {
+      "gateway": {
+        "type": "object",
+        "additionalProperties": false,
+        "properties": {
+          "baseUrl": {
+            "type": "string",
+            "description": "Custom gateway base URL, for example https://gateway.example.com/v1"
+          },
+          "botId": {
+            "type": "string"
+          },
+          "secret": {
+            "type": "string"
+          },
+          "requestTimeoutMs": {
+            "type": "number",
+            "default": 15000
+          },
+          "streamReconnectMs": {
+            "type": "number",
+            "default": 2000
+          }
+        }
+      },
+      "console": {
+        "type": "object",
+        "additionalProperties": false,
+        "properties": {
+          "enabled": {
+            "type": "boolean",
+            "default": true
+          },
+          "host": {
+            "type": "string",
+            "default": "127.0.0.1"
+          },
+          "port": {
+            "type": "number",
+            "default": 4318
+          }
+        }
+      },
+      "persistence": {
+        "type": "object",
+        "additionalProperties": false,
+        "properties": {
+          "maxSessions": {
+            "type": "number",
+            "default": 100
+          }
+        }
+      },
+      "logging": {
+        "type": "object",
+        "additionalProperties": false,
+        "properties": {
+          "level": {
+            "type": "string",
+            "enum": [
+              "debug",
+              "info",
+              "warn",
+              "error"
+            ],
+            "default": "info"
+          }
+        }
+      }
+    }
+  }
+}

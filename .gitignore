@@ -1,0 +1,11 @@
+node_modules
+dist
+coverage
+.DS_Store
+service/bin
+service/data
+service/tmp
+web/dist
+web/.vite
+plugin/dist
+*.log
