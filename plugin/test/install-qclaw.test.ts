@@ -48,6 +48,7 @@ describe("QClaw installer", () => {
       gateway: "ws://gateway.example.com:28789",
       botId: "bot-123",
       secret: "sk-secret",
+      preferResponsesApi: true,
       gatewayModel: "openai/gpt-5.5",
       consolePort: 4321
     });
@@ -79,6 +80,7 @@ describe("QClaw installer", () => {
         }
       }
     });
+    expect((updated as any).gateway.http.endpoints.responses.enabled).toBe(true);
   });
 
   it("infers the local gateway settings from openclaw.json when flags are omitted", async () => {
@@ -142,13 +144,14 @@ describe("QClaw installer", () => {
         gateway: {
           baseUrl: "ws://127.0.0.1:28789",
           secret: "local-token",
-          preferResponsesApi: true
+          preferResponsesApi: false
         },
         console: {
           host: "127.0.0.1"
         }
       }
     });
+    expect((updated as any).gateway.http?.endpoints?.responses).toBeUndefined();
   });
 
   it("replaces stale web assets when reinstalling over an existing plugin directory", async () => {
@@ -239,7 +242,7 @@ describe("QClaw installer", () => {
     expect(updated.plugins.entries["claw-control-center"].config?.gateway).toEqual({
       baseUrl: "ws://127.0.0.1:28789",
       secret: "local-token",
-      preferResponsesApi: true
+      preferResponsesApi: false
     });
     expect(updated.plugins.entries["claw-control-center"].config?.hub53ai).toEqual({
       enabled: true,
@@ -315,7 +318,7 @@ describe("QClaw installer", () => {
       sendThinkingMessage: false
     });
     expect(updated.channels["53aihub"].botId).toBe("legacy-bot");
-    expect((updated as any).gateway.http.endpoints.responses.enabled).toBe(true);
+    expect((updated as any).gateway.http?.endpoints?.responses).toBeUndefined();
   });
 
   it("installs into OpenClaw paths when the openclaw target is selected", async () => {
@@ -388,7 +391,7 @@ describe("QClaw installer", () => {
         gateway: {
           baseUrl: "ws://127.0.0.1:18789",
           secret: "openclaw-password",
-          preferResponsesApi: true
+          preferResponsesApi: false
         }
       }
     });

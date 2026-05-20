@@ -7,7 +7,7 @@
 
 1. 插件宿主层：负责读取宿主配置、注册服务、启动本地控制台。
 2. 本地控制台层：提供网页、REST API、WebSocket API。
-3. Gateway 适配层：优先使用 OpenResponses HTTP SSE (`/v1/responses`) 执行本地消息；如果宿主未启用该端点，则自动回退到 QClaw / OpenClaw gateway RPC。
+3. Gateway 适配层：默认使用 QClaw / OpenClaw gateway WebSocket RPC；同时保留可选的 OpenResponses HTTP SSE (`/v1/responses`) 执行路径。
 4. 53AIHub 桥接层：通过公司 WebSocket 完成 Bot 鉴权，并把远端消息转发到本地 Claw。
 
 ## 快速使用
@@ -55,11 +55,12 @@ node plugin/bin/install-qclaw.mjs install \
 
 `--gateway` / `--secret` 表示本地 QClaw/OpenClaw gateway；`--hub-*` 表示公司 53AIHub 服务器。两组配置不要混用。
 
-安装器会同时开启本地 Gateway 的 `gateway.http.endpoints.responses.enabled`，插件默认优先尝试 `POST /v1/responses` 的 SSE 流式输出 (streaming)，并在该端点不可用时回退到 WebSocket RPC。若要为 HTTP responses 路径指定模型，可使用：
+插件默认使用 WebSocket RPC。若要临时启用 HTTP responses 路径，可以显式传入 `--prefer-responses-api`；安装器只会在该开关开启时写入本地 Gateway 的 `gateway.http.endpoints.responses.enabled`。若要为 HTTP responses 路径指定模型，可同时使用 `--gateway-model`：
 
 ```bash
 node plugin/bin/install-qclaw.mjs install \
   --target openclaw \
+  --prefer-responses-api \
   --gateway-model openai/gpt-5.5
 ```
 

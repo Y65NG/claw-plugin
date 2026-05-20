@@ -10,6 +10,7 @@ type InstallInput = {
   gateway?: string;
   botId?: string;
   secret?: string;
+  preferResponsesApi?: boolean;
   gatewayModel?: string;
   hubWsUrl?: string;
   hubBotId?: string;
@@ -26,6 +27,7 @@ type ParsedArgs = {
   gateway?: string;
   "bot-id"?: string;
   secret?: string;
+  "prefer-responses-api"?: string;
   "gateway-model"?: string;
   "hub-ws-url"?: string;
   "hub-bot-id"?: string;
@@ -155,6 +157,7 @@ async function installIntoHost(
   }
 
   const botId = input.botId?.trim();
+  const preferResponsesApi = input.preferResponsesApi ?? false;
   const gatewayModel = input.gatewayModel?.trim();
   const hubWsUrl = input.hubWsUrl?.trim() || inferredHub53AI.wsUrl;
   const hubBotId = input.hubBotId?.trim() || inferredHub53AI.botId;
@@ -181,7 +184,7 @@ async function installIntoHost(
   const previousGateway = ensureObject(previousConfig, "gateway");
   previousGateway.baseUrl = gatewayBaseUrl;
   previousGateway.secret = secret;
-  previousGateway.preferResponsesApi = true;
+  previousGateway.preferResponsesApi = preferResponsesApi;
   if (botId) {
     previousGateway.botId = botId;
   }
@@ -189,11 +192,13 @@ async function installIntoHost(
     previousGateway.modelOverride = gatewayModel;
   }
 
-  const gatewayConfig = ensureObject(config, "gateway");
-  const gatewayHttp = ensureObject(gatewayConfig, "http");
-  const gatewayHttpEndpoints = ensureObject(gatewayHttp, "endpoints");
-  const responsesEndpoint = ensureObject(gatewayHttpEndpoints, "responses");
-  responsesEndpoint.enabled = true;
+  if (preferResponsesApi) {
+    const gatewayConfig = ensureObject(config, "gateway");
+    const gatewayHttp = ensureObject(gatewayConfig, "http");
+    const gatewayHttpEndpoints = ensureObject(gatewayHttp, "endpoints");
+    const responsesEndpoint = ensureObject(gatewayHttpEndpoints, "responses");
+    responsesEndpoint.enabled = true;
+  }
 
   if (hubConfigured || input.hubEnabled !== undefined) {
     const previousHub = ensureObject(previousConfig, "hub53ai");
@@ -262,6 +267,7 @@ export async function runInstallCommand(input: {
     gateway: args.gateway,
     botId: args["bot-id"],
     secret: args.secret,
+    preferResponsesApi: parseOptionalBoolean(args["prefer-responses-api"]),
     gatewayModel: args["gateway-model"],
     hubWsUrl: args["hub-ws-url"],
     hubBotId: args["hub-bot-id"],

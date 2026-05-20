@@ -97,7 +97,7 @@ export function resolvePluginConfig(config?: PluginConfig): ResolvedPluginConfig
       secret: config?.gateway?.secret?.trim() ?? "",
       requestTimeoutMs: config?.gateway?.requestTimeoutMs ?? 15_000,
       streamReconnectMs: config?.gateway?.streamReconnectMs ?? 2_000,
-      preferResponsesApi: config?.gateway?.preferResponsesApi ?? true,
+      preferResponsesApi: config?.gateway?.preferResponsesApi ?? false,
       modelOverride: config?.gateway?.modelOverride?.trim() ?? ""
     },
     hub53ai: {

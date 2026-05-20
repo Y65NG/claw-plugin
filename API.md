@@ -362,8 +362,8 @@ Response:
 
 - 向当前会话追加用户消息。
 - 将会话置为 `running`。
-- 优先通过 OpenClaw Gateway HTTP `POST /v1/responses` SSE 执行任务。
-- 如果 `responses` endpoint 未启用或返回 `404` / `405` / `501`，自动回退到 Gateway WebSocket RPC `chat.send`。
+- 默认通过 Gateway WebSocket RPC `chat.send` 执行任务。
+- 如果显式开启 `gateway.preferResponsesApi`，则先尝试 OpenClaw Gateway HTTP `POST /v1/responses` SSE；若该 endpoint 未启用或返回 `404` / `405` / `501`，自动回退到 `chat.send`。
 - 后续 assistant 输出通过 `WS /ws/sessions/:id` 推送。
 
 Frontend:
@@ -395,10 +395,10 @@ OpenClaw upstream:
 | OpenClaw API | Purpose | Official doc |
 | --- | --- | --- |
 | `sessions.messages.subscribe` | Ensure live events are subscribed before sending. | [Session control](https://docs.openclaw.ai/gateway/protocol#session-control) |
-| `POST /v1/responses` | Preferred local execution path when enabled; returns SSE `response.output_text.delta` events. | [OpenResponses API](https://docs.openclaw.ai/gateway/openresponses-http-api) |
-| `chat.send` | Fallback execution path when the HTTP responses endpoint is unavailable. | [Session control](https://docs.openclaw.ai/gateway/protocol#session-control) |
+| `chat.send` | Default execution path. | [Session control](https://docs.openclaw.ai/gateway/protocol#session-control) |
+| `POST /v1/responses` | Optional execution path when `gateway.preferResponsesApi` is explicitly enabled; returns SSE `response.output_text.delta` events. | [OpenResponses API](https://docs.openclaw.ai/gateway/openresponses-http-api) |
 
-Preferred Gateway HTTP call:
+Optional Gateway HTTP call:
 
 ```http
 POST /v1/responses
@@ -893,10 +893,10 @@ Bridge to OpenClaw upstream:
 | `sessions.messages.subscribe` | Current conversation event stream | `ensureSubscribed()` in [plugin/src/gateway-client.ts](./plugin/src/gateway-client.ts) | [Session control](https://docs.openclaw.ai/gateway/protocol#session-control) |
 | `sessions.messages.unsubscribe` | Cleanup unused subscription | `subscribe()` cleanup in [plugin/src/gateway-client.ts](./plugin/src/gateway-client.ts) | [Session control](https://docs.openclaw.ai/gateway/protocol#session-control) |
 | `chat.history` | Load message history, synthesize history events, retry lookup | `getSessionMessages()` / `listEvents()` / retry path in [plugin/src/gateway-client.ts](./plugin/src/gateway-client.ts) | [Session control](https://docs.openclaw.ai/gateway/protocol#session-control) |
-| `POST /v1/responses` | Preferred local message execution path when `gateway.preferResponsesApi` is enabled and the host endpoint is available | `startResponsesApiRun()` in [plugin/src/gateway-client.ts](./plugin/src/gateway-client.ts) | [OpenResponses API](https://docs.openclaw.ai/gateway/openresponses-http-api) |
-| `response.output_text.delta` | Preferred SSE assistant text stream event | `consumeResponsesApiStream()` in [plugin/src/gateway-client.ts](./plugin/src/gateway-client.ts) | [Streaming (SSE)](https://docs.openclaw.ai/gateway/openresponses-http-api#streaming-sse) |
-| `response.output_text.done` / `response.completed` | Preferred SSE final text and completion events | `consumeResponsesApiStream()` in [plugin/src/gateway-client.ts](./plugin/src/gateway-client.ts) | [Streaming (SSE)](https://docs.openclaw.ai/gateway/openresponses-http-api#streaming-sse) |
-| `chat.send` | Fallback user-message execution path when HTTP responses is unavailable | `sendMessage()` in [plugin/src/gateway-client.ts](./plugin/src/gateway-client.ts) | [Session control](https://docs.openclaw.ai/gateway/protocol#session-control) |
+| `chat.send` | Default user-message execution path | `sendMessage()` in [plugin/src/gateway-client.ts](./plugin/src/gateway-client.ts) | [Session control](https://docs.openclaw.ai/gateway/protocol#session-control) |
+| `POST /v1/responses` | Optional local message execution path when `gateway.preferResponsesApi` is explicitly enabled and the host endpoint is available | `startResponsesApiRun()` in [plugin/src/gateway-client.ts](./plugin/src/gateway-client.ts) | [OpenResponses API](https://docs.openclaw.ai/gateway/openresponses-http-api) |
+| `response.output_text.delta` | Optional SSE assistant text stream event | `consumeResponsesApiStream()` in [plugin/src/gateway-client.ts](./plugin/src/gateway-client.ts) | [Streaming (SSE)](https://docs.openclaw.ai/gateway/openresponses-http-api#streaming-sse) |
+| `response.output_text.done` / `response.completed` | Optional SSE final text and completion events | `consumeResponsesApiStream()` in [plugin/src/gateway-client.ts](./plugin/src/gateway-client.ts) | [Streaming (SSE)](https://docs.openclaw.ai/gateway/openresponses-http-api#streaming-sse) |
 | `chat.abort` | Stop active run | `controlSession("stop")` in [plugin/src/gateway-client.ts](./plugin/src/gateway-client.ts) | [Session control](https://docs.openclaw.ai/gateway/protocol#session-control) |
 | `chat` event | Assistant delta/final text | `mapGatewayFrameToEvents()` in [plugin/src/gateway-client.ts](./plugin/src/gateway-client.ts) | [Common event families](https://docs.openclaw.ai/gateway/protocol#common-event-families) |
 | `session.message` event | User/assistant transcript rows | `mapGatewayFrameToEvents()` in [plugin/src/gateway-client.ts](./plugin/src/gateway-client.ts) | [Common event families](https://docs.openclaw.ai/gateway/protocol#common-event-families) |
