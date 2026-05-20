@@ -53,6 +53,7 @@ export type PluginStatusSnapshot = {
   healthy: boolean;
   modelPrimary?: string;
   enabledSkills?: string[];
+  hub53ai?: Hub53AIStatusSnapshot;
 };
 
 export type RunnerConfig = {
@@ -67,6 +68,20 @@ export type GatewayConfigView = {
   secret?: string;
   requestTimeoutMs?: number;
   streamReconnectMs?: number;
+};
+
+export type Hub53AIStatusSnapshot = {
+  enabled: boolean;
+  configured: boolean;
+  connectionStatus: "disabled" | "connecting" | "connected" | "disconnected" | "error";
+  botId?: string;
+  wsUrl?: string;
+  lastHeartbeatAt?: string;
+  lastConnectedAt?: string;
+  lastError?: string;
+  receivedMessageCount: number;
+  sentMessageCount: number;
+  pendingOutboundCount: number;
 };
 
 export type BootstrapPayload = {
