@@ -22,6 +22,10 @@ export type GatewayConfig = {
 
 export type GatewaySession = SessionSummary;
 export type GatewayEvent = TimelineEvent;
+export type GatewayRuntimeInfo = {
+  modelPrimary?: string;
+  enabledSkills: string[];
+};
 
 type GatewayFrame =
   | {
@@ -43,6 +47,7 @@ type GatewayFrame =
     };
 
 type GatewayClient = {
+  getRuntimeInfo(): Promise<GatewayRuntimeInfo>;
   listSessions(limit?: number): Promise<GatewaySession[]>;
   createSession(title: string, initialPrompt?: string): Promise<GatewaySession>;
   getSession(sessionId: string): Promise<GatewaySession>;
@@ -150,6 +155,16 @@ export function createGatewayClient(config: Partial<GatewayConfig>): GatewayClie
   });
 
   return {
+    async getRuntimeInfo() {
+      try {
+        const payload = await transport.request("skills.status", { agentId: "main" }, { timeoutMs: 2_000 });
+        return extractRuntimeInfo(payload);
+      } catch {
+        return {
+          enabledSkills: []
+        };
+      }
+    },
     async listSessions(limit = 50) {
       const payload = await transport.request("sessions.list", {
         limit,
@@ -1169,6 +1184,107 @@ function extractSessions(payload: unknown, hostKind = "openclaw"): GatewaySessio
     ? ((payload as { sessions: unknown[] }).sessions ?? [])
     : [];
   return sessions.map((session) => normalizeSession(session, "Untitled session", hostKind));
+}
+
+function extractRuntimeInfo(payload: unknown): GatewayRuntimeInfo {
+  const record = toRecord(payload);
+  const modelPrimary =
+    readStringFromUnknown(record, ["modelPrimary"]) ??
+    readStringFromUnknown(record, ["model", "primary"]) ??
+    readStringFromUnknown(record, ["models", "primary"]) ??
+    readStringFromUnknown(record, ["agent", "model", "primary"]) ??
+    readStringFromUnknown(record, ["defaults", "model", "primary"]) ??
+    (typeof record.model === "string" && record.model.trim() ? record.model.trim() : undefined);
+  const enabledSkills = collectRuntimeSkills(
+    record.skills ?? record.enabledSkills ?? record.items ?? record.entries ?? readUnknownPath(record, ["data", "skills"])
+  );
+
+  return {
+    ...(modelPrimary ? { modelPrimary } : {}),
+    enabledSkills
+  };
+}
+
+function collectRuntimeSkills(value: unknown): string[] {
+  const skills: string[] = [];
+  const seen = new Set<string>();
+  const pushSkill = (skill: string) => {
+    const normalized = skill.trim();
+    if (!normalized || seen.has(normalized)) {
+      return;
+    }
+    seen.add(normalized);
+    skills.push(normalized);
+  };
+
+  const visit = (entry: unknown, mapKey?: string) => {
+    if (typeof entry === "string") {
+      pushSkill(entry);
+      return;
+    }
+    if (Array.isArray(entry)) {
+      for (const item of entry) {
+        visit(item);
+      }
+      return;
+    }
+    if (!entry || typeof entry !== "object") {
+      return;
+    }
+
+    const record = entry as Record<string, unknown>;
+    const nested = record.skills ?? record.items ?? record.entries;
+    if (nested && !("enabled" in record) && !("status" in record) && !("available" in record)) {
+      visit(nested);
+      return;
+    }
+
+    const name = stringProperty(record, ["id", "name", "key", "slug"]) ?? mapKey;
+    if (name && isRuntimeSkillEnabled(record)) {
+      pushSkill(name);
+    }
+  };
+
+  if (Array.isArray(value)) {
+    value.forEach((entry) => visit(entry));
+    return skills;
+  }
+
+  if (value && typeof value === "object") {
+    for (const [key, entry] of Object.entries(value as Record<string, unknown>)) {
+      visit(entry, key);
+    }
+    return skills;
+  }
+
+  visit(value);
+  return skills;
+}
+
+function isRuntimeSkillEnabled(record: Record<string, unknown>): boolean {
+  if ("enabled" in record) {
+    return record.enabled === true;
+  }
+  if (record.disabled === true) {
+    return false;
+  }
+  if (record.available === true || record.ready === true) {
+    return true;
+  }
+  if (typeof record.status === "string") {
+    return ["enabled", "available", "ready", "running", "active"].includes(record.status.toLowerCase());
+  }
+  return true;
+}
+
+function stringProperty(record: Record<string, unknown>, keys: string[]): string | undefined {
+  for (const key of keys) {
+    const value = record[key];
+    if (typeof value === "string" && value.trim()) {
+      return value.trim();
+    }
+  }
+  return undefined;
 }
 
 function extractCreatedSession(payload: unknown): Record<string, unknown> {

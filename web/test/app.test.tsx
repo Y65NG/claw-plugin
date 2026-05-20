@@ -549,7 +549,7 @@ describe("App", () => {
               runnerCommand: "gateway",
               createdAt: now,
               updatedAt: now,
-              lastEventSeq: 16
+              lastEventSeq: 17
             }
           ]
         })
@@ -564,7 +564,7 @@ describe("App", () => {
             runnerCommand: "gateway",
             createdAt: now,
             updatedAt: now,
-            lastEventSeq: 16
+              lastEventSeq: 17
           },
           messages: [
             {
@@ -646,6 +646,19 @@ describe("App", () => {
               id: "evt-5",
               sessionId: "session-1",
               seq: 14,
+              kind: "assistant.thinking",
+              payload: {
+                content: "Second reasoning step before using the search tool.",
+                privateContentOmitted: false,
+                rawThinkingVisible: true,
+                textLength: 50
+              },
+              createdAt: now
+            },
+            {
+              id: "evt-6",
+              sessionId: "session-1",
+              seq: 15,
               kind: "tool.call",
               payload: {
                 data: {
@@ -691,7 +704,9 @@ describe("App", () => {
       expect(conversation.getByText("Inspected skill weather")).toBeInTheDocument();
       expect(conversation.getByText("Used Weather")).toBeInTheDocument();
       expect(conversation.getByText("Model reasoning")).toBeInTheDocument();
-      expect(conversation.getByText("Let me inspect the weather skill, then call the weather tool.")).toBeInTheDocument();
+      expect(conversation.getAllByText(/Let me inspect the weather skill, then call the weather tool/).length).toBeGreaterThan(0);
+      expect(conversation.getAllByText(/Second reasoning step before using the search tool/).length).toBeGreaterThan(0);
+      expect(conversation.getByText("#13-#14")).toBeInTheDocument();
       expect(conversation.getByText("Tool output")).toBeInTheDocument();
       expect(conversation.getAllByText("TOOL INPUT").length).toBeGreaterThan(0);
       expect(conversation.getByText("TOOL OUTPUT")).toBeInTheDocument();
@@ -707,7 +722,7 @@ describe("App", () => {
       expect(eventPanel.getByText("Inspected skill weather")).toBeInTheDocument();
       expect(eventPanel.getByText("Used Weather")).toBeInTheDocument();
       expect(eventPanel.getByText("Tool output")).toBeInTheDocument();
-      expect(eventPanel.getByText("Model reasoning")).toBeInTheDocument();
+      expect(eventPanel.getAllByText("Model reasoning")).toHaveLength(2);
       expect(sidebar.queryByText("Event list")).not.toBeInTheDocument();
     });
   });

@@ -728,7 +728,7 @@ Backend:
 
 OpenClaw upstream:
 
-- 无直接 RPC。它推送本地 `buildStatusSnapshot()` 的结果。
+- `skills.status`。插件会先尝试读取运行时 skill/model 摘要，再推送本地 `buildStatusSnapshot()` 的结果；如果该 RPC 不可用，则回退到宿主 `openclaw.json`。
 
 Message example:
 
@@ -747,8 +747,9 @@ Message example:
 
 当前实现：
 
-- `modelPrimary` 和 `enabledSkills` 由 [plugin/src/host.ts](./plugin/src/host.ts) 读取宿主 `openclaw.json`。
-- 读取路径：
+- `modelPrimary` 和 `enabledSkills` 优先由 [plugin/src/gateway-client.ts](./plugin/src/gateway-client.ts) 调用 `skills.status` 读取运行时信息。
+- 如果 Gateway 不支持该 RPC 或请求失败，则由 [plugin/src/host.ts](./plugin/src/host.ts) 读取宿主 `openclaw.json` 作为回退。
+- 配置回退读取路径：
   - `agents.defaults.model.primary`
   - `skills.entries.*.enabled === true`
 
@@ -761,8 +762,8 @@ OpenClaw 官方可选 RPC：
 
 重要说明：
 
-- 当前插件尚未调用 `models.list` / `skills.status`。
-- 如果之后需要显示更准确的运行时模型、skill eligibility、缺失依赖、安装状态，应从读取 `openclaw.json` 升级为调用上述 Gateway RPC。
+- 当前插件已调用 `skills.status`，并对结果做 5 秒缓存，避免状态页高频刷新反复访问 Gateway。
+- `models.list` 仍未作为独立模型目录来源使用；如果之后需要展示完整模型目录、skill eligibility、缺失依赖、安装状态，可以继续扩展上述 Gateway RPC。
 
 ## 8. Frontend Feature: 53AIHub Bridge Status
 
@@ -902,8 +903,8 @@ Bridge to OpenClaw upstream:
 | `session.message` event | User/assistant transcript rows | `mapGatewayFrameToEvents()` in [plugin/src/gateway-client.ts](./plugin/src/gateway-client.ts) | [Common event families](https://docs.openclaw.ai/gateway/protocol#common-event-families) |
 | `session.tool` event | Tool call/result activity | `mapGatewayFrameToEvents()` in [plugin/src/gateway-client.ts](./plugin/src/gateway-client.ts) | [Common event families](https://docs.openclaw.ai/gateway/protocol#common-event-families) |
 | `sessions.changed` event | Run started/completed/status update | `mapGatewayFrameToEvents()` in [plugin/src/gateway-client.ts](./plugin/src/gateway-client.ts) | [Common event families](https://docs.openclaw.ai/gateway/protocol#common-event-families) |
-| `models.list` | Not currently called; recommended future source for model panel | N/A | [Models and usage](https://docs.openclaw.ai/gateway/protocol#models-and-usage) |
-| `skills.status` | Not currently called; recommended future source for skill panel | N/A | [Operator helper methods](https://docs.openclaw.ai/gateway/protocol#operator-helper-methods) |
+| `skills.status` | Runtime skill/model summary for status panel | `getRuntimeInfo()` in [plugin/src/gateway-client.ts](./plugin/src/gateway-client.ts) | [Operator helper methods](https://docs.openclaw.ai/gateway/protocol#operator-helper-methods) |
+| `models.list` | Not currently called as a standalone model catalog source | N/A | [Models and usage](https://docs.openclaw.ai/gateway/protocol#models-and-usage) |
 | `tools.effective` | Not currently called; recommended future source for session-scoped tool inventory | N/A | [Operator helper methods](https://docs.openclaw.ai/gateway/protocol#operator-helper-methods) |
 | `status` | Not currently called; optional future Gateway status source | N/A | [System and identity](https://docs.openclaw.ai/gateway/protocol#system-and-identity) |
 | `health` | Not currently called; optional future Gateway health source | N/A | [System and identity](https://docs.openclaw.ai/gateway/protocol#system-and-identity) |
@@ -1151,6 +1152,6 @@ npx wscat -c ws://127.0.0.1:4318/ws/status
 2. Execution authority belongs to the local OpenClaw/QClaw Gateway.
 3. UI disconnects do not stop a Claw run; they only drop the browser subscription.
 4. Session history and events are persisted locally in JSON/JSONL-style plugin state.
-5. `modelPrimary` and `enabledSkills` currently come from `openclaw.json`, not from `models.list` / `skills.status`.
+5. `modelPrimary` and `enabledSkills` prefer runtime `skills.status`, then fall back to `openclaw.json`.
 6. 53AIHub protocol is company-specific and separate from OpenClaw Gateway Protocol.
 7. Secrets are never returned in `/api/bootstrap`, `/api/config`, `/api/status`, or frontend state.

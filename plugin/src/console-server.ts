@@ -9,7 +9,7 @@ import WebSocket, { WebSocketServer } from "ws";
 import { createHub53AIBridge, type Hub53AIConfig, type Hub53AIStatusSnapshot } from "./53aihub-client";
 import type { AgentEventProbe, AgentEventProbeSnapshot } from "./agent-event-probe";
 import { FileSessionStore } from "./file-store";
-import type { GatewayClient, GatewayConfig, GatewayEvent } from "./gateway-client";
+import type { GatewayClient, GatewayConfig, GatewayEvent, GatewayRuntimeInfo } from "./gateway-client";
 import { readHostRuntimeInfo, type HostRuntimeInfo } from "./host";
 import type { ControlAction, SessionDetail, SessionMessage, SessionStatus, SessionSummary, TimelineEvent } from "./models";
 
@@ -56,6 +56,8 @@ type StatusSnapshot = {
   agentEvents?: AgentEventProbeSnapshot;
 };
 
+const RUNTIME_INFO_CACHE_TTL_MS = 5_000;
+
 export function createConsoleServer(input: CreateConsoleServerInput) {
   const hostRuntime = input.hostRuntime ?? readHostRuntimeInfo(input.configPath);
   const store = new FileSessionStore(
@@ -70,6 +72,15 @@ export function createConsoleServer(input: CreateConsoleServerInput) {
   let currentPort = input.consoleConfig.port;
   let remoteSyncTimer: NodeJS.Timeout | undefined;
   let remoteSyncInFlight = false;
+  let runtimeInfoCache: {
+    value: GatewayRuntimeInfo | null;
+    updatedAtMs: number;
+    inFlight: Promise<void> | null;
+  } = {
+    value: null,
+    updatedAtMs: 0,
+    inFlight: null
+  };
   const hub53ai = input.hub53aiConfig
     ? createHub53AIBridge({
         stateDir: input.stateDir,
@@ -119,6 +130,7 @@ export function createConsoleServer(input: CreateConsoleServerInput) {
   async function start() {
     await store.init();
     await syncRemoteSessions();
+    await refreshRuntimeInfo(true);
     await hub53ai?.start();
     await new Promise<void>((resolvePromise) => {
       httpServer.listen(input.consoleConfig.port, input.consoleConfig.host, () => resolvePromise());
@@ -542,8 +554,40 @@ export function createConsoleServer(input: CreateConsoleServerInput) {
     await store.appendMessage(derived);
   }
 
+  async function refreshRuntimeInfo(force = false) {
+    const now = Date.now();
+    if (!force && runtimeInfoCache.value && now - runtimeInfoCache.updatedAtMs < RUNTIME_INFO_CACHE_TTL_MS) {
+      return;
+    }
+    if (runtimeInfoCache.inFlight) {
+      await runtimeInfoCache.inFlight;
+      return;
+    }
+
+    runtimeInfoCache.inFlight = (async () => {
+      try {
+        runtimeInfoCache.value = await input.gateway.getRuntimeInfo();
+        runtimeInfoCache.updatedAtMs = Date.now();
+      } catch {
+        runtimeInfoCache.updatedAtMs = Date.now();
+      } finally {
+        runtimeInfoCache.inFlight = null;
+      }
+    })();
+    await runtimeInfoCache.inFlight;
+  }
+
+  function getRuntimeInfoSnapshot(): GatewayRuntimeInfo {
+    if (!runtimeInfoCache.inFlight && Date.now() - runtimeInfoCache.updatedAtMs >= RUNTIME_INFO_CACHE_TTL_MS) {
+      void refreshRuntimeInfo();
+    }
+    return runtimeInfoCache.value ?? { enabledSkills: [] };
+  }
+
   function buildStatusSnapshot(): StatusSnapshot {
     const sessions = store.listSessions();
+    const runtimeInfo = getRuntimeInfoSnapshot();
+    const runtimeSkills = runtimeInfo.enabledSkills.filter((skill) => skill.trim());
     return {
       hostKind: input.hostKind,
       stateDir: input.stateDir,
@@ -556,8 +600,8 @@ export function createConsoleServer(input: CreateConsoleServerInput) {
       activeSessionCount: sessions.length,
       runningSessionCount: sessions.filter((session) => session.status === "running").length,
       healthy: lastGatewayError === null,
-      modelPrimary: hostRuntime.modelPrimary,
-      enabledSkills: hostRuntime.enabledSkills,
+      modelPrimary: runtimeInfo.modelPrimary ?? hostRuntime.modelPrimary,
+      enabledSkills: runtimeSkills.length ? runtimeSkills : hostRuntime.enabledSkills,
       hub53ai: hub53ai?.getStatus(),
       agentEvents: input.agentEventProbe?.getSnapshot()
     };

@@ -448,6 +448,80 @@ describe("console server", () => {
     }
   });
 
+  it("prefers runtime skill metadata from the gateway and falls back safely when unavailable", async () => {
+    const stateDir = await mkdtemp(join(tmpdir(), "claw-control-center-"));
+    cleanupPaths.push(stateDir);
+
+    const configPath = join(stateDir, "openclaw.json");
+    await writeFile(
+      configPath,
+      JSON.stringify(
+        {
+          agents: {
+            defaults: {
+              model: {
+                primary: "config/model"
+              }
+            }
+          },
+          skills: {
+            entries: {}
+          }
+        },
+        null,
+        2
+      )
+    );
+
+    const gateway = new FakeGateway();
+    gateway.runtimeInfo = {
+      modelPrimary: "runtime/model",
+      enabledSkills: ["weather", "web_search"]
+    };
+    const server = createConsoleServer({
+      stateDir,
+      configPath,
+      hostKind: "openclaw",
+      pluginVersion: "1.0.0",
+      token: "local-token",
+      gatewayConfig: {
+        baseUrl: "https://gateway.example.com",
+        botId: "bot-123",
+        secret: "sk-secret"
+      },
+      consoleConfig: {
+        host: "127.0.0.1",
+        port: 0
+      },
+      persistence: {
+        maxSessions: 20
+      },
+      gateway
+    });
+
+    await server.start();
+    try {
+      const bootstrap = await fetchJson<{
+        status: {
+          modelPrimary?: string;
+          enabledSkills?: string[];
+        };
+      }>(`${server.baseUrl}/api/bootstrap`);
+      expect(bootstrap.status.modelPrimary).toBe("runtime/model");
+      expect(bootstrap.status.enabledSkills).toEqual(["weather", "web_search"]);
+
+      gateway.runtimeInfoError = new Error("skills.status unsupported");
+      const status = await fetchJson<{
+        modelPrimary?: string;
+        enabledSkills?: string[];
+      }>(`${server.baseUrl}/api/status`);
+      expect(status.modelPrimary).toBe("runtime/model");
+      expect(status.enabledSkills).toEqual(["weather", "web_search"]);
+    } finally {
+      await server.stop();
+    }
+  });
+
   it("surfaces redacted 53AIHub bridge config and status", async () => {
     const stateDir = await mkdtemp(join(tmpdir(), "claw-control-center-"));
     cleanupPaths.push(stateDir);
@@ -516,9 +590,18 @@ class FakeGateway {
   private messageHistory = new Map<string, Array<{ id: string; sessionId: string; role: string; content: string; createdAt: string }>>();
   private eventHistory = new Map<string, GatewayEvent[]>();
   private listeners = new Map<string, Set<(event: GatewayEvent) => void>>();
+  runtimeInfo?: { modelPrimary?: string; enabledSkills: string[] };
+  runtimeInfoError?: Error;
 
   async listSessions(): Promise<GatewaySession[]> {
     return [...this.sessions.values()];
+  }
+
+  async getRuntimeInfo(): Promise<{ modelPrimary?: string; enabledSkills: string[] }> {
+    if (this.runtimeInfoError) {
+      throw this.runtimeInfoError;
+    }
+    return this.runtimeInfo ?? { enabledSkills: [] };
   }
 
   async createSession(title: string): Promise<GatewaySession> {

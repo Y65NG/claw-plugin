@@ -315,6 +315,123 @@ describe("gateway client", () => {
     await new Promise<void>((resolve) => wss.close(() => resolve()));
   });
 
+  it("reads runtime model and enabled skills from Gateway runtime metadata", async () => {
+    const capturedMethods: string[] = [];
+    const httpServer = createServer();
+    servers.add(httpServer);
+    const wss = new WebSocketServer({ noServer: true });
+
+    httpServer.on("upgrade", (request, socket, head) => {
+      wss.handleUpgrade(request, socket, head, (client) => {
+        client.send(
+          JSON.stringify({
+            type: "event",
+            event: "connect.challenge",
+            payload: { nonce: "nonce-1" }
+          })
+        );
+
+        client.on("message", (data) => {
+          const frame = JSON.parse(data.toString()) as {
+            id: string;
+            method: string;
+          };
+          capturedMethods.push(frame.method);
+          if (frame.method === "connect") {
+            client.send(JSON.stringify({ type: "res", id: frame.id, ok: true, payload: { protocol: 4 } }));
+            return;
+          }
+          if (frame.method === "skills.status") {
+            client.send(
+              JSON.stringify({
+                type: "res",
+                id: frame.id,
+                ok: true,
+                payload: {
+                  modelPrimary: "openai/gpt-5.5",
+                  skills: [
+                    "browser",
+                    { id: "weather", enabled: true },
+                    { id: "disabled-skill", enabled: false },
+                    { name: "web_search", status: "ready" },
+                    { key: "not-ready", status: "disabled" }
+                  ]
+                }
+              })
+            );
+            return;
+          }
+          client.send(JSON.stringify({ type: "res", id: frame.id, ok: true, payload: { ok: true } }));
+        });
+      });
+    });
+
+    const address = await listen(httpServer);
+    const client = createGatewayClient({
+      baseUrl: address.replace("http://", "ws://"),
+      secret: "shared-token"
+    });
+
+    await expect(client.getRuntimeInfo()).resolves.toEqual({
+      modelPrimary: "openai/gpt-5.5",
+      enabledSkills: ["browser", "weather", "web_search"]
+    });
+    expect(capturedMethods).toContain("skills.status");
+    await client.stop();
+    await new Promise<void>((resolve) => wss.close(() => resolve()));
+  });
+
+  it("returns empty runtime metadata when Gateway does not support skills.status", async () => {
+    const httpServer = createServer();
+    servers.add(httpServer);
+    const wss = new WebSocketServer({ noServer: true });
+
+    httpServer.on("upgrade", (request, socket, head) => {
+      wss.handleUpgrade(request, socket, head, (client) => {
+        client.send(
+          JSON.stringify({
+            type: "event",
+            event: "connect.challenge",
+            payload: { nonce: "nonce-1" }
+          })
+        );
+
+        client.on("message", (data) => {
+          const frame = JSON.parse(data.toString()) as {
+            id: string;
+            method: string;
+          };
+          if (frame.method === "connect") {
+            client.send(JSON.stringify({ type: "res", id: frame.id, ok: true, payload: { protocol: 4 } }));
+            return;
+          }
+          client.send(
+            JSON.stringify({
+              type: "res",
+              id: frame.id,
+              ok: false,
+              error: {
+                message: "method not found"
+              }
+            })
+          );
+        });
+      });
+    });
+
+    const address = await listen(httpServer);
+    const client = createGatewayClient({
+      baseUrl: address.replace("http://", "ws://"),
+      secret: "shared-token"
+    });
+
+    await expect(client.getRuntimeInfo()).resolves.toEqual({
+      enabledSkills: []
+    });
+    await client.stop();
+    await new Promise<void>((resolve) => wss.close(() => resolve()));
+  });
+
   it("drops replayed stream events at or below the subscribed sequence", async () => {
     const received: string[] = [];
     const httpServer = createServer();

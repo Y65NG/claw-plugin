@@ -47,6 +47,7 @@ type ActivityCard = {
 type EventListItem = {
   key: string;
   seq: number;
+  seqLabel?: string;
   kind: string;
   title: string;
   summary: string;
@@ -406,7 +407,7 @@ export function App() {
                     <span className="event-summary">{item.eventItem.summary}</span>
                   </span>
                   <span className="event-meta">
-                    <span>#{item.eventItem.seq}</span>
+                    <span>{item.eventItem.seqLabel ?? `#${item.eventItem.seq}`}</span>
                     <time>{formatUpdatedAt(item.eventItem.createdAt)}</time>
                   </span>
                 </summary>
@@ -460,7 +461,7 @@ export function App() {
                         <span className="event-summary">{item.summary}</span>
                       </span>
                       <span className="event-meta">
-                        <span>#{item.seq}</span>
+                        <span>{item.seqLabel ?? `#${item.seq}`}</span>
                         <time>{formatUpdatedAt(item.createdAt)}</time>
                       </span>
                     </summary>
@@ -711,24 +712,107 @@ function buildConversationItems(messages: SessionMessage[], events: TimelineEven
     order: index
   }));
 
-  const activityItems: ConversationItem[] = events
-    .map((event, index) => {
-      const activity = summarizeActivity(event);
-      if (!activity) {
-        return null;
-      }
-
-      return {
-        key: `activity-${event.sessionId}-${event.seq}`,
-        kind: "activity" as const,
-        createdAt: event.createdAt,
-        eventItem: summarizeEventListItem(event),
-        order: visibleMessages.length + index
-      };
-    })
-    .filter((item): item is ConversationItem => item !== null);
+  const activityItems = buildConversationActivityItems(events, visibleMessages.length);
 
   return [...messageItems, ...activityItems].sort(compareConversationItems);
+}
+
+function buildConversationActivityItems(events: TimelineEvent[], baseOrder: number): ConversationItem[] {
+  const items: ConversationItem[] = [];
+  let pendingReasoning: Array<{ event: TimelineEvent; index: number }> = [];
+
+  const flushReasoning = () => {
+    if (!pendingReasoning.length) {
+      return;
+    }
+    const group = pendingReasoning;
+    pendingReasoning = [];
+    const first = group[0]!;
+    const eventsToSummarize = group.map((entry) => entry.event);
+    const eventItem =
+      eventsToSummarize.length === 1
+        ? summarizeEventListItem(eventsToSummarize[0]!)
+        : summarizeMergedReasoningItem(eventsToSummarize);
+    items.push({
+      key: eventItem.key.replace(/^event-/, "activity-"),
+      kind: "activity",
+      createdAt: first.event.createdAt,
+      eventItem,
+      order: baseOrder + first.index
+    });
+  };
+
+  events.forEach((event, index) => {
+    if (event.kind === "assistant.thinking" && summarizeActivity(event)) {
+      const previous = pendingReasoning.at(-1)?.event;
+      if (previous && !canMergeReasoningEvents(previous, event)) {
+        flushReasoning();
+      }
+      pendingReasoning.push({ event, index });
+      return;
+    }
+
+    flushReasoning();
+    const activity = summarizeActivity(event);
+    if (!activity) {
+      return;
+    }
+    items.push({
+      key: `activity-${event.sessionId}-${event.seq}`,
+      kind: "activity",
+      createdAt: event.createdAt,
+      eventItem: summarizeEventListItem(event),
+      order: baseOrder + index
+    });
+  });
+
+  flushReasoning();
+  return items;
+}
+
+function canMergeReasoningEvents(left: TimelineEvent, right: TimelineEvent): boolean {
+  return reasoningVisibilityKey(left) === reasoningVisibilityKey(right);
+}
+
+function reasoningVisibilityKey(event: TimelineEvent): string {
+  return readNestedBoolean(event.payload, ["rawThinkingVisible"]) ? "raw" : "hidden";
+}
+
+function summarizeMergedReasoningItem(events: TimelineEvent[]): EventListItem {
+  const first = events[0]!;
+  const last = events.at(-1)!;
+  const rawThinkingVisible = readNestedBoolean(first.payload, ["rawThinkingVisible"]);
+  const contents = events
+    .map((event) =>
+      normalizeReasoningForDisplay(
+        readNestedString(event.payload, ["content"]) ??
+          "Claw emitted a thinking update. Raw reasoning is not displayed."
+      )
+    )
+    .filter(Boolean);
+  const combinedContent = contents.join("\n\n");
+  const textLength = events.reduce((total, event) => total + (readNestedNumber(event.payload, ["textLength"]) ?? 0), 0);
+
+  return {
+    key: `event-${first.sessionId}-${first.seq}-${last.seq}`,
+    seq: first.seq,
+    seqLabel: `#${first.seq}-#${last.seq}`,
+    kind: first.kind,
+    title: rawThinkingVisible ? "Model reasoning" : "Thinking update",
+    summary: truncateSummary(combinedContent),
+    detail: rawThinkingVisible
+      ? [
+          combinedContent,
+          `Reasoning segments: ${events.length}`,
+          ...(textLength ? [`Reasoning length: ${textLength} chars`] : [])
+        ].join("\n")
+      : [
+          "Private chain-of-thought is intentionally hidden; this card only marks that Claw produced a thinking stream.",
+          ...(textLength ? [`Hidden thinking length: ${textLength} chars`] : [])
+        ].join("\n"),
+    createdAt: first.createdAt,
+    tone: "neutral"
+  };
 }
 
 function dedupeConversationMessages(messages: SessionMessage[]): SessionMessage[] {

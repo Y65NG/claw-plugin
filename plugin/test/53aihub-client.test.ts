@@ -1,5 +1,5 @@
 import { createServer } from "node:http";
-import { mkdtemp, rm } from "node:fs/promises";
+import { mkdtemp, rm, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 
@@ -73,6 +73,186 @@ describe("53AIHub client", () => {
     });
     expect(parseIncomingMessage(JSON.stringify({ action: "ping" }))).toBeNull();
     expect(parseIncomingMessage("not-json")).toBeNull();
+  });
+
+  it("extracts 53AIHub user names and creates readable local session titles", async () => {
+    const chat = parseIncomingMessage(
+      JSON.stringify({
+        req_id: "req-title",
+        action: "chat",
+        data: {
+          user: "user-123",
+          conversation_id: "chat-title",
+          metadata: {
+            userName: "杨芳贤"
+          },
+          messages: [
+            {
+              role: "user",
+              content: "每日CRM与企微资讯简报查看53ai.com官网的更新"
+            }
+          ]
+        }
+      })
+    );
+
+    expect(chat).toMatchObject({
+      userName: "杨芳贤",
+      userId: "user-123",
+      chatId: "chat-title",
+      text: "每日CRM与企微资讯简报查看53ai.com官网的更新"
+    });
+
+    const stateDir = await mkdtemp(join(tmpdir(), "claw-53aihub-"));
+    cleanupPaths.push(stateDir);
+    const server = await createFakeHubServer();
+    cleanupServers.push(server.close);
+    const gateway = new FakeGateway();
+
+    const bridge = createHub53AIBridge({
+      stateDir,
+      config: {
+        enabled: true,
+        botId: "bot-123",
+        secret: "sk-secret",
+        wsUrl: server.url,
+        accessPolicy: "open",
+        allowFrom: [],
+        sendThinkingMessage: false,
+        reconnectBaseMs: 20,
+        maxReconnectAttempts: 2
+      },
+      gateway,
+      callbacks: {
+        onSessionUpsert: async (session) => {
+          gateway.upsertSession(session);
+        },
+        onUserMessage: async () => undefined,
+        onSessionStatus: async () => undefined,
+        onEnsureSessionStream: async () => undefined,
+        getLastEventSeq: () => 0,
+        onStatusChange: () => undefined
+      }
+    });
+
+    await bridge.start();
+    try {
+      const connection = await server.connected;
+      connection.socket.send(
+        JSON.stringify({
+          req_id: "req-title",
+          action: "chat",
+          data: {
+            user: "user-123",
+            conversation_id: "chat-title",
+            metadata: {
+              userName: "杨芳贤"
+            },
+            messages: [
+              {
+                role: "user",
+                content: "每日CRM与企微资讯简报查看53ai.com官网的更新"
+              }
+            ]
+          }
+        })
+      );
+
+      await waitFor(() => {
+        expect(gateway.createdTitles).toEqual([
+          "53AI Hub-杨芳贤：每日CRM与企微资讯简报查看53ai.com官网的更新"
+        ]);
+      });
+    } finally {
+      await bridge.stop();
+    }
+  });
+
+  it("renames only old 53AIHub placeholder session titles for existing mappings", async () => {
+    const stateDir = await mkdtemp(join(tmpdir(), "claw-53aihub-"));
+    cleanupPaths.push(stateDir);
+    await writeFile(
+      join(stateDir, "claw-control-center-53aihub.json"),
+      JSON.stringify(
+        {
+          mappings: {
+            "chat-title": "session-existing"
+          },
+          outbox: []
+        },
+        null,
+        2
+      )
+    );
+
+    const server = await createFakeHubServer();
+    cleanupServers.push(server.close);
+    const gateway = new FakeGateway();
+    gateway.upsertSession({
+      id: "session-existing",
+      title: "53AIHub chat-title",
+      status: "idle",
+      hostKind: "qclaw",
+      runnerCommand: "gateway",
+      createdAt: new Date().toISOString(),
+      updatedAt: new Date().toISOString(),
+      lastEventSeq: 0
+    });
+
+    const bridge = createHub53AIBridge({
+      stateDir,
+      config: {
+        enabled: true,
+        botId: "bot-123",
+        secret: "sk-secret",
+        wsUrl: server.url,
+        accessPolicy: "open",
+        allowFrom: [],
+        sendThinkingMessage: false,
+        reconnectBaseMs: 20,
+        maxReconnectAttempts: 2
+      },
+      gateway,
+      callbacks: {
+        onSessionUpsert: async (session) => {
+          gateway.upsertSession(session);
+        },
+        onUserMessage: async () => undefined,
+        onSessionStatus: async () => undefined,
+        onEnsureSessionStream: async () => undefined,
+        getLastEventSeq: () => 0,
+        onStatusChange: () => undefined
+      }
+    });
+
+    await bridge.start();
+    try {
+      const connection = await server.connected;
+      connection.socket.send(
+        JSON.stringify({
+          req_id: "req-rename",
+          action: "message",
+          data: {
+            msgId: "msg-title",
+            chatId: "chat-title",
+            userId: "user-123",
+            userName: "杨芳贤",
+            content: "每日CRM与企微资讯简报查看53ai.com官网的更新"
+          }
+        })
+      );
+
+      await waitFor(() => {
+        expect(gateway.renames).toEqual([
+          {
+            sessionId: "session-existing",
+            title: "53AI Hub-杨芳贤：每日CRM与企微资讯简报查看53ai.com官网的更新"
+          }
+        ]);
+      });
+    } finally {
+      await bridge.stop();
+    }
   });
 
   it("authenticates to 53AIHub and bridges remote chat frames to the local gateway", async () => {
@@ -273,12 +453,19 @@ class FakeGateway {
   private listeners = new Map<string, Set<(event: GatewayEvent) => void>>();
   sentMessages: Array<{ sessionId: string; content: string }> = [];
   eventsToEmit?: GatewayEvent[];
+  createdTitles: string[] = [];
+  renames: Array<{ sessionId: string; title: string }> = [];
 
   async listSessions(): Promise<GatewaySession[]> {
     return [...this.sessions.values()];
   }
 
+  async getRuntimeInfo(): Promise<{ enabledSkills: string[] }> {
+    return { enabledSkills: [] };
+  }
+
   async createSession(title: string): Promise<GatewaySession> {
+    this.createdTitles.push(title);
     const now = new Date().toISOString();
     const session: GatewaySession = {
       id: `session-${this.sessions.size + 1}`,
@@ -338,7 +525,18 @@ class FakeGateway {
     }, 10);
   }
 
-  async controlSession(): Promise<void> {
+  async controlSession(sessionId: string, action?: string, title?: string): Promise<void> {
+    if (action === "rename" && title) {
+      this.renames.push({ sessionId, title });
+      const session = this.sessions.get(sessionId);
+      if (session) {
+        this.sessions.set(sessionId, {
+          ...session,
+          title,
+          updatedAt: new Date().toISOString()
+        });
+      }
+    }
     return;
   }
 

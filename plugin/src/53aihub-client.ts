@@ -39,6 +39,7 @@ export type Hub53AIIncomingMessage = {
   reqId: string;
   chatId: string;
   userId: string;
+  userName?: string;
   text: string;
   imageUrls?: string[];
   fileUrls?: string[];
@@ -100,6 +101,8 @@ const HEARTBEAT_INTERVAL_MS = 30_000;
 const DEFAULT_THINKING_MESSAGE = "正在处理您的请求...";
 const MAX_OUTBOX_FRAMES = 200;
 const RUN_WAIT_TIMEOUT_MS = 30 * 60 * 1000;
+const HUB_SESSION_TITLE_PREFIX = "53AI Hub-";
+const HUB_TITLE_SUMMARY_LENGTH = 40;
 
 export function createHub53AIBridge(input: HubBridgeInput) {
   const statePath = join(input.stateDir, "claw-control-center-53aihub.json");
@@ -477,18 +480,37 @@ export function createHub53AIBridge(input: HubBridgeInput) {
   }
 
   async function resolveSession(message: Hub53AIIncomingMessage): Promise<GatewaySession> {
+    const desiredTitle = buildHubSessionTitle(message);
     const mappedId = state.mappings[message.chatId];
     if (mappedId) {
       const session = await input.gateway.getSession(mappedId);
-      await input.callbacks.onSessionUpsert(session);
-      return session;
+      const nextSession = await renamePlaceholderSessionIfNeeded(session, message, desiredTitle);
+      await input.callbacks.onSessionUpsert(nextSession);
+      return nextSession;
     }
 
-    const session = await input.gateway.createSession(`53AIHub ${message.chatId}`);
+    const session = await input.gateway.createSession(desiredTitle);
     state.mappings[message.chatId] = session.id;
     await persistState();
     await input.callbacks.onSessionUpsert(session);
     return session;
+  }
+
+  async function renamePlaceholderSessionIfNeeded(
+    session: GatewaySession,
+    message: Hub53AIIncomingMessage,
+    desiredTitle: string
+  ): Promise<GatewaySession> {
+    if (!isOldHubPlaceholderTitle(session.title, message.chatId)) {
+      return session;
+    }
+
+    await input.gateway.controlSession(session.id, "rename", desiredTitle);
+    return {
+      ...session,
+      title: desiredTitle,
+      updatedAt: new Date().toISOString()
+    };
   }
 
   async function sendReply(inputReply: {
@@ -603,6 +625,7 @@ export function parseIncomingMessage(rawJson: string): Hub53AIIncomingMessage | 
 
     if (wsMsg.action === "chat") {
       const openAIReq = toRecord(wsMsg.data);
+      const metadata = toRecord(openAIReq.metadata);
       const messages = Array.isArray(openAIReq.messages) ? openAIReq.messages : [];
       const lastUserMsg = [...messages].reverse().find((message) => toRecord(message).role === "user");
       if (!lastUserMsg) {
@@ -610,7 +633,15 @@ export function parseIncomingMessage(rawJson: string): Hub53AIIncomingMessage | 
       }
       const userMessage = toRecord(lastUserMsg);
       const content = userMessage.content;
-      const userId = stringOr(openAIReq.user, userMessage.name, `user-${String(wsMsg.req_id ?? randomUUID())}`);
+      const userObject = toRecord(openAIReq.user);
+      const userId = stringOr(
+        openAIReq.user,
+        userObject.id,
+        userObject.userId,
+        userMessage.userId,
+        userMessage.name,
+        `user-${String(wsMsg.req_id ?? randomUUID())}`
+      );
       const chatId = stringOr(openAIReq.conversation_id, userId);
       return {
         type: "message",
@@ -618,6 +649,7 @@ export function parseIncomingMessage(rawJson: string): Hub53AIIncomingMessage | 
         reqId: String(wsMsg.req_id ?? randomUUID()),
         chatId,
         userId,
+        userName: extractUserName(openAIReq, metadata, userObject, userMessage),
         text: extractTextFromContent(content),
         imageUrls: extractImagesFromContent(content),
         fileUrls: extractFilesFromContent(content)
@@ -625,14 +657,16 @@ export function parseIncomingMessage(rawJson: string): Hub53AIIncomingMessage | 
     }
 
     const data = toRecord(wsMsg.data);
+    const userObject = toRecord(data.user);
     const chatId = stringOr(data.chatId, data.userId, "default-chat");
-    const userId = stringOr(data.userId, data.chatId, "default-user");
+    const userId = stringOr(data.userId, userObject.id, userObject.userId, data.chatId, "default-user");
     return {
       type: stringOr(data.type, "message"),
       msgId: stringOr(data.msgId, data.id, `msg-${Date.now()}`),
       reqId: String(wsMsg.req_id ?? data.msgId ?? data.id ?? `msg-${Date.now()}`),
       chatId,
       userId,
+      userName: extractUserName(data, userObject),
       text: stringOr(data.text, data.content, ""),
       imageUrls: normalizeUrlList(data.imageUrls, data.images),
       fileUrls: normalizeUrlList(data.fileUrls, data.files),
@@ -641,6 +675,86 @@ export function parseIncomingMessage(rawJson: string): Hub53AIIncomingMessage | 
   } catch {
     return null;
   }
+}
+
+function extractUserName(...sources: unknown[]): string | undefined {
+  const nameKeys = [
+    "userName",
+    "username",
+    "nickName",
+    "nickname",
+    "displayName",
+    "senderName",
+    "fromUserName",
+    "name"
+  ];
+
+  for (const source of sources) {
+    const record = toRecord(source);
+    const direct = stringFromKeys(record, nameKeys);
+    if (direct) {
+      return direct;
+    }
+
+    const nestedUser = toRecord(record.user);
+    const nestedName = stringFromKeys(nestedUser, nameKeys);
+    if (nestedName) {
+      return nestedName;
+    }
+  }
+
+  return undefined;
+}
+
+function stringFromKeys(record: Record<string, any>, keys: string[]): string | undefined {
+  for (const key of keys) {
+    const value = record[key];
+    if (typeof value === "string" && value.trim()) {
+      return value.trim();
+    }
+  }
+  return undefined;
+}
+
+function buildHubSessionTitle(message: Hub53AIIncomingMessage): string {
+  const userName = sanitizeTitlePart(message.userName || message.userId || message.chatId || "未知用户");
+  const summary = summarizeHubMessageForTitle(message);
+  return `${HUB_SESSION_TITLE_PREFIX}${userName}：${summary}`;
+}
+
+function summarizeHubMessageForTitle(message: Hub53AIIncomingMessage): string {
+  const text = normalizeTitleText(message.text || message.quoteContent || "");
+  if (text) {
+    return truncateVisibleText(text, HUB_TITLE_SUMMARY_LENGTH);
+  }
+  if (message.imageUrls?.length && message.fileUrls?.length) {
+    return "多媒体消息";
+  }
+  if (message.imageUrls?.length) {
+    return "图片消息";
+  }
+  if (message.fileUrls?.length) {
+    return "文件消息";
+  }
+  return "新会话";
+}
+
+function sanitizeTitlePart(value: string): string {
+  return normalizeTitleText(value).replace(/[：:]/g, "").slice(0, 40) || "未知用户";
+}
+
+function normalizeTitleText(value: string): string {
+  return value.replace(/\s+/g, " ").trim();
+}
+
+function truncateVisibleText(value: string, maxLength: number): string {
+  const chars = Array.from(value);
+  return chars.length > maxLength ? `${chars.slice(0, maxLength).join("")}…` : value;
+}
+
+function isOldHubPlaceholderTitle(title: string, chatId: string): boolean {
+  const normalized = title.trim();
+  return [`53AIHub ${chatId}`, `53AIHub:${chatId}`, `53AIHub-${chatId}`, chatId].includes(normalized);
 }
 
 function buildPrompt(message: Hub53AIIncomingMessage): string {
