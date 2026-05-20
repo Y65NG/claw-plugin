@@ -346,6 +346,76 @@ button {
   line-height: 1.5;
 }
 
+.tool-detail-card {
+  display: grid;
+  gap: 12px;
+  margin: 0 10px 10px;
+  padding: 12px;
+  border: 1px solid #e6e9ee;
+  border-radius: 13px;
+  background: #f3f4f6;
+}
+
+.tool-detail-heading {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 10px;
+  color: #586272;
+  font-size: 0.74rem;
+  font-weight: 700;
+}
+
+.tool-detail-name::before {
+  content: "↗";
+  margin-right: 7px;
+  color: #9aa3af;
+}
+
+.tool-detail-error {
+  padding: 2px 7px;
+  border-radius: 999px;
+  background: #fff1f2;
+  color: #c24152;
+  font-size: 0.66rem;
+  text-transform: uppercase;
+}
+
+.tool-detail-meta {
+  color: #7d8795;
+  font-size: 0.74rem;
+  line-height: 1.45;
+}
+
+.tool-detail-section {
+  display: grid;
+  gap: 8px;
+}
+
+.tool-detail-section h4 {
+  margin: 0;
+  color: #7b8491;
+  font-size: 0.69rem;
+  font-weight: 800;
+  letter-spacing: 0.08em;
+}
+
+.tool-detail-card .tool-detail-code {
+  max-height: 320px;
+  margin: 0;
+  padding: 12px;
+  overflow: auto;
+  white-space: pre-wrap;
+  word-break: break-word;
+  border: 1px solid #e9edf2;
+  border-radius: 11px;
+  background: #ffffff;
+  color: #4d5968;
+  font-family: "SFMono-Regular", Consolas, "Liberation Mono", monospace;
+  font-size: 0.72rem;
+  line-height: 1.55;
+}
+
 .event-kind-assistant-thinking {
   border-style: dashed;
   border-color: #d4d9df;

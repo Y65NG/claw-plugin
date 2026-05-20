@@ -635,10 +635,38 @@ describe("App", () => {
               seq: 13,
               kind: "assistant.thinking",
               payload: {
-                content: "I need to inspect the weather skill, then call the weather tool.",
+                content: "Let meLet me inspect the weather skill, then call the weather tool.",
                 privateContentOmitted: false,
                 rawThinkingVisible: true,
                 textLength: 42
+              },
+              createdAt: now
+            },
+            {
+              id: "evt-5",
+              sessionId: "session-1",
+              seq: 14,
+              kind: "tool.call",
+              payload: {
+                data: {
+                  phase: "result",
+                  name: "web_search",
+                  meta: "for \"best books\" (top 3)",
+                  isError: false,
+                  result: {
+                    details: {
+                      query: "best books",
+                      provider: "duckduckgo",
+                      count: 3,
+                      results: [
+                        {
+                          title: "Example result",
+                          url: "https://example.com/books"
+                        }
+                      ]
+                    }
+                  }
+                }
               },
               createdAt: now
             }
@@ -661,17 +689,24 @@ describe("App", () => {
       expect(screen.getByText("Enabled skills")).toBeInTheDocument();
       expect(screen.getByText("browser, online-search")).toBeInTheDocument();
       expect(conversation.getByText("Inspected skill weather")).toBeInTheDocument();
-      expect(conversation.getByText("Used tool weather")).toBeInTheDocument();
+      expect(conversation.getByText("Used Weather")).toBeInTheDocument();
       expect(conversation.getByText("Model reasoning")).toBeInTheDocument();
-      expect(conversation.getByText("I need to inspect the weather skill, then call the weather tool.")).toBeInTheDocument();
-      expect(conversationElement.querySelectorAll(".conversation-event-row.event-row")).toHaveLength(3);
+      expect(conversation.getByText("Let me inspect the weather skill, then call the weather tool.")).toBeInTheDocument();
+      expect(conversation.getByText("Tool output")).toBeInTheDocument();
+      expect(conversation.getAllByText("TOOL INPUT").length).toBeGreaterThan(0);
+      expect(conversation.getByText("TOOL OUTPUT")).toBeInTheDocument();
+      expect(conversation.getAllByText(/best books/).length).toBeGreaterThan(0);
+      expect(conversationElement.querySelectorAll(".conversation-event-row.event-row")).toHaveLength(4);
       expect(conversationElement.querySelector(".event-kind-assistant-thinking")).toBeTruthy();
       expect(conversationElement.querySelectorAll(".event-kind-tool-call")).toHaveLength(2);
+      expect(conversationElement.querySelectorAll(".event-kind-tool-result")).toHaveLength(1);
+      expect(conversation.queryByText("No user-facing arguments were captured for this tool call.")).not.toBeInTheDocument();
       expect(conversation.queryByText("Show details")).not.toBeInTheDocument();
       expect(eventPanel.getByText("Event list")).toBeInTheDocument();
       expect(eventPanel.getByText("Run started")).toBeInTheDocument();
       expect(eventPanel.getByText("Inspected skill weather")).toBeInTheDocument();
-      expect(eventPanel.getByText("Used tool weather")).toBeInTheDocument();
+      expect(eventPanel.getByText("Used Weather")).toBeInTheDocument();
+      expect(eventPanel.getByText("Tool output")).toBeInTheDocument();
       expect(eventPanel.getByText("Model reasoning")).toBeInTheDocument();
       expect(sidebar.queryByText("Event list")).not.toBeInTheDocument();
     });

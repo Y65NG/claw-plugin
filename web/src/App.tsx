@@ -36,10 +36,12 @@ type ConversationItem =
     };
 
 type ActivityCard = {
+  kind?: string;
   title: string;
   summary: string;
   details: string[];
   tone: "neutral" | "success" | "warning";
+  tool?: ToolDisplay;
 };
 
 type EventListItem = {
@@ -51,6 +53,16 @@ type EventListItem = {
   detail: string;
   createdAt: string;
   tone: "neutral" | "success" | "warning";
+  tool?: ToolDisplay;
+};
+
+type ToolDisplay = {
+  name: string;
+  displayName: string;
+  meta?: string;
+  input?: unknown;
+  output?: unknown;
+  isError: boolean;
 };
 
 function resetScrollToTop(element: HTMLDivElement | null) {
@@ -398,7 +410,7 @@ export function App() {
                     <time>{formatUpdatedAt(item.eventItem.createdAt)}</time>
                   </span>
                 </summary>
-                <pre>{item.eventItem.detail}</pre>
+                <EventDetail item={item.eventItem} />
               </details>
             )
           )}
@@ -452,7 +464,7 @@ export function App() {
                         <time>{formatUpdatedAt(item.createdAt)}</time>
                       </span>
                     </summary>
-                    <pre>{item.detail}</pre>
+                    <EventDetail item={item} />
                   </details>
                 ))
               ) : (
@@ -524,6 +536,37 @@ export function App() {
       </aside>
     </div>
   );
+}
+
+function EventDetail({ item }: { item: EventListItem }) {
+  if (item.tool) {
+    return (
+      <div className="tool-detail-card">
+        <div className="tool-detail-heading">
+          <span className="tool-detail-name">{item.tool.displayName}</span>
+          {item.tool.isError ? <span className="tool-detail-error">error</span> : null}
+        </div>
+        {item.tool.meta ? <div className="tool-detail-meta">with {item.tool.meta}</div> : null}
+        {item.tool.input !== undefined ? (
+          <section className="tool-detail-section">
+            <h4>TOOL INPUT</h4>
+            <pre className="tool-detail-code">{formatToolValue(item.tool.input)}</pre>
+          </section>
+        ) : null}
+        {item.tool.output !== undefined ? (
+          <section className="tool-detail-section">
+            <h4>TOOL OUTPUT</h4>
+            <pre className="tool-detail-code">{formatToolValue(item.tool.output)}</pre>
+          </section>
+        ) : null}
+        {item.tool.input === undefined && item.tool.output === undefined ? (
+          <pre className="tool-detail-code">{item.detail}</pre>
+        ) : null}
+      </div>
+    );
+  }
+
+  return <pre>{item.detail}</pre>;
 }
 
 function sortSessions(sessions: SessionSummary[]): SessionSummary[] {
@@ -730,9 +773,10 @@ function dedupeConversationMessages(messages: SessionMessage[]): SessionMessage[
 
 function summarizeActivity(event: TimelineEvent): ActivityCard | null {
   if (event.kind === "assistant.thinking") {
-    const content =
+    const content = normalizeReasoningForDisplay(
       readNestedString(event.payload, ["content"]) ??
-      "Claw emitted a thinking update. Raw reasoning is not displayed.";
+        "Claw emitted a thinking update. Raw reasoning is not displayed."
+    );
     const textLength = readNestedNumber(event.payload, ["textLength"]);
     const rawThinkingVisible = readNestedBoolean(event.payload, ["rawThinkingVisible"]);
     if (rawThinkingVisible) {
@@ -755,6 +799,10 @@ function summarizeActivity(event: TimelineEvent): ActivityCard | null {
       ],
       tone: "neutral"
     };
+  }
+
+  if (event.kind === "tool.result" || (event.kind === "tool.call" && isToolResultLike(event))) {
+    return summarizeToolResult(event);
   }
 
   if (event.kind === "tool.call") {
@@ -803,12 +851,13 @@ function summarizeEventListItem(event: TimelineEvent): EventListItem {
     return {
       key: `event-${event.sessionId}-${event.seq}`,
       seq: event.seq,
-      kind: event.kind,
+      kind: activity.kind ?? event.kind,
       title: activity.title,
       summary: activity.summary,
       detail: activity.details.join("\n") || formatEventPayload(event.payload),
       createdAt: event.createdAt,
-      tone: activity.tone
+      tone: activity.tone,
+      tool: activity.tool
     };
   }
 
@@ -827,9 +876,10 @@ function summarizeEventListItem(event: TimelineEvent): EventListItem {
   }
 
   if (event.kind === "assistant.thinking") {
-    const content =
+    const content = normalizeReasoningForDisplay(
       readNestedString(event.payload, ["content"]) ??
-      "Claw emitted a thinking update. Raw reasoning is not displayed.";
+        "Claw emitted a thinking update. Raw reasoning is not displayed."
+    );
     const textLength = readNestedNumber(event.payload, ["textLength"]);
     const rawThinkingVisible = readNestedBoolean(event.payload, ["rawThinkingVisible"]);
     return {
@@ -863,21 +913,17 @@ function summarizeEventListItem(event: TimelineEvent): EventListItem {
   }
 
   if (event.kind === "tool.result") {
-    const toolName = readNestedString(event.payload, ["data", "name"]) ?? readNestedString(event.payload, ["name"]);
-    const result =
-      readNestedString(event.payload, ["data", "result"]) ??
-      readNestedString(event.payload, ["result"]) ??
-      readNestedString(event.payload, ["output"]) ??
-      readNestedString(event.payload, ["content"]);
+    const tool = buildToolDisplay(event);
     return {
       key: `event-${event.sessionId}-${event.seq}`,
       seq: event.seq,
       kind: event.kind,
       title: "Tool output",
-      summary: toolName ?? (result ? truncateSummary(result, 96) : "Tool result"),
-      detail: result || formatEventPayload(event.payload),
+      summary: tool?.displayName ?? "Tool result",
+      detail: tool ? formatToolDetail(tool, true).join("\n") : formatEventPayload(event.payload),
       createdAt: event.createdAt,
-      tone: "success"
+      tone: tool?.isError ? "warning" : "success",
+      tool
     };
   }
 
@@ -942,12 +988,15 @@ function summarizeEventListItem(event: TimelineEvent): EventListItem {
 }
 
 function summarizeToolCall(event: TimelineEvent): ActivityCard | null {
-  const toolName = readNestedString(event.payload, ["data", "name"]) ?? readNestedString(event.payload, ["name"]);
-  if (!toolName) {
+  const tool = buildToolDisplay(event);
+  if (!tool) {
     return null;
   }
 
-  const path = readNestedString(event.payload, ["data", "args", "path"]);
+  const toolName = tool.name;
+  const path =
+    readNestedString(event.payload, ["data", "args", "path"]) ??
+    readStringFromUnknown(tool.input, ["path"]);
   const skillName = extractSkillName(path);
   if (skillName) {
     return {
@@ -958,14 +1007,29 @@ function summarizeToolCall(event: TimelineEvent): ActivityCard | null {
     };
   }
 
-  const args = readNestedObject(event.payload, ["data", "args"]);
-  const argumentSummary = summarizeArguments(args);
-  const toolCallTitle = formatToolCallTitle(toolName, args);
   return {
-    title: toolCallTitle ?? `Used tool ${toolName}`,
-    summary: toolName,
-    details: argumentSummary ? [argumentSummary] : ["No user-facing arguments were captured for this tool call."],
-    tone: "neutral"
+    kind: "tool.call",
+    title: tool.meta ?? formatToolCallTitle(toolName, asRecord(tool.input)) ?? `Used ${tool.displayName}`,
+    summary: tool.displayName,
+    details: formatToolDetail(tool, event.kind === "tool.result"),
+    tone: tool.isError ? "warning" : "neutral",
+    tool
+  };
+}
+
+function summarizeToolResult(event: TimelineEvent): ActivityCard | null {
+  const tool = buildToolDisplay(event);
+  if (!tool) {
+    return null;
+  }
+
+  return {
+    kind: "tool.result",
+    title: "Tool output",
+    summary: tool.displayName,
+    details: formatToolDetail(tool, true),
+    tone: tool.isError ? "warning" : "success",
+    tool
   };
 }
 
@@ -1001,6 +1065,202 @@ function formatToolCallTitle(toolName: string, args?: Record<string, unknown>): 
   return null;
 }
 
+function buildToolDisplay(event: TimelineEvent): ToolDisplay | undefined {
+  const toolName =
+    readNestedString(event.payload, ["data", "name"]) ??
+    readNestedString(event.payload, ["name"]) ??
+    readNestedString(event.payload, ["tool"]) ??
+    readNestedString(event.payload, ["toolName"]);
+  if (!toolName) {
+    return undefined;
+  }
+
+  const meta =
+    readNestedString(event.payload, ["data", "meta"]) ??
+    readNestedString(event.payload, ["meta"]) ??
+    readNestedString(event.payload, ["title"]);
+  const rawInput =
+    readNestedValue(event.payload, ["data", "args"]) ??
+    readNestedValue(event.payload, ["data", "arguments"]) ??
+    readNestedValue(event.payload, ["data", "input"]) ??
+    readNestedValue(event.payload, ["args"]) ??
+    readNestedValue(event.payload, ["arguments"]) ??
+    readNestedValue(event.payload, ["input"]);
+  const rawOutput =
+    readNestedValue(event.payload, ["data", "result", "details"]) ??
+    readNestedValue(event.payload, ["data", "result", "output"]) ??
+    readNestedValue(event.payload, ["data", "result", "content"]) ??
+    readNestedValue(event.payload, ["data", "result"]) ??
+    readNestedValue(event.payload, ["result"]) ??
+    readNestedValue(event.payload, ["output"]) ??
+    readNestedValue(event.payload, ["content"]);
+  const output = normalizeToolValue(rawOutput);
+  const inferredInput =
+    normalizeToolValue(rawInput) ??
+    inferToolInputFromMeta(toolName, meta) ??
+    inferToolInputFromOutput(toolName, output);
+  const isError =
+    readNestedBoolean(event.payload, ["data", "isError"]) ||
+    readNestedString(event.payload, ["data", "result", "details", "status"]) === "error" ||
+    readNestedString(event.payload, ["result", "status"]) === "error";
+
+  return {
+    name: toolName,
+    displayName: formatToolName(toolName),
+    meta,
+    input: inferredInput,
+    output,
+    isError
+  };
+}
+
+function isToolResultLike(event: TimelineEvent): boolean {
+  const phase =
+    readNestedString(event.payload, ["phase"]) ??
+    readNestedString(event.payload, ["data", "phase"]);
+  return phase ? ["result", "done", "output"].includes(phase) : false;
+}
+
+function inferToolInputFromMeta(toolName: string, meta?: string): unknown {
+  if (!meta) {
+    return undefined;
+  }
+
+  const searchMatch = meta.match(/^for\s+"(.+)"(?:\s+\(top\s+(\d+)\))?/i);
+  if (searchMatch) {
+    return {
+      query: searchMatch[1],
+      ...(searchMatch[2] ? { count: Number(searchMatch[2]) } : {})
+    };
+  }
+
+  const fetchMatch = meta.match(/^from\s+(\S+)(?:\s+\(max\s+(\d+)\s+chars\))?/i);
+  if (fetchMatch) {
+    return {
+      url: fetchMatch[1],
+      ...(fetchMatch[2] ? { maxChars: Number(fetchMatch[2]) } : {})
+    };
+  }
+
+  if (toolName === "exec" || toolName === "shell") {
+    return { command: meta };
+  }
+
+  return undefined;
+}
+
+function inferToolInputFromOutput(toolName: string, output: unknown): unknown {
+  const record = asRecord(output);
+  if (!record) {
+    return undefined;
+  }
+
+  if (toolName === "web_search") {
+    const query = readStringFromRecord(record, ["query"]);
+    const count = readNumberFromRecord(record, ["count", "limit", "top"]);
+    if (query) {
+      return {
+        query,
+        ...(count ? { count } : {})
+      };
+    }
+  }
+
+  if (toolName === "web_fetch") {
+    const url = readStringFromRecord(record, ["url", "href"]);
+    const maxChars = readNumberFromRecord(record, ["maxChars", "max_chars", "limit"]);
+    if (url) {
+      return {
+        url,
+        ...(maxChars ? { maxChars } : {})
+      };
+    }
+  }
+
+  return undefined;
+}
+
+function formatToolDetail(tool: ToolDisplay, includeOutput: boolean): string[] {
+  const lines = [tool.displayName];
+  if (tool.meta) {
+    lines.push(`with ${tool.meta}`);
+  }
+  if (tool.input !== undefined) {
+    lines.push("TOOL INPUT", formatToolValue(tool.input));
+  }
+  if (includeOutput && tool.output !== undefined) {
+    lines.push("TOOL OUTPUT", formatToolValue(tool.output));
+  }
+  return lines;
+}
+
+function formatToolName(toolName: string): string {
+  return toolName
+    .replace(/[_-]+/g, " ")
+    .replace(/\s+/g, " ")
+    .trim()
+    .replace(/\b\w/g, (match) => match.toUpperCase());
+}
+
+function normalizeToolValue(value: unknown): unknown {
+  if (value === undefined || value === null) {
+    return undefined;
+  }
+
+  if (typeof value === "string") {
+    const trimmed = value.trim();
+    if (!trimmed) {
+      return undefined;
+    }
+    return parseJsonishValue(trimmed) ?? trimmed;
+  }
+
+  if (Array.isArray(value)) {
+    const textParts = value
+      .flatMap((entry) => {
+        if (!entry || typeof entry !== "object") {
+          return [];
+        }
+        const record = entry as Record<string, unknown>;
+        const text = record.text ?? record.content ?? record.output;
+        return typeof text === "string" && text.trim() ? [text] : [];
+      });
+    if (textParts.length > 0) {
+      const joined = textParts.join("\n");
+      return parseJsonishValue(joined) ?? joined;
+    }
+    return value;
+  }
+
+  return value;
+}
+
+function parseJsonishValue(value: string): unknown {
+  if (!/^[\[{]/.test(value)) {
+    return undefined;
+  }
+  try {
+    return JSON.parse(value);
+  } catch {
+    return undefined;
+  }
+}
+
+function formatToolValue(value: unknown): string {
+  if (typeof value === "string") {
+    return value;
+  }
+  try {
+    return JSON.stringify(value, null, 2);
+  } catch {
+    return String(value);
+  }
+}
+
+function asRecord(value: unknown): Record<string, unknown> | undefined {
+  return value && typeof value === "object" && !Array.isArray(value) ? (value as Record<string, unknown>) : undefined;
+}
+
 function readStringFromRecord(record: Record<string, unknown>, keys: string[]): string | undefined {
   for (const key of keys) {
     const value = record[key];
@@ -1009,6 +1269,22 @@ function readStringFromRecord(record: Record<string, unknown>, keys: string[]): 
     }
   }
   return undefined;
+}
+
+function readStringFromUnknown(value: unknown, path: string[]): string | undefined {
+  const current = readUnknownPath(value, path);
+  return typeof current === "string" && current.trim() ? current.trim() : undefined;
+}
+
+function readUnknownPath(value: unknown, path: string[]): unknown {
+  let current = value;
+  for (const segment of path) {
+    if (!current || typeof current !== "object" || !(segment in current)) {
+      return undefined;
+    }
+    current = (current as Record<string, unknown>)[segment];
+  }
+  return current;
 }
 
 function readNumberFromRecord(record: Record<string, unknown>, keys: string[]): number | undefined {
@@ -1039,6 +1315,37 @@ function normalizeContentForComparison(content: string): string {
   return content.replace(/\s+/g, " ").trim();
 }
 
+function normalizeReasoningForDisplay(content: string): string {
+  return collapseRepeatedLeadingSegment(content);
+}
+
+function collapseRepeatedLeadingSegment(value: string): string {
+  const leadingWhitespace = value.match(/^\s*/)?.[0] ?? "";
+  const text = value.trimStart();
+  const maxSegmentLength = Math.min(32, Math.floor(text.length / 2));
+
+  for (let length = maxSegmentLength; length >= 2; length -= 1) {
+    const segment = text.slice(0, length);
+    if (!segment.trim() || !text.startsWith(`${segment}${segment}`)) {
+      continue;
+    }
+
+    const remainder = text.slice(length * 2);
+    const next = remainder[0] ?? "";
+    const segmentLooksNatural =
+      /\s/.test(segment) ||
+      /^[A-Z][a-z]+$/.test(segment) ||
+      /[\u4e00-\u9fff]/.test(segment);
+    const hasBoundary = !next || /\s|[,.!?;:，。！？；：]/.test(next) || /[\u4e00-\u9fff]/.test(next);
+
+    if (segmentLooksNatural && hasBoundary) {
+      return `${leadingWhitespace}${segment}${remainder}`;
+    }
+  }
+
+  return value;
+}
+
 function readNestedObject(value: unknown, path: string[]): Record<string, unknown> | undefined {
   let current = value;
   for (const segment of path) {
@@ -1048,6 +1355,17 @@ function readNestedObject(value: unknown, path: string[]): Record<string, unknow
     current = (current as Record<string, unknown>)[segment];
   }
   return current && typeof current === "object" ? (current as Record<string, unknown>) : undefined;
+}
+
+function readNestedValue(value: unknown, path: string[]): unknown {
+  let current = value;
+  for (const segment of path) {
+    if (!current || typeof current !== "object" || !(segment in current)) {
+      return undefined;
+    }
+    current = (current as Record<string, unknown>)[segment];
+  }
+  return current;
 }
 
 function readNestedNumber(value: unknown, path: string[]): number | undefined {

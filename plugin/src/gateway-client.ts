@@ -1440,13 +1440,14 @@ function mapGatewayFrameToEvents(
 
   if (frame.event === "session.tool") {
     const seq = Number(payload.seq ?? lastSeq + 1);
-    const kind = String(payload.phase ?? "tool");
+    const data = toRecord(payload.data);
+    const kind = String(payload.phase ?? data.phase ?? "tool");
     return [
       {
         id: `${sessionId}:tool:${seq}`,
         sessionId,
         seq,
-        kind: kind === "result" ? "tool.result" : "tool.call",
+        kind: ["result", "done", "output"].includes(kind) ? "tool.result" : "tool.call",
         payload: frame.payload ?? {},
         createdAt: new Date().toISOString()
       }
@@ -1649,7 +1650,7 @@ function buildThinkingPayload(
   exposeRawThinking: boolean,
   extra: Record<string, unknown>
 ): Record<string, unknown> {
-  const content = collapseRepeatedGrowingPrefix(thinking);
+  const content = normalizeThinkingContent(thinking);
   if (exposeRawThinking) {
     return {
       content,
@@ -1666,6 +1667,10 @@ function buildThinkingPayload(
     textLength: content.length,
     ...extra
   };
+}
+
+function normalizeThinkingContent(value: string): string {
+  return collapseRepeatedLeadingSegment(collapseRepeatedGrowingPrefix(value));
 }
 
 function normalizeFinalAssistantContent(content: string, previousRendered: string): string {
@@ -1700,6 +1705,33 @@ function collapseRepeatedGrowingPrefix(value: string): string {
     const second = text.slice(split).trimStart();
     if (first.length >= 20 && second.startsWith(first)) {
       return `${leadingWhitespace}${second}`;
+    }
+  }
+
+  return value;
+}
+
+function collapseRepeatedLeadingSegment(value: string): string {
+  const leadingWhitespace = value.match(/^\s*/)?.[0] ?? "";
+  const text = value.trimStart();
+  const maxSegmentLength = Math.min(32, Math.floor(text.length / 2));
+
+  for (let length = maxSegmentLength; length >= 2; length -= 1) {
+    const segment = text.slice(0, length);
+    if (!segment.trim() || !text.startsWith(`${segment}${segment}`)) {
+      continue;
+    }
+
+    const remainder = text.slice(length * 2);
+    const next = remainder[0] ?? "";
+    const segmentLooksNatural =
+      /\s/.test(segment) ||
+      /^[A-Z][a-z]+$/.test(segment) ||
+      /[\u4e00-\u9fff]/.test(segment);
+    const hasBoundary = !next || /\s|[,.!?;:，。！？；：]/.test(next) || /[\u4e00-\u9fff]/.test(next);
+
+    if (segmentLooksNatural && hasBoundary) {
+      return `${leadingWhitespace}${segment}${remainder}`;
     }
   }
 

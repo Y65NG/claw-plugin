@@ -672,6 +672,181 @@ describe("gateway client", () => {
     await new Promise<void>((resolve) => wss.close(() => resolve()));
   });
 
+  it("maps nested session.tool result phases to tool.result events", async () => {
+    const received: Array<{ kind: string; name?: unknown; result?: unknown }> = [];
+    const httpServer = createServer();
+    servers.add(httpServer);
+    const wss = new WebSocketServer({ noServer: true });
+
+    httpServer.on("upgrade", (request, socket, head) => {
+      wss.handleUpgrade(request, socket, head, (client) => {
+        client.send(
+          JSON.stringify({
+            type: "event",
+            event: "connect.challenge",
+            payload: { nonce: "nonce-1" }
+          })
+        );
+
+        client.on("message", (data) => {
+          const frame = JSON.parse(data.toString()) as {
+            id: string;
+            method: string;
+          };
+
+          if (frame.method === "connect") {
+            client.send(JSON.stringify({ type: "res", id: frame.id, ok: true, payload: { protocol: 4 } }));
+            return;
+          }
+
+          client.send(JSON.stringify({ type: "res", id: frame.id, ok: true, payload: { ok: true } }));
+
+          if (frame.method === "sessions.messages.subscribe") {
+            client.send(
+              JSON.stringify({
+                type: "event",
+                event: "session.tool",
+                payload: {
+                  sessionKey: "agent:main:test-session",
+                  seq: 9,
+                  data: {
+                    phase: "result",
+                    name: "web_search",
+                    result: {
+                      details: {
+                        query: "books",
+                        count: 3
+                      }
+                    }
+                  }
+                }
+              })
+            );
+          }
+        });
+      });
+    });
+
+    const address = await listen(httpServer);
+    const client = createGatewayClient({
+      baseUrl: address.replace("http://", "ws://"),
+      secret: "shared-token"
+    });
+
+    const close = client.subscribe("agent:main:test-session", 0, {
+      onEvent: (event) =>
+        received.push({
+          kind: event.kind,
+          name: (event.payload as { data?: { name?: unknown } }).data?.name,
+          result: (event.payload as { data?: { result?: unknown } }).data?.result
+        }),
+      onDisconnect: () => {}
+    });
+
+    await eventually(() =>
+      expect(received).toEqual([
+        {
+          kind: "tool.result",
+          name: "web_search",
+          result: {
+            details: {
+              query: "books",
+              count: 3
+            }
+          }
+        }
+      ])
+    );
+    close();
+    await client.stop();
+    await new Promise<void>((resolve) => wss.close(() => resolve()));
+  });
+
+  it("collapses duplicated leading words in exposed reasoning text", async () => {
+    const received: Array<{ kind: string; content: string }> = [];
+    const httpServer = createServer();
+    servers.add(httpServer);
+    const wss = new WebSocketServer({ noServer: true });
+
+    httpServer.on("upgrade", (request, socket, head) => {
+      wss.handleUpgrade(request, socket, head, (client) => {
+        client.send(
+          JSON.stringify({
+            type: "event",
+            event: "connect.challenge",
+            payload: { nonce: "nonce-1" }
+          })
+        );
+
+        client.on("message", (data) => {
+          const frame = JSON.parse(data.toString()) as {
+            id: string;
+            method: string;
+          };
+
+          if (frame.method === "connect") {
+            client.send(JSON.stringify({ type: "res", id: frame.id, ok: true, payload: { protocol: 4 } }));
+            return;
+          }
+
+          client.send(JSON.stringify({ type: "res", id: frame.id, ok: true, payload: { ok: true } }));
+
+          if (frame.method === "sessions.messages.subscribe") {
+            client.send(
+              JSON.stringify({
+                type: "event",
+                event: "session.message",
+                payload: {
+                  sessionKey: "agent:main:test-session",
+                  messageSeq: 7,
+                  message: {
+                    role: "assistant",
+                    content: [
+                      { type: "thinking", thinking: "\nLet meLet me search the web." },
+                      { type: "text", text: "Visible answer" }
+                    ],
+                    timestamp: Date.now()
+                  }
+                }
+              })
+            );
+          }
+        });
+      });
+    });
+
+    const address = await listen(httpServer);
+    const client = createGatewayClient({
+      baseUrl: address.replace("http://", "ws://"),
+      secret: "shared-token"
+    });
+
+    const close = client.subscribe("agent:main:test-session", 0, {
+      onEvent: (event) =>
+        received.push({
+          kind: event.kind,
+          content: String((event.payload as { content?: string }).content ?? "")
+        }),
+      onDisconnect: () => {}
+    });
+
+    await eventually(() =>
+      expect(received).toEqual([
+        {
+          kind: "assistant.thinking",
+          content: "\nLet me search the web."
+        },
+        {
+          kind: "assistant.message",
+          content: "Visible answer"
+        }
+      ])
+    );
+    close();
+    await client.stop();
+    await new Promise<void>((resolve) => wss.close(() => resolve()));
+  });
+
   it("sanitizes thinking signals when raw thinking is disabled", async () => {
     const received: Array<{
       kind: string;
