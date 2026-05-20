@@ -10,6 +10,10 @@ type InstallInput = {
   gateway?: string;
   botId?: string;
   secret?: string;
+  hubWsUrl?: string;
+  hubBotId?: string;
+  hubSecret?: string;
+  hubEnabled?: boolean;
   consoleHost?: string;
   consolePort?: number;
 };
@@ -21,6 +25,10 @@ type ParsedArgs = {
   gateway?: string;
   "bot-id"?: string;
   secret?: string;
+  "hub-ws-url"?: string;
+  "hub-bot-id"?: string;
+  "hub-secret"?: string;
+  "hub-enabled"?: string;
   "extensions-dir"?: string;
   "config-path"?: string;
   "console-host"?: string;
@@ -35,6 +43,19 @@ type OpenClawConfig = {
       mode?: unknown;
       token?: unknown;
       password?: unknown;
+    };
+  };
+  channels?: {
+    "53aihub"?: {
+      enabled?: unknown;
+      botId?: unknown;
+      secret?: unknown;
+      token?: unknown;
+      WSUrl?: unknown;
+      websocketUrl?: unknown;
+      accessPolicy?: unknown;
+      allowFrom?: unknown;
+      sendThinkingMessage?: unknown;
     };
   };
   plugins?: {
@@ -82,6 +103,7 @@ export async function installIntoQClaw(input: InstallInput): Promise<{
   extensionsDir: string;
   destination: string;
   gatewayBaseUrl: string;
+  hub53aiConfigured: boolean;
 }> {
   return installIntoHost(input, "QClaw");
 }
@@ -91,6 +113,7 @@ export async function installIntoOpenClaw(input: InstallInput): Promise<{
   extensionsDir: string;
   destination: string;
   gatewayBaseUrl: string;
+  hub53aiConfigured: boolean;
 }> {
   return installIntoHost(input, "OpenClaw");
 }
@@ -103,6 +126,7 @@ async function installIntoHost(
   extensionsDir: string;
   destination: string;
   gatewayBaseUrl: string;
+  hub53aiConfigured: boolean;
 }> {
   await mkdir(input.extensionsDir, { recursive: true });
   const destination = join(input.extensionsDir, PLUGIN_ID);
@@ -113,6 +137,7 @@ async function installIntoHost(
   await mkdir(dirname(input.configPath), { recursive: true });
   const config = await readOpenClawConfig(input.configPath);
   const inferredGateway = inferGatewaySettings(config);
+  const inferredHub53AI = inferHub53AISettings(config);
 
   const gatewayBaseUrl = input.gateway?.trim() || inferredGateway.baseUrl;
   if (!gatewayBaseUrl) {
@@ -125,6 +150,15 @@ async function installIntoHost(
   }
 
   const botId = input.botId?.trim();
+  const hubWsUrl = input.hubWsUrl?.trim() || inferredHub53AI.wsUrl;
+  const hubBotId = input.hubBotId?.trim() || inferredHub53AI.botId;
+  const hubSecret = input.hubSecret?.trim() || inferredHub53AI.secret;
+  const hubConfigured = Boolean(hubWsUrl && hubBotId && hubSecret);
+  const hubInputProvided = Boolean(input.hubWsUrl?.trim() || input.hubBotId?.trim() || input.hubSecret?.trim());
+  const hubEnabled = input.hubEnabled ?? (hubConfigured ? (hubInputProvided ? true : inferredHub53AI.enabled) : false);
+  if (hubEnabled && !hubConfigured) {
+    throw new Error("hub53ai requires --hub-ws-url, --hub-bot-id, and --hub-secret when enabled");
+  }
   const consoleHost = input.consoleHost?.trim();
   const consolePort = normalizePort(input.consolePort);
 
@@ -145,6 +179,24 @@ async function installIntoHost(
     previousGateway.botId = botId;
   }
 
+  if (hubConfigured || input.hubEnabled !== undefined) {
+    const previousHub = ensureObject(previousConfig, "hub53ai");
+    previousHub.enabled = hubEnabled;
+    if (hubBotId) {
+      previousHub.botId = hubBotId;
+    }
+    if (hubSecret) {
+      previousHub.secret = hubSecret;
+    }
+    if (hubWsUrl) {
+      previousHub.wsUrl = hubWsUrl;
+    }
+    previousHub.accessPolicy = inferredHub53AI.accessPolicy || previousHub.accessPolicy || "open";
+    previousHub.allowFrom = inferredHub53AI.allowFrom ?? previousHub.allowFrom ?? [];
+    previousHub.sendThinkingMessage =
+      inferredHub53AI.sendThinkingMessage ?? previousHub.sendThinkingMessage ?? true;
+  }
+
   if (consoleHost || consolePort !== undefined) {
     const previousConsole = ensureObject(previousConfig, "console");
     if (consoleHost) {
@@ -162,7 +214,8 @@ async function installIntoHost(
     configPath: input.configPath,
     extensionsDir: input.extensionsDir,
     destination,
-    gatewayBaseUrl
+    gatewayBaseUrl,
+    hub53aiConfigured: hubConfigured
   };
 }
 
@@ -193,6 +246,10 @@ export async function runInstallCommand(input: {
     gateway: args.gateway,
     botId: args["bot-id"],
     secret: args.secret,
+    hubWsUrl: args["hub-ws-url"],
+    hubBotId: args["hub-bot-id"],
+    hubSecret: args["hub-secret"],
+    hubEnabled: parseOptionalBoolean(args["hub-enabled"]),
     consoleHost: args["console-host"],
     consolePort: args["console-port"] ? Number(args["console-port"]) : undefined
   });
@@ -203,6 +260,7 @@ export async function runInstallCommand(input: {
       `Extensions: ${result.extensionsDir}`,
       `Config: ${result.configPath}`,
       `Gateway: ${result.gatewayBaseUrl}`,
+      `53AIHub: ${result.hub53aiConfigured ? "configured" : "not configured"}`,
       `Restart ${targetInfo.label} to load the plugin.`
     ].join("\n") + "\n"
   );
@@ -215,8 +273,13 @@ function parseArgs(argv: string[]): ParsedArgs {
     if (!entry.startsWith("--")) {
       continue;
     }
-    parsed[entry.slice(2) as keyof ParsedArgs] = argv[index + 1] ?? "";
-    index += 1;
+    const next = argv[index + 1];
+    if (next && !next.startsWith("--")) {
+      parsed[entry.slice(2) as keyof ParsedArgs] = next;
+      index += 1;
+    } else {
+      parsed[entry.slice(2) as keyof ParsedArgs] = "true";
+    }
   }
   return parsed;
 }
@@ -268,6 +331,62 @@ function inferGatewaySettings(config: OpenClawConfig): { baseUrl: string; secret
         ? auth.token
         : "";
   return { baseUrl, secret };
+}
+
+function inferHub53AISettings(config: OpenClawConfig): {
+  enabled: boolean;
+  botId: string;
+  secret: string;
+  wsUrl: string;
+  accessPolicy?: string;
+  allowFrom?: string[];
+  sendThinkingMessage?: boolean;
+} {
+  const legacy = config.channels?.["53aihub"];
+  if (!legacy) {
+    return {
+      enabled: false,
+      botId: "",
+      secret: "",
+      wsUrl: ""
+    };
+  }
+
+  return {
+    enabled: legacy.enabled !== false,
+    botId: typeof legacy.botId === "string" ? legacy.botId : "",
+    secret:
+      typeof legacy.secret === "string"
+        ? legacy.secret
+        : typeof legacy.token === "string"
+          ? legacy.token
+          : "",
+    wsUrl:
+      typeof legacy.WSUrl === "string"
+        ? legacy.WSUrl
+        : typeof legacy.websocketUrl === "string"
+          ? legacy.websocketUrl
+          : "",
+    accessPolicy: typeof legacy.accessPolicy === "string" ? legacy.accessPolicy : undefined,
+    allowFrom: Array.isArray(legacy.allowFrom)
+      ? legacy.allowFrom.map((entry) => String(entry)).filter(Boolean)
+      : undefined,
+    sendThinkingMessage:
+      typeof legacy.sendThinkingMessage === "boolean" ? legacy.sendThinkingMessage : undefined
+  };
+}
+
+function parseOptionalBoolean(value: string | undefined): boolean | undefined {
+  if (value === undefined) {
+    return undefined;
+  }
+  if (value === "" || value === "true" || value === "1" || value === "yes") {
+    return true;
+  }
+  if (value === "false" || value === "0" || value === "no") {
+    return false;
+  }
+  throw new Error(`invalid boolean value: ${value}`);
 }
 
 function normalizePort(port: number | undefined): number | undefined {

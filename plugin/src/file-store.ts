@@ -52,8 +52,12 @@ export class FileSessionStore {
 
   async upsertSession(session: SessionSummary): Promise<void> {
     const existing = this.state.sessions[session.id];
+    const mergedSession = {
+      ...session,
+      lastEventSeq: Math.max(session.lastEventSeq, existing?.session.lastEventSeq ?? 0)
+    };
     this.state.sessions[session.id] = {
-      session,
+      session: mergedSession,
       messages: existing?.messages ?? [],
       events: existing?.events ?? [],
       hydrated: existing?.hydrated ?? false

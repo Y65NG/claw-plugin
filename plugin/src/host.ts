@@ -12,10 +12,22 @@ export type PluginConfig = {
     requestTimeoutMs?: number;
     streamReconnectMs?: number;
   };
+  hub53ai?: {
+    enabled?: boolean;
+    botId?: string;
+    secret?: string;
+    wsUrl?: string;
+    accessPolicy?: "open" | "allowlist";
+    allowFrom?: string[];
+    sendThinkingMessage?: boolean;
+    reconnectBaseMs?: number;
+    maxReconnectAttempts?: number;
+  };
   console?: {
     enabled?: boolean;
     host?: string;
     port?: number;
+    showRawThinking?: boolean;
   };
   persistence?: {
     maxSessions?: number;
@@ -33,10 +45,22 @@ export type ResolvedPluginConfig = {
     requestTimeoutMs: number;
     streamReconnectMs: number;
   };
+  hub53ai: {
+    enabled: boolean;
+    botId: string;
+    secret: string;
+    wsUrl: string;
+    accessPolicy: "open" | "allowlist";
+    allowFrom: string[];
+    sendThinkingMessage: boolean;
+    reconnectBaseMs: number;
+    maxReconnectAttempts: number;
+  };
   console: {
     enabled: boolean;
     host: string;
     port: number;
+    showRawThinking: boolean;
   };
   persistence: {
     maxSessions: number;
@@ -70,10 +94,24 @@ export function resolvePluginConfig(config?: PluginConfig): ResolvedPluginConfig
       requestTimeoutMs: config?.gateway?.requestTimeoutMs ?? 15_000,
       streamReconnectMs: config?.gateway?.streamReconnectMs ?? 2_000
     },
+    hub53ai: {
+      enabled: config?.hub53ai?.enabled ?? false,
+      botId: config?.hub53ai?.botId?.trim() ?? "",
+      secret: config?.hub53ai?.secret?.trim() ?? "",
+      wsUrl: config?.hub53ai?.wsUrl?.trim() ?? "",
+      accessPolicy: config?.hub53ai?.accessPolicy === "allowlist" ? "allowlist" : "open",
+      allowFrom: Array.isArray(config?.hub53ai?.allowFrom)
+        ? config.hub53ai.allowFrom.map((entry) => String(entry).trim()).filter(Boolean)
+        : [],
+      sendThinkingMessage: config?.hub53ai?.sendThinkingMessage ?? true,
+      reconnectBaseMs: config?.hub53ai?.reconnectBaseMs ?? 2_000,
+      maxReconnectAttempts: config?.hub53ai?.maxReconnectAttempts ?? 10
+    },
     console: {
       enabled: config?.console?.enabled ?? true,
       host: config?.console?.host ?? "127.0.0.1",
-      port: config?.console?.port ?? 4318
+      port: config?.console?.port ?? 4318,
+      showRawThinking: config?.console?.showRawThinking ?? true
     },
     persistence: {
       maxSessions: config?.persistence?.maxSessions ?? 100
@@ -93,6 +131,15 @@ export function resolvePluginConfigWithHostDefaults(configPath: string, config?:
   }
   if (!resolved.gateway.secret && hostConfig.secret) {
     resolved.gateway.secret = hostConfig.secret;
+  }
+  if (!resolved.hub53ai.botId && hostConfig.hub53ai?.botId) {
+    resolved.hub53ai.botId = hostConfig.hub53ai.botId;
+  }
+  if (!resolved.hub53ai.secret && hostConfig.hub53ai?.secret) {
+    resolved.hub53ai.secret = hostConfig.hub53ai.secret;
+  }
+  if (!resolved.hub53ai.wsUrl && hostConfig.hub53ai?.wsUrl) {
+    resolved.hub53ai.wsUrl = hostConfig.hub53ai.wsUrl;
   }
 
   return resolved;
@@ -151,7 +198,15 @@ export function readHostRuntimeInfo(configPath: string): HostRuntimeInfo {
   }
 }
 
-function readHostGatewayConfig(configPath: string): { baseUrl?: string; secret?: string } {
+function readHostGatewayConfig(configPath: string): {
+  baseUrl?: string;
+  secret?: string;
+  hub53ai?: {
+    botId?: string;
+    secret?: string;
+    wsUrl?: string;
+  };
+} {
   try {
     const raw = readFileSync(configPath, "utf8");
     const parsed = JSON.parse(raw) as {
@@ -170,6 +225,15 @@ function readHostGatewayConfig(configPath: string): { baseUrl?: string; secret?:
         token?: unknown;
         password?: unknown;
       };
+      channels?: {
+        "53aihub"?: {
+          botId?: unknown;
+          secret?: unknown;
+          token?: unknown;
+          WSUrl?: unknown;
+          websocketUrl?: unknown;
+        };
+      };
     };
 
     const gateway = parsed.gateway ?? {};
@@ -187,7 +251,26 @@ function readHostGatewayConfig(configPath: string): { baseUrl?: string; secret?:
           ? auth.token
           : undefined;
 
-    return { baseUrl, secret };
+    const legacyHub = parsed.channels?.["53aihub"];
+    const hub53ai = legacyHub
+      ? {
+          botId: typeof legacyHub.botId === "string" ? legacyHub.botId : undefined,
+          secret:
+            typeof legacyHub.secret === "string"
+              ? legacyHub.secret
+              : typeof legacyHub.token === "string"
+                ? legacyHub.token
+                : undefined,
+          wsUrl:
+            typeof legacyHub.WSUrl === "string"
+              ? legacyHub.WSUrl
+              : typeof legacyHub.websocketUrl === "string"
+                ? legacyHub.websocketUrl
+                : undefined
+        }
+      : undefined;
+
+    return { baseUrl, secret, hub53ai };
   } catch {
     return {};
   }

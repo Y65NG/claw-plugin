@@ -33,6 +33,54 @@
           }
         }
       },
+      "hub53ai": {
+        "type": "object",
+        "additionalProperties": false,
+        "properties": {
+          "enabled": {
+            "type": "boolean",
+            "default": false
+          },
+          "botId": {
+            "type": "string",
+            "description": "53AIHub Bot ID."
+          },
+          "secret": {
+            "type": "string",
+            "description": "53AIHub App Secret / Token."
+          },
+          "wsUrl": {
+            "type": "string",
+            "description": "53AIHub WebSocket URL, for example wss://example.com/api/v1/openclaw/ws/connect"
+          },
+          "accessPolicy": {
+            "type": "string",
+            "enum": [
+              "open",
+              "allowlist"
+            ],
+            "default": "open"
+          },
+          "allowFrom": {
+            "type": "array",
+            "items": {
+              "type": "string"
+            }
+          },
+          "sendThinkingMessage": {
+            "type": "boolean",
+            "default": true
+          },
+          "reconnectBaseMs": {
+            "type": "number",
+            "default": 2000
+          },
+          "maxReconnectAttempts": {
+            "type": "number",
+            "default": 10
+          }
+        }
+      },
       "console": {
         "type": "object",
         "additionalProperties": false,
@@ -48,6 +96,11 @@
           "port": {
             "type": "number",
             "default": 4318
+          },
+          "showRawThinking": {
+            "type": "boolean",
+            "default": true,
+            "description": "When true, display raw model thinking/reasoning fields returned by OpenClaw/QClaw in the local console."
           }
         }
       },

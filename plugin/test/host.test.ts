@@ -19,15 +19,25 @@ describe("host helpers", () => {
         botId: "bot-123",
         secret: "sk-demo-secret"
       },
+      hub53ai: {
+        enabled: true,
+        botId: "hub-bot",
+        secret: "hub-secret",
+        wsUrl: "wss://hub.example.com/ws"
+      },
       console: {
         host: "127.0.0.1",
-        port: 4318
+        port: 4318,
+        showRawThinking: true
       }
     });
 
     expect(config.gateway?.secret).toBe("[redacted]");
     expect(config.gateway?.botId).toBe("bot-123");
+    expect(config.hub53ai?.secret).toBe("[redacted]");
+    expect(config.hub53ai?.botId).toBe("hub-bot");
     expect(config.console?.host).toBe("127.0.0.1");
+    expect(config.console?.showRawThinking).toBe(true);
   });
 
   it("reads nested gateway host defaults from openclaw.json", () => {
@@ -51,5 +61,32 @@ describe("host helpers", () => {
     const config = resolvePluginConfigWithHostDefaults(configPath, {});
     expect(config.gateway.baseUrl).toBe("ws://127.0.0.1:28789");
     expect(config.gateway.secret).toBe("local-token");
+  });
+
+  it("reads legacy 53AIHub channel defaults from openclaw.json", () => {
+    const directory = mkdtempSync(join(tmpdir(), "claw-plugin-host-"));
+    const configPath = join(directory, "openclaw.json");
+
+    writeFileSync(
+      configPath,
+      JSON.stringify({
+        channels: {
+          "53aihub": {
+            botId: "legacy-bot",
+            secret: "legacy-secret",
+            WSUrl: "wss://legacy.example.com/api/v1/openclaw/ws/connect"
+          }
+        }
+      })
+    );
+
+    const config = resolvePluginConfigWithHostDefaults(configPath, {
+      hub53ai: {
+        enabled: true
+      }
+    });
+    expect(config.hub53ai.botId).toBe("legacy-bot");
+    expect(config.hub53ai.secret).toBe("legacy-secret");
+    expect(config.hub53ai.wsUrl).toBe("wss://legacy.example.com/api/v1/openclaw/ws/connect");
   });
 });

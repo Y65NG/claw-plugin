@@ -6,6 +6,8 @@ import { join, normalize, resolve } from "node:path";
 
 import WebSocket, { WebSocketServer } from "ws";
 
+import { createHub53AIBridge, type Hub53AIConfig, type Hub53AIStatusSnapshot } from "./53aihub-client";
+import type { AgentEventProbe, AgentEventProbeSnapshot } from "./agent-event-probe";
 import { FileSessionStore } from "./file-store";
 import type { GatewayClient, GatewayConfig, GatewayEvent } from "./gateway-client";
 import { readHostRuntimeInfo, type HostRuntimeInfo } from "./host";
@@ -27,10 +29,12 @@ type CreateConsoleServerInput = {
   pluginVersion: string;
   token: string;
   gatewayConfig: GatewayConfig;
+  hub53aiConfig?: Hub53AIConfig;
   consoleConfig: ConsoleConfig;
   persistence: PersistenceConfig;
   hostRuntime?: HostRuntimeInfo;
   gateway: GatewayClient;
+  agentEventProbe?: AgentEventProbe;
   webDir?: string;
 };
 
@@ -48,6 +52,8 @@ type StatusSnapshot = {
   healthy: boolean;
   modelPrimary?: string;
   enabledSkills: string[];
+  hub53ai?: Hub53AIStatusSnapshot;
+  agentEvents?: AgentEventProbeSnapshot;
 };
 
 export function createConsoleServer(input: CreateConsoleServerInput) {
@@ -62,6 +68,31 @@ export function createConsoleServer(input: CreateConsoleServerInput) {
   const statusSockets = new Set<WebSocket>();
   let lastGatewayError: Error | null = null;
   let currentPort = input.consoleConfig.port;
+  let remoteSyncTimer: NodeJS.Timeout | undefined;
+  let remoteSyncInFlight = false;
+  const hub53ai = input.hub53aiConfig
+    ? createHub53AIBridge({
+        stateDir: input.stateDir,
+        config: input.hub53aiConfig,
+        gateway: input.gateway,
+        callbacks: {
+          onSessionUpsert: async (session) => {
+            await store.upsertSession(session);
+            broadcastStatus();
+          },
+          onUserMessage: async (message) => {
+            await store.appendMessage(message);
+          },
+          onSessionStatus: async (sessionId, status) => {
+            await store.setSessionStatus(sessionId, status);
+            broadcastStatus();
+          },
+          onEnsureSessionStream: ensureSessionStream,
+          getLastEventSeq: (sessionId) => store.getLastEventSeq(sessionId),
+          onStatusChange: broadcastStatus
+        }
+      })
+    : undefined;
 
   const httpServer = createServer(async (request, response) => {
     try {
@@ -88,6 +119,7 @@ export function createConsoleServer(input: CreateConsoleServerInput) {
   async function start() {
     await store.init();
     await syncRemoteSessions();
+    await hub53ai?.start();
     await new Promise<void>((resolvePromise) => {
       httpServer.listen(input.consoleConfig.port, input.consoleConfig.host, () => resolvePromise());
     });
@@ -102,9 +134,21 @@ export function createConsoleServer(input: CreateConsoleServerInput) {
         ensureSessionStream(session.id);
       }
     }
+    remoteSyncTimer = setInterval(() => {
+      void syncRemoteSessions().then((changed) => {
+        if (changed) {
+          broadcastStatus();
+        }
+      });
+    }, 5_000);
   }
 
   async function stop() {
+    if (remoteSyncTimer) {
+      clearInterval(remoteSyncTimer);
+      remoteSyncTimer = undefined;
+    }
+    await hub53ai?.stop();
     for (const close of sessionStreams.values()) {
       close();
     }
@@ -135,6 +179,7 @@ export function createConsoleServer(input: CreateConsoleServerInput) {
       const sockets = sessionSockets.get(sessionId) ?? new Set<WebSocket>();
       sockets.add(socket);
       sessionSockets.set(sessionId, sockets);
+      void ensureSessionStream(sessionId);
       socket.on("close", () => {
         sockets.delete(socket);
         if (sockets.size === 0) {
@@ -160,11 +205,23 @@ export function createConsoleServer(input: CreateConsoleServerInput) {
             ...input.gatewayConfig,
             secret: "[redacted]"
           },
+          hub53ai: input.hub53aiConfig
+            ? {
+                ...input.hub53aiConfig,
+                secret: "[redacted]"
+              }
+            : undefined,
           config: {
             gateway: {
               ...input.gatewayConfig,
               secret: "[redacted]"
             },
+            hub53ai: input.hub53aiConfig
+              ? {
+                  ...input.hub53aiConfig,
+                  secret: "[redacted]"
+                }
+              : undefined,
             console: input.consoleConfig,
             persistence: input.persistence
           }
@@ -178,13 +235,34 @@ export function createConsoleServer(input: CreateConsoleServerInput) {
       return;
     }
 
+    if (method === "GET" && url.pathname === "/api/agent-events") {
+      const afterSeq = Number(url.searchParams.get("afterSeq") ?? "0");
+      writeJson(response, 200, {
+        probe: input.agentEventProbe?.getSnapshot(),
+        events: input.agentEventProbe?.getEvents(afterSeq) ?? []
+      });
+      return;
+    }
+
     if (method === "GET" && url.pathname === "/api/config") {
       writeJson(response, 200, {
         gateway: {
           ...input.gatewayConfig,
           secret: "[redacted]"
         },
+        hub53ai: input.hub53aiConfig
+          ? {
+              ...input.hub53aiConfig,
+              secret: "[redacted]"
+            }
+          : undefined,
         config: {
+          hub53ai: input.hub53aiConfig
+            ? {
+                ...input.hub53aiConfig,
+                secret: "[redacted]"
+              }
+            : undefined,
           console: input.consoleConfig,
           persistence: input.persistence
         }
@@ -193,6 +271,7 @@ export function createConsoleServer(input: CreateConsoleServerInput) {
     }
 
     if (method === "GET" && url.pathname === "/api/sessions") {
+      await syncRemoteSessions();
       writeJson(response, 200, {
         sessions: store.listSessions()
       });
@@ -390,16 +469,20 @@ export function createConsoleServer(input: CreateConsoleServerInput) {
     if (nextStatus) {
       await store.setSessionStatus(event.sessionId, nextStatus);
     }
-    if (event.kind === "assistant.message") {
+    if (event.kind === "assistant.message" || event.kind === "user.message") {
       const content = String((event.payload as { content?: unknown }).content ?? "");
       if (content) {
-        await store.appendMessage({
-          id: `assistant-${event.seq}`,
-          sessionId: event.sessionId,
-          role: "assistant",
-          content,
-          createdAt: event.createdAt
-        });
+        const role = event.kind === "user.message" ? "user" : "assistant";
+        const record = store.getSession(event.sessionId);
+        if (!record || !hasNearbyDuplicateMessage(record.messages, role, content, event.createdAt)) {
+          await store.appendMessage({
+            id: `${role}-${event.seq}`,
+            sessionId: event.sessionId,
+            role,
+            content,
+            createdAt: event.createdAt
+          });
+        }
       }
     }
     if (isTerminalEvent(event.kind)) {
@@ -414,18 +497,29 @@ export function createConsoleServer(input: CreateConsoleServerInput) {
   }
 
   async function syncRemoteSessions() {
+    if (remoteSyncInFlight) {
+      return false;
+    }
+    remoteSyncInFlight = true;
     try {
+      const before = sessionListSignature(store.listSessions());
       const remoteSessions = await input.gateway.listSessions(input.persistence.maxSessions);
+      lastGatewayError = null;
       for (const session of remoteSessions) {
         await store.upsertSession(session);
       }
+      return before !== sessionListSignature(store.listSessions());
     } catch (error) {
       lastGatewayError = error instanceof Error ? error : new Error(String(error));
+      return false;
+    } finally {
+      remoteSyncInFlight = false;
     }
   }
 
   async function hydrateSession(sessionId: string) {
     const session = await input.gateway.getSession(sessionId);
+    lastGatewayError = null;
     await store.upsertSession(session);
 
     const messages = await input.gateway.getSessionMessages(sessionId, 200);
@@ -463,7 +557,9 @@ export function createConsoleServer(input: CreateConsoleServerInput) {
       runningSessionCount: sessions.filter((session) => session.status === "running").length,
       healthy: lastGatewayError === null,
       modelPrimary: hostRuntime.modelPrimary,
-      enabledSkills: hostRuntime.enabledSkills
+      enabledSkills: hostRuntime.enabledSkills,
+      hub53ai: hub53ai?.getStatus(),
+      agentEvents: input.agentEventProbe?.getSnapshot()
     };
   }
 
@@ -529,6 +625,30 @@ function writeJson(response: ServerResponse, statusCode: number, payload: unknow
   response.end(JSON.stringify(payload));
 }
 
+function sessionListSignature(sessions: SessionSummary[]): string {
+  return sessions
+    .map((session) => `${session.id}:${session.updatedAt}:${session.status}:${session.lastEventSeq}`)
+    .sort()
+    .join("|");
+}
+
+function hasNearbyDuplicateMessage(
+  messages: SessionMessage[],
+  role: string,
+  content: string,
+  createdAt: string,
+  windowMs = 5_000
+): boolean {
+  const createdMs = new Date(createdAt).getTime();
+  return messages.some((message) => {
+    if (message.role !== role || message.content.trim() !== content.trim()) {
+      return false;
+    }
+    const messageMs = new Date(message.createdAt).getTime();
+    return Number.isFinite(createdMs) && Number.isFinite(messageMs) && Math.abs(createdMs - messageMs) <= windowMs;
+  });
+}
+
 function nextStatusForEvent(kind: string): SessionStatus | undefined {
   switch (kind) {
     case "run.completed":
@@ -538,6 +658,7 @@ function nextStatusForEvent(kind: string): SessionStatus | undefined {
     case "run.interrupted":
       return "interrupted";
     case "run.started":
+    case "assistant.thinking":
     case "assistant.delta":
     case "assistant.message":
     case "tool.call":
@@ -568,15 +689,16 @@ function deriveDerivedAssistantMessage(
     return null;
   }
 
-  const lastDeltaEvent = [...events]
-    .reverse()
-    .find(
+  const deltaEvents = events
+    .filter(
       (event) =>
         event.kind === "assistant.delta" &&
         event.seq <= lastTerminalEvent.seq &&
         typeof event.payload?.content === "string" &&
         String(event.payload.content).trim().length > 0
-    );
+    )
+    .sort((left, right) => left.seq - right.seq);
+  const lastDeltaEvent = deltaEvents.at(-1);
   if (!lastDeltaEvent) {
     return null;
   }
@@ -586,7 +708,7 @@ function deriveDerivedAssistantMessage(
     .slice(lastUserIndex + 1)
     .filter((message) => message.role === "assistant");
 
-  const cumulative = String(lastDeltaEvent.payload.content ?? "").trim();
+  const cumulative = mergeAssistantDeltaEvents(deltaEvents).trim();
   if (!cumulative) {
     return null;
   }
@@ -612,6 +734,36 @@ function deriveDerivedAssistantMessage(
     content: remainder,
     createdAt: lastDeltaEvent.createdAt
   };
+}
+
+function mergeAssistantDeltaEvents(events: TimelineEvent[]): string {
+  let merged = "";
+  for (const event of events) {
+    const content = String(event.payload.content ?? "");
+    if (!content) {
+      continue;
+    }
+
+    const mode = event.payload.mode;
+    if (mode === "replace" || event.payload.replace === true) {
+      merged = content;
+      continue;
+    }
+
+    if (mode === "append") {
+      if (content === merged || merged.endsWith(content)) {
+        continue;
+      }
+      merged = content.startsWith(merged) ? content : `${merged}${content}`;
+      continue;
+    }
+
+    if (content === merged || merged.startsWith(content)) {
+      continue;
+    }
+    merged = content.startsWith(merged) ? content : `${merged}${content}`;
+  }
+  return merged;
 }
 
 function stripKnownAssistantPrefix(

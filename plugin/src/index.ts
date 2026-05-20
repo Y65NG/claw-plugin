@@ -4,6 +4,7 @@ import { randomUUID } from "node:crypto";
 
 import type { OpenClawPluginApi } from "openclaw/plugin-sdk";
 
+import { createAgentEventProbe, type AgentEventProbe } from "./agent-event-probe";
 import { createConsoleServer } from "./console-server";
 import { createGatewayClient } from "./gateway-client";
 import {
@@ -20,6 +21,8 @@ const plugin = {
   register(api: OpenClawPluginApi) {
     let runtime: Awaited<ReturnType<typeof createRuntime>> | undefined;
     const pluginConfig = (api.pluginConfig ?? {}) as PluginConfig;
+    const agentEventProbe = createAgentEventProbe();
+    agentEventProbe.register(api);
 
     api.registerService({
       id: "claw-control-center-service",
@@ -33,7 +36,8 @@ const plugin = {
           stateDir: ctx.stateDir,
           configPath: resolveConfigPath(ctx),
           pluginConfig,
-          version: api.version ?? "dev"
+          version: api.version ?? "dev",
+          agentEventProbe
         });
         await runtime.start();
         api.logger.info(`Claw Control Center gateway console started at ${runtime.baseUrl}`);
@@ -50,6 +54,14 @@ const plugin = {
 };
 
 export default plugin;
+export {
+  createHub53AIBridge,
+  parseIncomingMessage as parseHub53AIIncomingMessage,
+  type Hub53AIConfig,
+  type Hub53AIIncomingMessage,
+  type Hub53AIOutgoingChunk,
+  type Hub53AIStatusSnapshot
+} from "./53aihub-client";
 export { createConsoleServer } from "./console-server";
 export { createGatewayClient } from "./gateway-client";
 export { installIntoOpenClaw, installIntoQClaw, runInstallCommand } from "./install-qclaw";
@@ -80,6 +92,7 @@ async function createRuntime(input: {
   configPath: string;
   pluginConfig: PluginConfig;
   version: string;
+  agentEventProbe?: AgentEventProbe;
 }) {
   const config = resolvePluginConfigWithHostDefaults(input.configPath, input.pluginConfig);
   if (!config.gateway.baseUrl) {
@@ -89,23 +102,28 @@ async function createRuntime(input: {
     throw new Error("Missing gateway.secret and no local gateway auth token could be inferred");
   }
 
+  const hostKind = detectHostKind(input.stateDir);
   const gatewayConfig = {
     ...config.gateway,
-    runtimeRoot: input.rootDir
+    hostKind,
+    runtimeRoot: input.rootDir,
+    exposeRawThinking: config.console.showRawThinking
   };
   const hostRuntime = readHostRuntimeInfo(input.configPath);
   const gateway = createGatewayClient(gatewayConfig);
   const server = createConsoleServer({
     stateDir: input.stateDir,
     configPath: input.configPath,
-    hostKind: detectHostKind(input.stateDir),
+    hostKind,
     pluginVersion: input.version,
     token: randomUUID(),
     gatewayConfig,
+    hub53aiConfig: config.hub53ai,
     consoleConfig: config.console,
     persistence: config.persistence,
     hostRuntime,
     gateway,
+    agentEventProbe: input.agentEventProbe,
     webDir: resolveWebDir(input.rootDir)
   });
 

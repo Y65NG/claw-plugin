@@ -272,6 +272,109 @@ describe("console server", () => {
     }
   });
 
+  it("does not derive a duplicate tail chunk when split deltas already have a final assistant message", async () => {
+    const stateDir = await mkdtemp(join(tmpdir(), "claw-control-center-"));
+    cleanupPaths.push(stateDir);
+
+    const gateway = new FakeGateway();
+    gateway.seedSession({
+      session: {
+        id: "session-split-delta",
+        title: "Split delta session",
+        status: "completed",
+        hostKind: "qclaw",
+        runnerCommand: "gateway",
+        createdAt: "2026-05-20T03:49:20.000Z",
+        updatedAt: "2026-05-20T03:49:46.000Z",
+        lastEventSeq: 5
+      },
+      messages: [
+        {
+          id: "user-1",
+          sessionId: "session-split-delta",
+          role: "user",
+          content: "解释流式输出",
+          createdAt: "2026-05-20T03:49:20.000Z"
+        },
+        {
+          id: "assistant-5",
+          sessionId: "session-split-delta",
+          role: "assistant",
+          content: "第一部分，第二部分。",
+          createdAt: "2026-05-20T03:49:46.000Z"
+        }
+      ],
+      events: [
+        {
+          id: "evt-1",
+          sessionId: "session-split-delta",
+          seq: 2,
+          kind: "assistant.delta",
+          payload: { content: "第一部分，", mode: "append" },
+          createdAt: "2026-05-20T03:49:45.000Z"
+        },
+        {
+          id: "evt-2",
+          sessionId: "session-split-delta",
+          seq: 3,
+          kind: "assistant.delta",
+          payload: { content: "第二部分。", mode: "append" },
+          createdAt: "2026-05-20T03:49:45.100Z"
+        },
+        {
+          id: "evt-3",
+          sessionId: "session-split-delta",
+          seq: 4,
+          kind: "assistant.message",
+          payload: { content: "第一部分，第二部分。" },
+          createdAt: "2026-05-20T03:49:46.000Z"
+        },
+        {
+          id: "evt-4",
+          sessionId: "session-split-delta",
+          seq: 5,
+          kind: "run.completed",
+          payload: { ok: true },
+          createdAt: "2026-05-20T03:49:46.000Z"
+        }
+      ]
+    });
+
+    const server = createConsoleServer({
+      stateDir,
+      configPath: join(stateDir, "openclaw.json"),
+      hostKind: "qclaw",
+      pluginVersion: "1.0.0",
+      token: "local-token",
+      gatewayConfig: {
+        baseUrl: "https://gateway.example.com",
+        botId: "bot-123",
+        secret: "sk-secret"
+      },
+      consoleConfig: {
+        host: "127.0.0.1",
+        port: 0
+      },
+      persistence: {
+        maxSessions: 20
+      },
+      gateway
+    });
+
+    await server.start();
+    try {
+      const detail = await fetchJson<{
+        messages: Array<{ role: string; content: string }>;
+      }>(`${server.baseUrl}/api/sessions/session-split-delta`);
+      expect(detail.messages.map((message) => message.content)).toEqual([
+        "解释流式输出",
+        "第一部分，第二部分。"
+      ]);
+    } finally {
+      await server.stop();
+    }
+  });
+
   it("surfaces host skill and model metadata in bootstrap and status responses", async () => {
     const stateDir = await mkdtemp(join(tmpdir(), "claw-control-center-"));
     cleanupPaths.push(stateDir);
@@ -340,6 +443,68 @@ describe("console server", () => {
       }>(`${server.baseUrl}/api/status`);
       expect(status.modelPrimary).toBe("qclaw/modelroute");
       expect(status.enabledSkills).toEqual(["browser", "online-search"]);
+    } finally {
+      await server.stop();
+    }
+  });
+
+  it("surfaces redacted 53AIHub bridge config and status", async () => {
+    const stateDir = await mkdtemp(join(tmpdir(), "claw-control-center-"));
+    cleanupPaths.push(stateDir);
+
+    const gateway = new FakeGateway();
+    const server = createConsoleServer({
+      stateDir,
+      configPath: join(stateDir, "openclaw.json"),
+      hostKind: "qclaw",
+      pluginVersion: "1.0.0",
+      token: "local-token",
+      gatewayConfig: {
+        baseUrl: "https://gateway.example.com",
+        botId: "bot-123",
+        secret: "sk-secret"
+      },
+      hub53aiConfig: {
+        enabled: false,
+        botId: "hub-bot",
+        secret: "hub-secret",
+        wsUrl: "wss://hub.example.com/api/v1/openclaw/ws/connect",
+        accessPolicy: "open",
+        allowFrom: [],
+        sendThinkingMessage: true,
+        reconnectBaseMs: 2000,
+        maxReconnectAttempts: 10
+      },
+      consoleConfig: {
+        host: "127.0.0.1",
+        port: 0
+      },
+      persistence: {
+        maxSessions: 20
+      },
+      gateway
+    });
+
+    await server.start();
+    try {
+      const bootstrap = await fetchJson<{
+        status: {
+          hub53ai?: { enabled: boolean; connectionStatus: string; botId?: string };
+        };
+        config: {
+          hub53ai?: { secret?: string; botId?: string };
+        };
+      }>(`${server.baseUrl}/api/bootstrap`);
+
+      expect(bootstrap.status.hub53ai).toMatchObject({
+        enabled: false,
+        connectionStatus: "disabled",
+        botId: "hu***ot"
+      });
+      expect(bootstrap.config.hub53ai).toMatchObject({
+        botId: "hub-bot",
+        secret: "[redacted]"
+      });
     } finally {
       await server.stop();
     }

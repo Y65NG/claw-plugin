@@ -191,6 +191,127 @@ describe("QClaw installer", () => {
     expect(await readFile(join(stalePluginDir, "web-dist", "assets", "new-bundle.js"), "utf8")).toContain("fresh");
   });
 
+  it("writes explicit 53AIHub bridge config without mixing it into the local gateway config", async () => {
+    const tempRoot = await mkdtemp(join(tmpdir(), "qclaw-install-"));
+    cleanupPaths.push(tempRoot);
+
+    const configPath = join(tempRoot, "openclaw.json");
+    const extensionsDir = join(tempRoot, "extensions");
+    const packageRoot = join(tempRoot, "package");
+    await mkdir(join(packageRoot, "dist"), { recursive: true });
+    await writeFile(join(packageRoot, "package.json"), JSON.stringify({ name: "@claw-plugin/claw-control-center" }));
+    await writeFile(join(packageRoot, "openclaw.plugin.json"), JSON.stringify({ id: "claw-control-center" }));
+    await writeFile(join(packageRoot, "dist", "index.cjs"), "module.exports = {};\n");
+    await writeFile(
+      configPath,
+      JSON.stringify({
+        gateway: {
+          host: "127.0.0.1",
+          port: 28789,
+          auth: {
+            mode: "token",
+            token: "local-token"
+          }
+        }
+      })
+    );
+
+    const result = await installIntoQClaw({
+      packageRoot,
+      extensionsDir,
+      configPath,
+      hubWsUrl: "wss://hub.example.com/api/v1/openclaw/ws/connect",
+      hubBotId: "hub-bot",
+      hubSecret: "hub-secret"
+    });
+
+    const updated = JSON.parse(await readFile(configPath, "utf8")) as {
+      plugins: {
+        entries: Record<string, { enabled: boolean; config?: Record<string, any> }>;
+      };
+    };
+
+    expect(result.hub53aiConfigured).toBe(true);
+    expect(updated.plugins.entries["claw-control-center"].config?.gateway).toEqual({
+      baseUrl: "ws://127.0.0.1:28789",
+      secret: "local-token"
+    });
+    expect(updated.plugins.entries["claw-control-center"].config?.hub53ai).toEqual({
+      enabled: true,
+      botId: "hub-bot",
+      secret: "hub-secret",
+      wsUrl: "wss://hub.example.com/api/v1/openclaw/ws/connect",
+      accessPolicy: "open",
+      allowFrom: [],
+      sendThinkingMessage: true
+    });
+  });
+
+  it("migrates legacy channels.53aihub config into the new bridge config", async () => {
+    const tempRoot = await mkdtemp(join(tmpdir(), "qclaw-install-"));
+    cleanupPaths.push(tempRoot);
+
+    const configPath = join(tempRoot, "openclaw.json");
+    const extensionsDir = join(tempRoot, "extensions");
+    const packageRoot = join(tempRoot, "package");
+    await mkdir(join(packageRoot, "dist"), { recursive: true });
+    await writeFile(join(packageRoot, "package.json"), JSON.stringify({ name: "@claw-plugin/claw-control-center" }));
+    await writeFile(join(packageRoot, "openclaw.plugin.json"), JSON.stringify({ id: "claw-control-center" }));
+    await writeFile(join(packageRoot, "dist", "index.cjs"), "module.exports = {};\n");
+    await writeFile(
+      configPath,
+      JSON.stringify(
+        {
+          gateway: {
+            host: "127.0.0.1",
+            port: 28789,
+            auth: {
+              mode: "token",
+              token: "local-token"
+            }
+          },
+          channels: {
+            "53aihub": {
+              enabled: true,
+              botId: "legacy-bot",
+              secret: "legacy-secret",
+              WSUrl: "wss://legacy.example.com/api/v1/openclaw/ws/connect",
+              accessPolicy: "allowlist",
+              allowFrom: ["user-a"],
+              sendThinkingMessage: false
+            }
+          }
+        },
+        null,
+        2
+      )
+    );
+
+    await installIntoQClaw({
+      packageRoot,
+      extensionsDir,
+      configPath
+    });
+
+    const updated = JSON.parse(await readFile(configPath, "utf8")) as {
+      channels: Record<string, { botId: string }>;
+      plugins: {
+        entries: Record<string, { enabled: boolean; config?: Record<string, any> }>;
+      };
+    };
+
+    expect(updated.plugins.entries["claw-control-center"].config?.hub53ai).toEqual({
+      enabled: true,
+      botId: "legacy-bot",
+      secret: "legacy-secret",
+      wsUrl: "wss://legacy.example.com/api/v1/openclaw/ws/connect",
+      accessPolicy: "allowlist",
+      allowFrom: ["user-a"],
+      sendThinkingMessage: false
+    });
+    expect(updated.channels["53aihub"].botId).toBe("legacy-bot");
+  });
+
   it("installs into OpenClaw paths when the openclaw target is selected", async () => {
     const tempRoot = await mkdtemp(join(tmpdir(), "openclaw-install-"));
     cleanupPaths.push(tempRoot);

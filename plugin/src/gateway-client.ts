@@ -11,9 +11,11 @@ export type GatewayConfig = {
   baseUrl: string;
   botId: string;
   secret: string;
+  hostKind?: string;
   requestTimeoutMs: number;
   streamReconnectMs: number;
   runtimeRoot?: string;
+  exposeRawThinking?: boolean;
 };
 
 export type GatewaySession = SessionSummary;
@@ -73,9 +75,15 @@ type SessionSubscription = {
     onDisconnect: (error?: Error) => void;
   }>;
   lastSeq: number;
+  openedAtMs: number;
+  activeRunIds: Set<string>;
+  renderedAssistantTextByRun: Map<string, string>;
+  renderedThinkingTextByRun: Map<string, string>;
 };
 
 const DEFAULT_SCOPES = ["operator.read", "operator.write"];
+const MAX_DELTA_CHUNK_CHARS = 240;
+const MIN_DELTA_CHUNK_CHARS = 80;
 
 type RpcTransport = {
   request(method: string, params: Record<string, unknown>, options?: GatewayRequestOptions): Promise<any>;
@@ -104,9 +112,17 @@ export function createGatewayClient(config: Partial<GatewayConfig>): GatewayClie
       return;
     }
 
-    const events = mapGatewayFrameToEvents(frame, subscription.lastSeq);
+    if (isStaleChatFrame(frame, subscription)) {
+      return;
+    }
+
+    const events = mapGatewayFrameToEvents(frame, subscription.lastSeq, subscription, resolved.exposeRawThinking);
     for (const event of events) {
+      if (frame.event !== "chat" && event.seq <= subscription.lastSeq) {
+        continue;
+      }
       subscription.lastSeq = Math.max(subscription.lastSeq, event.seq);
+      updateActiveRunTracking(frame, subscription);
       for (const handler of subscription.handlers) {
         handler.onEvent(event);
       }
@@ -130,7 +146,7 @@ export function createGatewayClient(config: Partial<GatewayConfig>): GatewayClie
         includeDerivedTitles: true,
         includeLastMessage: true
       });
-      return extractSessions(payload);
+      return extractSessions(payload, resolved.hostKind);
     },
     async createSession(title) {
       const payload = await transport.request("sessions.create", {
@@ -138,14 +154,14 @@ export function createGatewayClient(config: Partial<GatewayConfig>): GatewayClie
         agentId: "main"
       });
       return {
-        ...normalizeSession(extractCreatedSession(payload), title),
+        ...normalizeSession(extractCreatedSession(payload), title, resolved.hostKind),
         title
       };
     },
     async getSession(sessionId) {
       const sessions = await this.listSessions(200);
       const match = sessions.find((session) => session.id === sessionId);
-      return match ?? fallbackSession(sessionId);
+      return match ?? fallbackSession(sessionId, resolved.hostKind);
     },
     async getSessionMessages(sessionId, limit = 200) {
       const payload = await transport.request("chat.history", {
@@ -198,7 +214,11 @@ export function createGatewayClient(config: Partial<GatewayConfig>): GatewayClie
     subscribe(sessionId, afterSeq, handlers) {
       const subscription = subscriptions.get(sessionId) ?? {
         handlers: new Set(),
-        lastSeq: afterSeq
+        lastSeq: afterSeq,
+        openedAtMs: Date.now(),
+        activeRunIds: new Set<string>(),
+        renderedAssistantTextByRun: new Map<string, string>(),
+        renderedThinkingTextByRun: new Map<string, string>()
       };
       subscription.lastSeq = Math.max(subscription.lastSeq, afterSeq);
       subscription.handlers.add(handlers);
@@ -236,16 +256,27 @@ export function resolveGatewayConfig(config: Partial<GatewayConfig>): GatewayCon
     secret: String(config.secret ?? ""),
     requestTimeoutMs: Number(config.requestTimeoutMs ?? 15_000),
     streamReconnectMs: Number(config.streamReconnectMs ?? 2_000),
-    runtimeRoot: typeof config.runtimeRoot === "string" ? config.runtimeRoot : undefined
+    hostKind: typeof config.hostKind === "string" ? config.hostKind : undefined,
+    runtimeRoot: typeof config.runtimeRoot === "string" ? config.runtimeRoot : undefined,
+    exposeRawThinking: config.exposeRawThinking !== false
   };
 }
 
 function createTransport(config: GatewayConfig): RpcTransport {
   const officialModulePath = resolveOfficialGatewayClientModule(config.runtimeRoot);
-  if (officialModulePath) {
+  if (officialModulePath && shouldUseOfficialGatewayClient(config)) {
     return createOfficialTransport(config, officialModulePath);
   }
   return new RpcSocketClient(config);
+}
+
+function shouldUseOfficialGatewayClient(config: GatewayConfig): boolean {
+  try {
+    const url = new URL(config.baseUrl);
+    return url.port === "28789";
+  } catch {
+    return false;
+  }
 }
 
 function resolveOfficialGatewayClientModule(runtimeRoot?: string): string | null {
@@ -590,14 +621,15 @@ class RpcSocketClient {
       id: "connect-handshake",
       method: "connect",
       params: {
-        minProtocol: 3,
-        maxProtocol: 3,
+        minProtocol: 4,
+        maxProtocol: 4,
         client: {
-          id: "cli",
+          id: "gateway-client",
           displayName: "Claw Control Center",
           version: "claw-control-center",
           platform: process.platform,
-          mode: "cli"
+          mode: "backend",
+          instanceId: "claw-control-center"
         },
         role: "operator",
         scopes: DEFAULT_SCOPES,
@@ -648,11 +680,11 @@ function normalizeGatewayUrl(raw: string): string {
   return parsed.toString().replace(/\/$/, "");
 }
 
-function extractSessions(payload: unknown): GatewaySession[] {
+function extractSessions(payload: unknown, hostKind = "openclaw"): GatewaySession[] {
   const sessions = Array.isArray((payload as { sessions?: unknown[] } | null)?.sessions)
     ? ((payload as { sessions: unknown[] }).sessions ?? [])
     : [];
-  return sessions.map((session) => normalizeSession(session));
+  return sessions.map((session) => normalizeSession(session, "Untitled session", hostKind));
 }
 
 function extractCreatedSession(payload: unknown): Record<string, unknown> {
@@ -669,7 +701,7 @@ function extractMessages(sessionId: string, payload: unknown): SessionMessage[] 
     .filter((message): message is SessionMessage => message !== null);
 }
 
-function normalizeSession(payload: unknown, fallbackTitle = "Untitled session"): GatewaySession {
+function normalizeSession(payload: unknown, fallbackTitle = "Untitled session", hostKind = "openclaw"): GatewaySession {
   const entry = payload && typeof payload === "object" ? (payload as Record<string, unknown>) : {};
   const key = String(entry.key ?? entry.sessionKey ?? entry.sessionId ?? randomUUID());
   const updatedAtMs = Number(entry.updatedAt ?? entry.startedAt ?? Date.now());
@@ -681,7 +713,7 @@ function normalizeSession(payload: unknown, fallbackTitle = "Untitled session"):
     id: key,
     title,
     status: normalizeStatus(entry.status),
-    hostKind: "qclaw",
+    hostKind,
     runnerCommand: "openclaw-gateway",
     createdAt,
     updatedAt,
@@ -770,7 +802,9 @@ function synthesizeEventsFromHistory(sessionId: string, payload: unknown, afterS
 
 function mapGatewayFrameToEvents(
   frame: Extract<GatewayFrame, { type: "event" }>,
-  lastSeq: number
+  lastSeq: number,
+  subscription?: SessionSubscription,
+  exposeRawThinking = false
 ): GatewayEvent[] {
   const sessionId = extractSessionKey(frame.payload);
   const payload = toRecord(frame.payload);
@@ -783,49 +817,141 @@ function mapGatewayFrameToEvents(
 
   if (frame.event === "chat") {
     const state = String(payload.state ?? "delta");
-    const content = extractTextContent(message.content) ?? "";
-    if (!content.trim()) {
+    const deltaText = typeof payload.deltaText === "string" ? payload.deltaText : "";
+    const messageContent = extractTextContent(message.content) ?? "";
+    let content = state === "delta" ? deltaText || messageContent : messageContent || deltaText;
+    const thinking = extractThinkingSignal(payload, message.content);
+    if (!content.trim() && !thinking?.trim()) {
       return [];
     }
-    return [
-      {
-        id: `${sessionId}:chat:${Number(payload.seq ?? lastSeq + 1)}`,
-        sessionId,
-        seq: Number(payload.seq ?? lastSeq + 1),
-        kind: "assistant.delta",
-        payload: {
-          content,
-          state,
-          runId: payload.runId
-        },
-        createdAt: toIsoString(message.timestamp ?? Date.now())
+    const isDelta = state === "delta";
+    const runKey = typeof payload.runId === "string" && payload.runId ? payload.runId : sessionId;
+    let nextSeq = lastSeq + 1;
+    const events: GatewayEvent[] = [];
+
+    if (thinking?.trim()) {
+      const previousThinking = subscription?.renderedThinkingTextByRun.get(runKey) ?? "";
+      const shouldSkipThinking = isDelta && previousThinking && previousThinking.startsWith(thinking);
+      if (!shouldSkipThinking) {
+        const replaceThinking =
+          payload.replace === true || (isDelta && Boolean(previousThinking) && thinking.startsWith(previousThinking));
+        events.push({
+          id: `${sessionId}:thinking:${nextSeq}`,
+          sessionId,
+          seq: nextSeq,
+          kind: "assistant.thinking",
+          payload: buildThinkingPayload(thinking, exposeRawThinking, {
+            state,
+            mode: isDelta ? (replaceThinking ? "replace" : "append") : "replace",
+            replace: replaceThinking,
+            runId: payload.runId,
+            rawSeq: payload.seq
+          }),
+          createdAt: toIsoString(message.timestamp ?? Date.now())
+        });
+        nextSeq += 1;
+        if (isDelta && subscription) {
+          subscription.renderedThinkingTextByRun.set(
+            runKey,
+            replaceThinking ? thinking : `${previousThinking}${thinking}`
+          );
+        }
       }
-    ];
+    }
+
+    if (!content.trim()) {
+      return events;
+    }
+
+    const previousRendered = subscription?.renderedAssistantTextByRun.get(runKey) ?? "";
+    if (!isDelta && previousRendered.trim()) {
+      content = normalizeFinalAssistantContent(content, previousRendered);
+    }
+    if (isDelta && previousRendered && previousRendered.startsWith(content)) {
+      return events;
+    }
+    const replace = payload.replace === true || (isDelta && Boolean(previousRendered) && content.startsWith(previousRendered));
+    const mode = isDelta ? (replace ? "replace" : "append") : "replace";
+    const chunks = isDelta && mode === "append" ? splitDeltaText(content) : [content];
+    const createdAt = toIsoString(message.timestamp ?? Date.now());
+    chunks.forEach((chunk, index) => {
+      const seq = nextSeq + index;
+      events.push({
+        id: `${sessionId}:chat:${seq}`,
+        sessionId,
+        seq,
+        kind: isDelta ? "assistant.delta" : "assistant.message",
+        payload: {
+          content: chunk,
+          state,
+          mode,
+          replace,
+          runId: payload.runId,
+          rawSeq: payload.seq,
+          ...(isDelta && mode === "append" && chunks.length > 1
+            ? {
+                syntheticChunk: {
+                  index,
+                  total: chunks.length
+                }
+              }
+            : {})
+        },
+        createdAt
+      });
+    });
+    if (isDelta && subscription) {
+      subscription.renderedAssistantTextByRun.set(
+        runKey,
+        mode === "replace" ? content : `${previousRendered}${chunks.join("")}`
+      );
+    }
+    return events;
   }
 
   if (frame.event === "session.message") {
     const role = typeof message.role === "string" ? message.role : "";
-    if (role !== "assistant") {
+    if (role !== "assistant" && role !== "user") {
       return [];
     }
     const content = extractTextContent(message.content) ?? "";
-    if (!content.trim()) {
+    const thinking = role === "assistant" ? extractThinkingContent(message.content) : null;
+    if (!content.trim() && !thinking?.trim()) {
       return [];
     }
-    const seq = Number(payload.messageSeq ?? messageMeta.seq ?? lastSeq + 1);
-    return [
-      {
+    const rawSeq = Number(payload.messageSeq ?? messageMeta.seq);
+    let seq = Number.isFinite(rawSeq) ? Math.max(lastSeq + 1, rawSeq) : lastSeq + 1;
+    const createdAt = toIsoString(message.timestamp ?? Date.now());
+    const events: GatewayEvent[] = [];
+    if (thinking?.trim()) {
+      events.push({
+        id: `${sessionId}:thinking:${seq}`,
+        sessionId,
+        seq,
+        kind: "assistant.thinking",
+        payload: buildThinkingPayload(thinking, exposeRawThinking, {
+          state: "final",
+          mode: "replace",
+          replace: true,
+          rawSeq: payload.messageSeq ?? messageMeta.seq
+        }),
+        createdAt
+      });
+      seq += 1;
+    }
+    if (content.trim()) {
+      events.push({
         id: `${sessionId}:message:${seq}`,
         sessionId,
         seq,
-        kind: "assistant.message",
+        kind: role === "user" ? "user.message" : "assistant.message",
         payload: {
-          content,
-          thinking: extractThinkingContent(message.content)
+          content
         },
-        createdAt: toIsoString(message.timestamp ?? Date.now())
-      }
-    ];
+        createdAt
+      });
+    }
+    return events;
   }
 
   if (frame.event === "session.tool") {
@@ -895,6 +1021,45 @@ function extractSessionKey(payload: unknown): string | null {
   return typeof sessionKey === "string" && sessionKey.trim() ? sessionKey : null;
 }
 
+function isStaleChatFrame(frame: Extract<GatewayFrame, { type: "event" }>, subscription: SessionSubscription): boolean {
+  if (frame.event !== "chat") {
+    return false;
+  }
+
+  const payload = toRecord(frame.payload);
+  const runId = typeof payload.runId === "string" ? payload.runId : "";
+  if (runId && subscription.activeRunIds.has(runId)) {
+    return false;
+  }
+
+  const message = toRecord(payload.message);
+  const timestamp = Number(message.timestamp ?? payload.ts ?? 0);
+  if (!Number.isFinite(timestamp) || timestamp <= 0) {
+    return false;
+  }
+
+  return timestamp < subscription.openedAtMs - 5_000;
+}
+
+function updateActiveRunTracking(frame: Extract<GatewayFrame, { type: "event" }>, subscription: SessionSubscription) {
+  if (frame.event !== "sessions.changed") {
+    return;
+  }
+
+  const payload = toRecord(frame.payload);
+  const runId = typeof payload.runId === "string" ? payload.runId : "";
+  if (!runId) {
+    return;
+  }
+
+  const phase = String(payload.phase ?? "");
+  if (phase === "start") {
+    subscription.activeRunIds.add(runId);
+  } else if (phase === "end") {
+    subscription.activeRunIds.delete(runId);
+  }
+}
+
 function extractTextContent(content: unknown): string | null {
   if (typeof content === "string") {
     return content;
@@ -940,6 +1105,163 @@ function extractThinkingContent(content: unknown): string | null {
   return lines.length > 0 ? lines.join("\n") : null;
 }
 
+function extractThinkingSignal(payload: Record<string, unknown>, messageContent: unknown): string | null {
+  const nestedData = toRecord(payload.data);
+  const candidates = [
+    payload.thinking,
+    payload.thinkingText,
+    payload.reasoning,
+    payload.reasoningText,
+    payload.reasoning_content,
+    payload.deltaThinking,
+    payload.deltaReasoning,
+    nestedData.thinking,
+    nestedData.thinkingText,
+    nestedData.reasoning,
+    nestedData.reasoningText,
+    nestedData.reasoning_content,
+    extractThinkingContent(messageContent)
+  ];
+
+  for (const candidate of candidates) {
+    const text = extractStringContent(candidate);
+    if (text?.trim()) {
+      return text;
+    }
+  }
+  return null;
+}
+
+function extractStringContent(value: unknown): string | null {
+  if (typeof value === "string") {
+    return value;
+  }
+  if (!Array.isArray(value)) {
+    return null;
+  }
+  const text = value
+    .flatMap((entry) => {
+      if (!entry || typeof entry !== "object") {
+        return [];
+      }
+      const record = entry as Record<string, unknown>;
+      if (typeof record.text === "string") {
+        return [record.text];
+      }
+      if (typeof record.thinking === "string") {
+        return [record.thinking];
+      }
+      if (typeof record.content === "string") {
+        return [record.content];
+      }
+      return [];
+    })
+    .join("");
+  return text || null;
+}
+
+function buildThinkingPayload(
+  thinking: string,
+  exposeRawThinking: boolean,
+  extra: Record<string, unknown>
+): Record<string, unknown> {
+  const content = collapseRepeatedGrowingPrefix(thinking);
+  if (exposeRawThinking) {
+    return {
+      content,
+      privateContentOmitted: false,
+      rawThinkingVisible: true,
+      textLength: content.length,
+      ...extra
+    };
+  }
+
+  return {
+    content: "Claw emitted a private thinking update. Raw reasoning is hidden.",
+    privateContentOmitted: true,
+    textLength: content.length,
+    ...extra
+  };
+}
+
+function normalizeFinalAssistantContent(content: string, previousRendered: string): string {
+  const trimmedPrevious = previousRendered.trim();
+  const trimmedContent = content.trim();
+  if (!trimmedPrevious || !trimmedContent || trimmedContent === trimmedPrevious) {
+    return trimmedContent || content;
+  }
+
+  const index = trimmedContent.lastIndexOf(trimmedPrevious);
+  if (index >= 0) {
+    const trailingLength = trimmedContent.length - index - trimmedPrevious.length;
+    const endsWithPreviousAnswer = trimmedPrevious.length >= 10 && trailingLength <= 8;
+    const previousDominatesSnapshot = trimmedPrevious.length >= Math.min(160, trimmedContent.length * 0.45);
+    if (endsWithPreviousAnswer || previousDominatesSnapshot) {
+      return trimmedPrevious;
+    }
+  }
+
+  return content;
+}
+
+function collapseRepeatedGrowingPrefix(value: string): string {
+  const leadingWhitespace = value.match(/^\s*/)?.[0] ?? "";
+  const text = value.trimStart();
+  if (text.length < 40) {
+    return value;
+  }
+
+  for (let split = Math.floor(text.length / 2); split >= 20; split -= 1) {
+    const first = text.slice(0, split).trim();
+    const second = text.slice(split).trimStart();
+    if (first.length >= 20 && second.startsWith(first)) {
+      return `${leadingWhitespace}${second}`;
+    }
+  }
+
+  return value;
+}
+
+function splitDeltaText(text: string): string[] {
+  if (text.length <= MAX_DELTA_CHUNK_CHARS) {
+    return [text];
+  }
+
+  const chunks: string[] = [];
+  let cursor = 0;
+  while (cursor < text.length) {
+    const remaining = text.length - cursor;
+    if (remaining <= MAX_DELTA_CHUNK_CHARS) {
+      chunks.push(text.slice(cursor));
+      break;
+    }
+
+    const hardLimit = cursor + MAX_DELTA_CHUNK_CHARS;
+    const softLimit = cursor + MIN_DELTA_CHUNK_CHARS;
+    let splitAt = findReadableSplit(text, softLimit, hardLimit);
+    if (splitAt <= cursor) {
+      splitAt = hardLimit;
+    }
+
+    chunks.push(text.slice(cursor, splitAt));
+    cursor = splitAt;
+  }
+
+  return chunks;
+}
+
+function findReadableSplit(text: string, minIndex: number, maxIndex: number): number {
+  const boundedMax = Math.min(maxIndex, text.length);
+  const candidates = ["\n\n", "\n", "。", "！", "？", ". ", "! ", "? ", "；", "; ", "，", ", ", " "];
+  for (const marker of candidates) {
+    const index = text.lastIndexOf(marker, boundedMax);
+    if (index >= minIndex) {
+      return index + marker.length;
+    }
+  }
+  return boundedMax;
+}
+
 function normalizeStatus(status: unknown): GatewaySession["status"] {
   switch (status) {
     case "running":
@@ -976,13 +1298,13 @@ function toIsoString(value: unknown): string {
   return new Date().toISOString();
 }
 
-function fallbackSession(sessionId: string): GatewaySession {
+function fallbackSession(sessionId: string, hostKind = "openclaw"): GatewaySession {
   const now = new Date().toISOString();
   return {
     id: sessionId,
     title: sessionId,
     status: "idle",
-    hostKind: "qclaw",
+    hostKind,
     runnerCommand: "openclaw-gateway",
     createdAt: now,
     updatedAt: now,

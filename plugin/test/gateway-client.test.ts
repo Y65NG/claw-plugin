@@ -18,6 +18,8 @@ describe("gateway client", () => {
   it("speaks the OpenClaw websocket RPC handshake and carries the shared token", async () => {
     let capturedToken = "";
     let capturedMethod = "";
+    let capturedMinProtocol = 0;
+    let capturedMaxProtocol = 0;
 
     const httpServer = createServer();
     servers.add(httpServer);
@@ -46,6 +48,8 @@ describe("gateway client", () => {
 
           if (frame.method === "connect") {
             capturedToken = String(frame.params?.auth?.token ?? "");
+            capturedMinProtocol = Number((frame.params as Record<string, unknown>)?.minProtocol ?? 0);
+            capturedMaxProtocol = Number((frame.params as Record<string, unknown>)?.maxProtocol ?? 0);
             client.send(
               JSON.stringify({
                 type: "res",
@@ -53,7 +57,7 @@ describe("gateway client", () => {
                 ok: true,
                 payload: {
                   type: "hello-ok",
-                  protocol: 3
+                  protocol: 4
                 }
               })
             );
@@ -88,8 +92,695 @@ describe("gateway client", () => {
 
     expect(capturedMethod).toBe("sessions.create");
     expect(capturedToken).toBe("shared-token");
+    expect(capturedMinProtocol).toBe(4);
+    expect(capturedMaxProtocol).toBe(4);
     expect(session.id).toBe("agent:main:test-session");
     expect(session.title).toBe("Gateway session");
+    await client.stop();
+    await new Promise<void>((resolve) => wss.close(() => resolve()));
+  });
+
+  it("sends OpenClaw messages through chat.send without external delivery", async () => {
+    let capturedMethod = "";
+    let capturedParams: Record<string, unknown> = {};
+
+    const httpServer = createServer();
+    servers.add(httpServer);
+    const wss = new WebSocketServer({ noServer: true });
+
+    httpServer.on("upgrade", (request, socket, head) => {
+      wss.handleUpgrade(request, socket, head, (client) => {
+        client.send(
+          JSON.stringify({
+            type: "event",
+            event: "connect.challenge",
+            payload: { nonce: "nonce-1" }
+          })
+        );
+
+        client.on("message", (data) => {
+          const frame = JSON.parse(data.toString()) as {
+            id: string;
+            method: string;
+            params?: Record<string, unknown>;
+          };
+
+          if (frame.method === "connect") {
+            client.send(JSON.stringify({ type: "res", id: frame.id, ok: true, payload: { protocol: 4 } }));
+            return;
+          }
+
+          capturedMethod = frame.method;
+          capturedParams = frame.params ?? {};
+          client.send(JSON.stringify({ type: "res", id: frame.id, ok: true, payload: { ok: true } }));
+        });
+      });
+    });
+
+    const address = await listen(httpServer);
+    const client = createGatewayClient({
+      baseUrl: address.replace("http://", "ws://"),
+      secret: "shared-token"
+    });
+
+    await client.sendMessage("agent:main:telegram:direct:123", "hello");
+
+    expect(capturedMethod).toBe("chat.send");
+    expect(capturedParams).toMatchObject({
+      sessionKey: "agent:main:telegram:direct:123",
+      message: "hello",
+      deliver: false
+    });
+    expect(capturedParams).toHaveProperty("idempotencyKey");
+    await client.stop();
+    await new Promise<void>((resolve) => wss.close(() => resolve()));
+  });
+
+  it("drops replayed stream events at or below the subscribed sequence", async () => {
+    const received: string[] = [];
+    const httpServer = createServer();
+    servers.add(httpServer);
+    const wss = new WebSocketServer({ noServer: true });
+
+    httpServer.on("upgrade", (request, socket, head) => {
+      wss.handleUpgrade(request, socket, head, (client) => {
+        client.send(
+          JSON.stringify({
+            type: "event",
+            event: "connect.challenge",
+            payload: { nonce: "nonce-1" }
+          })
+        );
+
+        client.on("message", (data) => {
+          const frame = JSON.parse(data.toString()) as {
+            id: string;
+            method: string;
+            params?: Record<string, unknown>;
+          };
+
+          if (frame.method === "connect") {
+            client.send(JSON.stringify({ type: "res", id: frame.id, ok: true, payload: { protocol: 4 } }));
+            return;
+          }
+
+          client.send(JSON.stringify({ type: "res", id: frame.id, ok: true, payload: { ok: true } }));
+
+          if (frame.method === "sessions.messages.subscribe") {
+            const now = Date.now();
+            client.send(
+              JSON.stringify({
+                type: "event",
+                event: "chat",
+                payload: {
+                  sessionKey: "agent:main:test-session",
+                  seq: 4,
+                  message: { role: "assistant", content: [{ type: "text", text: "old" }], timestamp: now - 60_000 }
+                }
+              })
+            );
+            client.send(
+              JSON.stringify({
+                type: "event",
+                event: "chat",
+                payload: {
+                  sessionKey: "agent:main:test-session",
+                  seq: 6,
+                  message: { role: "assistant", content: [{ type: "text", text: "new" }], timestamp: now }
+                }
+              })
+            );
+          }
+        });
+      });
+    });
+
+    const address = await listen(httpServer);
+    const client = createGatewayClient({
+      baseUrl: address.replace("http://", "ws://"),
+      secret: "shared-token"
+    });
+
+    const close = client.subscribe("agent:main:test-session", 5, {
+      onEvent: (event) => received.push(String((event.payload as { content?: string }).content ?? "")),
+      onDisconnect: () => {}
+    });
+
+    await eventually(() => expect(received).toEqual(["new"]));
+    close();
+    await client.stop();
+    await new Promise<void>((resolve) => wss.close(() => resolve()));
+  });
+
+  it("uses chat deltaText as append chunks instead of replacing with cumulative message content", async () => {
+    const received: Array<{ kind: string; content: string; mode?: unknown }> = [];
+    const httpServer = createServer();
+    servers.add(httpServer);
+    const wss = new WebSocketServer({ noServer: true });
+
+    httpServer.on("upgrade", (request, socket, head) => {
+      wss.handleUpgrade(request, socket, head, (client) => {
+        client.send(
+          JSON.stringify({
+            type: "event",
+            event: "connect.challenge",
+            payload: { nonce: "nonce-1" }
+          })
+        );
+
+        client.on("message", (data) => {
+          const frame = JSON.parse(data.toString()) as {
+            id: string;
+            method: string;
+            params?: Record<string, unknown>;
+          };
+
+          if (frame.method === "connect") {
+            client.send(JSON.stringify({ type: "res", id: frame.id, ok: true, payload: { protocol: 4 } }));
+            return;
+          }
+
+          client.send(JSON.stringify({ type: "res", id: frame.id, ok: true, payload: { ok: true } }));
+
+          if (frame.method === "sessions.messages.subscribe") {
+            const now = Date.now();
+            for (const payload of [
+              {
+                state: "delta",
+                deltaText: "Hel",
+                message: { role: "assistant", content: [{ type: "text", text: "Hello" }], timestamp: now }
+              },
+              {
+                state: "delta",
+                deltaText: "lo",
+                message: { role: "assistant", content: [{ type: "text", text: "Hello" }], timestamp: now }
+              },
+              {
+                state: "final",
+                message: { role: "assistant", content: [{ type: "text", text: "Hello" }], timestamp: now }
+              }
+            ]) {
+              client.send(
+                JSON.stringify({
+                  type: "event",
+                  event: "chat",
+                  payload: {
+                    sessionKey: "agent:main:test-session",
+                    runId: "run-1",
+                    seq: received.length + 1,
+                    ...payload
+                  }
+                })
+              );
+            }
+          }
+        });
+      });
+    });
+
+    const address = await listen(httpServer);
+    const client = createGatewayClient({
+      baseUrl: address.replace("http://", "ws://"),
+      secret: "shared-token"
+    });
+
+    const close = client.subscribe("agent:main:test-session", 0, {
+      onEvent: (event) =>
+        received.push({
+          kind: event.kind,
+          content: String((event.payload as { content?: string }).content ?? ""),
+          mode: (event.payload as { mode?: unknown }).mode
+        }),
+      onDisconnect: () => {}
+    });
+
+    await eventually(() =>
+      expect(received).toEqual([
+        { kind: "assistant.delta", content: "Hel", mode: "append" },
+        { kind: "assistant.delta", content: "lo", mode: "append" },
+        { kind: "assistant.message", content: "Hello", mode: "replace" }
+      ])
+    );
+    close();
+    await client.stop();
+    await new Promise<void>((resolve) => wss.close(() => resolve()));
+  });
+
+  it("normalizes cumulative chat deltas as replace snapshots instead of appending duplicates", async () => {
+    const received: Array<{ kind: string; content: string; mode?: unknown; synthetic?: unknown }> = [];
+    const longSnapshot =
+      "开头" + Array.from({ length: 18 }, (_, index) => `第 ${index + 1} 句用于验证累计快照归一化。`).join("");
+    const httpServer = createServer();
+    servers.add(httpServer);
+    const wss = new WebSocketServer({ noServer: true });
+
+    httpServer.on("upgrade", (request, socket, head) => {
+      wss.handleUpgrade(request, socket, head, (client) => {
+        client.send(
+          JSON.stringify({
+            type: "event",
+            event: "connect.challenge",
+            payload: { nonce: "nonce-1" }
+          })
+        );
+
+        client.on("message", (data) => {
+          const frame = JSON.parse(data.toString()) as {
+            id: string;
+            method: string;
+          };
+
+          if (frame.method === "connect") {
+            client.send(JSON.stringify({ type: "res", id: frame.id, ok: true, payload: { protocol: 4 } }));
+            return;
+          }
+
+          client.send(JSON.stringify({ type: "res", id: frame.id, ok: true, payload: { ok: true } }));
+
+          if (frame.method === "sessions.messages.subscribe") {
+            const now = Date.now();
+            for (const payload of [
+              {
+                seq: 1,
+                deltaText: "开头"
+              },
+              {
+                seq: 2,
+                deltaText: longSnapshot
+              }
+            ]) {
+              client.send(
+                JSON.stringify({
+                  type: "event",
+                  event: "chat",
+                  payload: {
+                    sessionKey: "agent:main:test-session",
+                    runId: "run-1",
+                    state: "delta",
+                    message: {
+                      role: "assistant",
+                      content: [{ type: "text", text: payload.deltaText }],
+                      timestamp: now
+                    },
+                    ...payload
+                  }
+                })
+              );
+            }
+          }
+        });
+      });
+    });
+
+    const address = await listen(httpServer);
+    const client = createGatewayClient({
+      baseUrl: address.replace("http://", "ws://"),
+      secret: "shared-token"
+    });
+
+    const close = client.subscribe("agent:main:test-session", 0, {
+      onEvent: (event) =>
+        received.push({
+          kind: event.kind,
+          content: String((event.payload as { content?: string }).content ?? ""),
+          mode: (event.payload as { mode?: unknown }).mode,
+          synthetic: (event.payload as { syntheticChunk?: unknown }).syntheticChunk
+        }),
+      onDisconnect: () => {}
+    });
+
+    await eventually(() =>
+      expect(received).toEqual([
+        { kind: "assistant.delta", content: "开头", mode: "append", synthetic: undefined },
+        { kind: "assistant.delta", content: longSnapshot, mode: "replace", synthetic: undefined }
+      ])
+    );
+    close();
+    await client.stop();
+    await new Promise<void>((resolve) => wss.close(() => resolve()));
+  });
+
+  it("strips reasoning-prefixed final snapshots when streamed answer text is already known", async () => {
+    const received: Array<{ kind: string; content: string; mode?: unknown }> = [];
+    const finalAnswer = "Final visible answer.";
+    const httpServer = createServer();
+    servers.add(httpServer);
+    const wss = new WebSocketServer({ noServer: true });
+
+    httpServer.on("upgrade", (request, socket, head) => {
+      wss.handleUpgrade(request, socket, head, (client) => {
+        client.send(
+          JSON.stringify({
+            type: "event",
+            event: "connect.challenge",
+            payload: { nonce: "nonce-1" }
+          })
+        );
+
+        client.on("message", (data) => {
+          const frame = JSON.parse(data.toString()) as {
+            id: string;
+            method: string;
+          };
+
+          if (frame.method === "connect") {
+            client.send(JSON.stringify({ type: "res", id: frame.id, ok: true, payload: { protocol: 4 } }));
+            return;
+          }
+
+          client.send(JSON.stringify({ type: "res", id: frame.id, ok: true, payload: { ok: true } }));
+
+          if (frame.method === "sessions.messages.subscribe") {
+            const now = Date.now();
+            for (const payload of [
+              {
+                seq: 1,
+                state: "delta",
+                deltaText: finalAnswer
+              },
+              {
+                seq: 2,
+                state: "final",
+                deltaText: `Reasoning prefix that should not be rendered. ${finalAnswer}`
+              }
+            ]) {
+              client.send(
+                JSON.stringify({
+                  type: "event",
+                  event: "chat",
+                  payload: {
+                    sessionKey: "agent:main:test-session",
+                    runId: "run-1",
+                    message: {
+                      role: "assistant",
+                      content: [{ type: "text", text: payload.deltaText }],
+                      timestamp: now
+                    },
+                    ...payload
+                  }
+                })
+              );
+            }
+          }
+        });
+      });
+    });
+
+    const address = await listen(httpServer);
+    const client = createGatewayClient({
+      baseUrl: address.replace("http://", "ws://"),
+      secret: "shared-token"
+    });
+
+    const close = client.subscribe("agent:main:test-session", 0, {
+      onEvent: (event) =>
+        received.push({
+          kind: event.kind,
+          content: String((event.payload as { content?: string }).content ?? ""),
+          mode: (event.payload as { mode?: unknown }).mode
+        }),
+      onDisconnect: () => {}
+    });
+
+    await eventually(() =>
+      expect(received).toEqual([
+        { kind: "assistant.delta", content: finalAnswer, mode: "append" },
+        { kind: "assistant.message", content: finalAnswer, mode: "replace" }
+      ])
+    );
+    close();
+    await client.stop();
+    await new Promise<void>((resolve) => wss.close(() => resolve()));
+  });
+
+  it("sanitizes thinking signals when raw thinking is disabled", async () => {
+    const received: Array<{
+      kind: string;
+      content: string;
+      privateContentOmitted?: unknown;
+      textLength?: unknown;
+    }> = [];
+    const httpServer = createServer();
+    servers.add(httpServer);
+    const wss = new WebSocketServer({ noServer: true });
+
+    httpServer.on("upgrade", (request, socket, head) => {
+      wss.handleUpgrade(request, socket, head, (client) => {
+        client.send(
+          JSON.stringify({
+            type: "event",
+            event: "connect.challenge",
+            payload: { nonce: "nonce-1" }
+          })
+        );
+
+        client.on("message", (data) => {
+          const frame = JSON.parse(data.toString()) as {
+            id: string;
+            method: string;
+          };
+
+          if (frame.method === "connect") {
+            client.send(JSON.stringify({ type: "res", id: frame.id, ok: true, payload: { protocol: 4 } }));
+            return;
+          }
+
+          client.send(JSON.stringify({ type: "res", id: frame.id, ok: true, payload: { ok: true } }));
+
+          if (frame.method === "sessions.messages.subscribe") {
+            client.send(
+              JSON.stringify({
+                type: "event",
+                event: "session.message",
+                payload: {
+                  sessionKey: "agent:main:test-session",
+                  messageSeq: 7,
+                  message: {
+                    role: "assistant",
+                    content: [
+                      { type: "thinking", thinking: "private reasoning that should never be rendered" },
+                      { type: "text", text: "Visible answer" }
+                    ],
+                    timestamp: Date.now()
+                  }
+                }
+              })
+            );
+          }
+        });
+      });
+    });
+
+    const address = await listen(httpServer);
+    const client = createGatewayClient({
+      baseUrl: address.replace("http://", "ws://"),
+      secret: "shared-token",
+      exposeRawThinking: false
+    });
+
+    const close = client.subscribe("agent:main:test-session", 0, {
+      onEvent: (event) =>
+        received.push({
+          kind: event.kind,
+          content: String((event.payload as { content?: string }).content ?? ""),
+          privateContentOmitted: (event.payload as { privateContentOmitted?: unknown }).privateContentOmitted,
+          textLength: (event.payload as { textLength?: unknown }).textLength
+        }),
+      onDisconnect: () => {}
+    });
+
+    await eventually(() => {
+      expect(received).toEqual([
+        {
+          kind: "assistant.thinking",
+          content: "Claw emitted a private thinking update. Raw reasoning is hidden.",
+          privateContentOmitted: true,
+          textLength: "private reasoning that should never be rendered".length
+        },
+        {
+          kind: "assistant.message",
+          content: "Visible answer",
+          privateContentOmitted: undefined,
+          textLength: undefined
+        }
+      ]);
+      expect(JSON.stringify(received)).not.toContain("private reasoning");
+    });
+    close();
+    await client.stop();
+    await new Promise<void>((resolve) => wss.close(() => resolve()));
+  });
+
+  it("exposes raw model thinking by default", async () => {
+    const received: Array<{
+      kind: string;
+      content: string;
+      privateContentOmitted?: unknown;
+      rawThinkingVisible?: unknown;
+      textLength?: unknown;
+    }> = [];
+    const httpServer = createServer();
+    servers.add(httpServer);
+    const wss = new WebSocketServer({ noServer: true });
+
+    httpServer.on("upgrade", (request, socket, head) => {
+      wss.handleUpgrade(request, socket, head, (client) => {
+        client.send(
+          JSON.stringify({
+            type: "event",
+            event: "connect.challenge",
+            payload: { nonce: "nonce-1" }
+          })
+        );
+
+        client.on("message", (data) => {
+          const frame = JSON.parse(data.toString()) as {
+            id: string;
+            method: string;
+          };
+
+          if (frame.method === "connect") {
+            client.send(JSON.stringify({ type: "res", id: frame.id, ok: true, payload: { protocol: 4 } }));
+            return;
+          }
+
+          client.send(JSON.stringify({ type: "res", id: frame.id, ok: true, payload: { ok: true } }));
+
+          if (frame.method === "sessions.messages.subscribe") {
+            client.send(
+              JSON.stringify({
+                type: "event",
+                event: "session.message",
+                payload: {
+                  sessionKey: "agent:main:test-session",
+                  messageSeq: 7,
+                  message: {
+                    role: "assistant",
+                    content: [
+                      { type: "thinking", thinking: "visible model reasoning from OpenClaw" },
+                      { type: "text", text: "Visible answer" }
+                    ],
+                    timestamp: Date.now()
+                  }
+                }
+              })
+            );
+          }
+        });
+      });
+    });
+
+    const address = await listen(httpServer);
+    const client = createGatewayClient({
+      baseUrl: address.replace("http://", "ws://"),
+      secret: "shared-token"
+    });
+
+    const close = client.subscribe("agent:main:test-session", 0, {
+      onEvent: (event) =>
+        received.push({
+          kind: event.kind,
+          content: String((event.payload as { content?: string }).content ?? ""),
+          privateContentOmitted: (event.payload as { privateContentOmitted?: unknown }).privateContentOmitted,
+          rawThinkingVisible: (event.payload as { rawThinkingVisible?: unknown }).rawThinkingVisible,
+          textLength: (event.payload as { textLength?: unknown }).textLength
+        }),
+      onDisconnect: () => {}
+    });
+
+    await eventually(() => {
+      expect(received).toEqual([
+        {
+          kind: "assistant.thinking",
+          content: "visible model reasoning from OpenClaw",
+          privateContentOmitted: false,
+          rawThinkingVisible: true,
+          textLength: "visible model reasoning from OpenClaw".length
+        },
+        {
+          kind: "assistant.message",
+          content: "Visible answer",
+          privateContentOmitted: undefined,
+          rawThinkingVisible: undefined,
+          textLength: undefined
+        }
+      ]);
+    });
+    close();
+    await client.stop();
+    await new Promise<void>((resolve) => wss.close(() => resolve()));
+  });
+
+  it("splits a single large gateway delta into smaller local streaming chunks", async () => {
+    const received: string[] = [];
+    const longText = Array.from({ length: 20 }, (_, index) => `第 ${index + 1} 句用于验证流式输出。`).join("");
+    const httpServer = createServer();
+    servers.add(httpServer);
+    const wss = new WebSocketServer({ noServer: true });
+
+    httpServer.on("upgrade", (request, socket, head) => {
+      wss.handleUpgrade(request, socket, head, (client) => {
+        client.send(
+          JSON.stringify({
+            type: "event",
+            event: "connect.challenge",
+            payload: { nonce: "nonce-1" }
+          })
+        );
+
+        client.on("message", (data) => {
+          const frame = JSON.parse(data.toString()) as {
+            id: string;
+            method: string;
+          };
+
+          if (frame.method === "connect") {
+            client.send(JSON.stringify({ type: "res", id: frame.id, ok: true, payload: { protocol: 4 } }));
+            return;
+          }
+
+          client.send(JSON.stringify({ type: "res", id: frame.id, ok: true, payload: { ok: true } }));
+
+          if (frame.method === "sessions.messages.subscribe") {
+            client.send(
+              JSON.stringify({
+                type: "event",
+                event: "chat",
+                payload: {
+                  sessionKey: "agent:main:test-session",
+                  runId: "run-1",
+                  state: "delta",
+                  seq: 1,
+                  deltaText: longText,
+                  message: {
+                    role: "assistant",
+                    content: [{ type: "text", text: longText }],
+                    timestamp: Date.now()
+                  }
+                }
+              })
+            );
+          }
+        });
+      });
+    });
+
+    const address = await listen(httpServer);
+    const client = createGatewayClient({
+      baseUrl: address.replace("http://", "ws://"),
+      secret: "shared-token"
+    });
+
+    const close = client.subscribe("agent:main:test-session", 0, {
+      onEvent: (event) => received.push(String((event.payload as { content?: string }).content ?? "")),
+      onDisconnect: () => {}
+    });
+
+    await eventually(() => {
+      expect(received.length).toBeGreaterThan(1);
+      expect(received.join("")).toBe(longText);
+    });
+    close();
     await client.stop();
     await new Promise<void>((resolve) => wss.close(() => resolve()));
   });
@@ -105,4 +796,19 @@ function listen(server: ReturnType<typeof createServer>): Promise<string> {
       resolve(`http://${address.address}:${address.port}`);
     });
   });
+}
+
+async function eventually(assertion: () => void) {
+  const deadline = Date.now() + 1_000;
+  let lastError: unknown;
+  while (Date.now() < deadline) {
+    try {
+      assertion();
+      return;
+    } catch (error) {
+      lastError = error;
+      await new Promise((resolve) => setTimeout(resolve, 20));
+    }
+  }
+  throw lastError;
 }
