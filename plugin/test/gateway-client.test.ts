@@ -156,6 +156,165 @@ describe("gateway client", () => {
     await new Promise<void>((resolve) => wss.close(() => resolve()));
   });
 
+  it("prefers Gateway HTTP responses SSE when enabled and emits text plus reasoning deltas", async () => {
+    const received: Array<{ kind: string; content: string; transport?: unknown }> = [];
+    const wsMethods: string[] = [];
+    let capturedAuthorization = "";
+    let capturedSessionKey = "";
+    let capturedModelOverride = "";
+    let capturedBody = "";
+
+    const httpServer = createServer((request, response) => {
+      if (request.method !== "POST" || request.url !== "/v1/responses") {
+        response.writeHead(404);
+        response.end("not found");
+        return;
+      }
+
+      capturedAuthorization = String(request.headers.authorization ?? "");
+      capturedSessionKey = String(request.headers["x-openclaw-session-key"] ?? "");
+      capturedModelOverride = String(request.headers["x-openclaw-model"] ?? "");
+      request.on("data", (chunk) => {
+        capturedBody += chunk.toString();
+      });
+      request.on("end", () => {
+        response.writeHead(200, {
+          "Content-Type": "text/event-stream"
+        });
+        response.write('event: response.created\ndata: {"type":"response.created","response":{"id":"resp_1"}}\n\n');
+        response.write(
+          'event: response.reasoning_text.delta\ndata: {"type":"response.reasoning_text.delta","delta":"thinking"}\n\n'
+        );
+        response.write('event: response.output_text.delta\ndata: {"type":"response.output_text.delta","delta":"Hel"}\n\n');
+        response.write('event: response.output_text.delta\ndata: {"type":"response.output_text.delta","delta":"lo"}\n\n');
+        response.write('event: response.output_text.done\ndata: {"type":"response.output_text.done","text":"Hello"}\n\n');
+        response.write('event: response.completed\ndata: {"type":"response.completed","response":{"id":"resp_1"}}\n\n');
+        response.end("data: [DONE]\n\n");
+      });
+    });
+    servers.add(httpServer);
+    const wss = new WebSocketServer({ noServer: true });
+
+    httpServer.on("upgrade", (request, socket, head) => {
+      wss.handleUpgrade(request, socket, head, (client) => {
+        client.send(
+          JSON.stringify({
+            type: "event",
+            event: "connect.challenge",
+            payload: { nonce: "nonce-1" }
+          })
+        );
+
+        client.on("message", (data) => {
+          const frame = JSON.parse(data.toString()) as {
+            id: string;
+            method: string;
+          };
+          wsMethods.push(frame.method);
+          client.send(JSON.stringify({ type: "res", id: frame.id, ok: true, payload: { ok: true, protocol: 4 } }));
+        });
+      });
+    });
+
+    const address = await listen(httpServer);
+    const client = createGatewayClient({
+      baseUrl: address.replace("http://", "ws://"),
+      secret: "shared-token",
+      preferResponsesApi: true,
+      modelOverride: "openai/gpt-5.5"
+    });
+
+    const close = client.subscribe("agent:main:test-session", 0, {
+      onEvent: (event) =>
+        received.push({
+          kind: event.kind,
+          content: String((event.payload as { content?: string }).content ?? ""),
+          transport: (event.payload as { transport?: unknown }).transport
+        }),
+      onDisconnect: () => {}
+    });
+
+    await client.sendMessage("agent:main:test-session", "hello");
+
+    await eventually(() => {
+      expect(capturedAuthorization).toBe("Bearer shared-token");
+      expect(capturedSessionKey).toBe("agent:main:test-session");
+      expect(capturedModelOverride).toBe("openai/gpt-5.5");
+      expect(JSON.parse(capturedBody)).toMatchObject({
+        model: "openclaw",
+        stream: true,
+        input: "hello",
+        user: "agent:main:test-session"
+      });
+      expect(wsMethods).not.toContain("chat.send");
+      expect(received).toEqual([
+        { kind: "run.started", content: "", transport: "responses-http" },
+        { kind: "assistant.thinking", content: "thinking", transport: "responses-http" },
+        { kind: "assistant.delta", content: "Hel", transport: "responses-http" },
+        { kind: "assistant.delta", content: "lo", transport: "responses-http" },
+        { kind: "assistant.message", content: "Hello", transport: "responses-http" },
+        { kind: "run.completed", content: "", transport: "responses-http" }
+      ]);
+    });
+
+    close();
+    await client.stop();
+    await new Promise<void>((resolve) => wss.close(() => resolve()));
+  });
+
+  it("falls back to websocket chat.send when Gateway HTTP responses is unavailable", async () => {
+    let capturedMethod = "";
+    const httpServer = createServer((request, response) => {
+      if (request.url === "/v1/responses") {
+        response.writeHead(404);
+        response.end("not found");
+        return;
+      }
+      response.writeHead(404);
+      response.end("not found");
+    });
+    servers.add(httpServer);
+    const wss = new WebSocketServer({ noServer: true });
+
+    httpServer.on("upgrade", (request, socket, head) => {
+      wss.handleUpgrade(request, socket, head, (client) => {
+        client.send(
+          JSON.stringify({
+            type: "event",
+            event: "connect.challenge",
+            payload: { nonce: "nonce-1" }
+          })
+        );
+
+        client.on("message", (data) => {
+          const frame = JSON.parse(data.toString()) as {
+            id: string;
+            method: string;
+          };
+          if (frame.method === "connect") {
+            client.send(JSON.stringify({ type: "res", id: frame.id, ok: true, payload: { protocol: 4 } }));
+            return;
+          }
+          capturedMethod = frame.method;
+          client.send(JSON.stringify({ type: "res", id: frame.id, ok: true, payload: { ok: true } }));
+        });
+      });
+    });
+
+    const address = await listen(httpServer);
+    const client = createGatewayClient({
+      baseUrl: address.replace("http://", "ws://"),
+      secret: "shared-token",
+      preferResponsesApi: true
+    });
+
+    await client.sendMessage("agent:main:test-session", "hello");
+
+    expect(capturedMethod).toBe("chat.send");
+    await client.stop();
+    await new Promise<void>((resolve) => wss.close(() => resolve()));
+  });
+
   it("drops replayed stream events at or below the subscribed sequence", async () => {
     const received: string[] = [];
     const httpServer = createServer();

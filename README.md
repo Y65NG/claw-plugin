@@ -3,11 +3,11 @@
 `claw-control-center` 是一个运行在 QClaw / OpenClaw 宿主中的多会话控制插件。  
 它会在宿主内启动一个本地控制台 (local control console)，并通过本地 gateway (gateway) 与 QClaw / OpenClaw 会话系统交互。
 
-当前实现包含三层：
+当前实现包含四层：
 
 1. 插件宿主层：负责读取宿主配置、注册服务、启动本地控制台。
 2. 本地控制台层：提供网页、REST API、WebSocket API。
-3. Gateway 适配层：把本地控制台请求转换为 QClaw / OpenClaw gateway RPC。
+3. Gateway 适配层：优先使用 OpenResponses HTTP SSE (`/v1/responses`) 执行本地消息；如果宿主未启用该端点，则自动回退到 QClaw / OpenClaw gateway RPC。
 4. 53AIHub 桥接层：通过公司 WebSocket 完成 Bot 鉴权，并把远端消息转发到本地 Claw。
 
 ## 快速使用
@@ -54,6 +54,14 @@ node plugin/bin/install-qclaw.mjs install \
 ```
 
 `--gateway` / `--secret` 表示本地 QClaw/OpenClaw gateway；`--hub-*` 表示公司 53AIHub 服务器。两组配置不要混用。
+
+安装器会同时开启本地 Gateway 的 `gateway.http.endpoints.responses.enabled`，插件默认优先尝试 `POST /v1/responses` 的 SSE 流式输出 (streaming)，并在该端点不可用时回退到 WebSocket RPC。若要为 HTTP responses 路径指定模型，可使用：
+
+```bash
+node plugin/bin/install-qclaw.mjs install \
+  --target openclaw \
+  --gateway-model openai/gpt-5.5
+```
 
 安装后重启对应宿主，然后访问：
 

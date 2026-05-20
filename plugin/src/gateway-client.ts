@@ -16,6 +16,8 @@ export type GatewayConfig = {
   streamReconnectMs: number;
   runtimeRoot?: string;
   exposeRawThinking?: boolean;
+  preferResponsesApi?: boolean;
+  modelOverride?: string;
 };
 
 export type GatewaySession = SessionSummary;
@@ -96,10 +98,28 @@ export function createGatewayClient(config: Partial<GatewayConfig>): GatewayClie
   const resolved = resolveGatewayConfig(config);
   const transport = createTransport(resolved);
   const subscriptions = new Map<string, SessionSubscription>();
+  const responsesRuns = new Map<string, AbortController>();
 
   const ensureSubscribed = async (sessionId: string) => {
     await transport.request("sessions.subscribe", {});
     await transport.request("sessions.messages.subscribe", { key: sessionId });
+  };
+
+  const emitEvents = (sessionId: string, events: GatewayEvent[]) => {
+    const subscription = subscriptions.get(sessionId);
+    if (!subscription) {
+      return;
+    }
+
+    for (const event of events) {
+      if (event.seq <= subscription.lastSeq) {
+        continue;
+      }
+      subscription.lastSeq = Math.max(subscription.lastSeq, event.seq);
+      for (const handler of subscription.handlers) {
+        handler.onEvent(event);
+      }
+    }
   };
 
   transport.onEvent((frame) => {
@@ -117,16 +137,8 @@ export function createGatewayClient(config: Partial<GatewayConfig>): GatewayClie
     }
 
     const events = mapGatewayFrameToEvents(frame, subscription.lastSeq, subscription, resolved.exposeRawThinking);
-    for (const event of events) {
-      if (frame.event !== "chat" && event.seq <= subscription.lastSeq) {
-        continue;
-      }
-      subscription.lastSeq = Math.max(subscription.lastSeq, event.seq);
-      updateActiveRunTracking(frame, subscription);
-      for (const handler of subscription.handlers) {
-        handler.onEvent(event);
-      }
-    }
+    updateActiveRunTracking(frame, subscription);
+    emitEvents(sessionId, events);
   });
 
   transport.onDisconnect((error) => {
@@ -171,6 +183,24 @@ export function createGatewayClient(config: Partial<GatewayConfig>): GatewayClie
       return extractMessages(sessionId, payload);
     },
     async sendMessage(sessionId, content) {
+      if (resolved.preferResponsesApi) {
+        try {
+          await startResponsesApiRun({
+            config: resolved,
+            sessionId,
+            content,
+            activeRuns: responsesRuns,
+            nextSeq: () => (subscriptions.get(sessionId)?.lastSeq ?? 0) + 1,
+            emit: (event) => emitEvents(sessionId, [event])
+          });
+          return;
+        } catch (error) {
+          if (!isResponsesApiUnavailableError(error)) {
+            throw error;
+          }
+        }
+      }
+
       await transport.request("chat.send", {
         sessionKey: sessionId,
         message: content,
@@ -180,6 +210,23 @@ export function createGatewayClient(config: Partial<GatewayConfig>): GatewayClie
     },
     async controlSession(sessionId, action, title) {
       if (action === "stop") {
+        const activeRun = responsesRuns.get(sessionId);
+        if (activeRun) {
+          activeRun.abort();
+          responsesRuns.delete(sessionId);
+          emitEvents(sessionId, [
+            {
+              id: `${sessionId}:responses:interrupted:${Date.now()}`,
+              sessionId,
+              seq: (subscriptions.get(sessionId)?.lastSeq ?? 0) + 1,
+              kind: "run.interrupted",
+              payload: { transport: "responses-http", reason: "aborted by user" },
+              createdAt: new Date().toISOString()
+            }
+          ]);
+          return;
+        }
+
         await transport.request("chat.abort", {
           sessionKey: sessionId
         });
@@ -244,6 +291,10 @@ export function createGatewayClient(config: Partial<GatewayConfig>): GatewayClie
     },
     async stop() {
       subscriptions.clear();
+      for (const run of responsesRuns.values()) {
+        run.abort();
+      }
+      responsesRuns.clear();
       await transport.stop();
     }
   };
@@ -258,7 +309,9 @@ export function resolveGatewayConfig(config: Partial<GatewayConfig>): GatewayCon
     streamReconnectMs: Number(config.streamReconnectMs ?? 2_000),
     hostKind: typeof config.hostKind === "string" ? config.hostKind : undefined,
     runtimeRoot: typeof config.runtimeRoot === "string" ? config.runtimeRoot : undefined,
-    exposeRawThinking: config.exposeRawThinking !== false
+    exposeRawThinking: config.exposeRawThinking !== false,
+    preferResponsesApi: config.preferResponsesApi === true,
+    modelOverride: typeof config.modelOverride === "string" ? config.modelOverride.trim() : ""
   };
 }
 
@@ -406,6 +459,437 @@ function resolveGatewayClientCtor(module: Record<string, unknown>): (new (opts: 
   }
 
   return null;
+}
+
+class ResponsesApiUnavailableError extends Error {
+  constructor(message: string) {
+    super(message);
+    this.name = "ResponsesApiUnavailableError";
+  }
+}
+
+type StartResponsesApiRunInput = {
+  config: GatewayConfig;
+  sessionId: string;
+  content: string;
+  activeRuns: Map<string, AbortController>;
+  nextSeq: () => number;
+  emit: (event: GatewayEvent) => void;
+};
+
+async function startResponsesApiRun(input: StartResponsesApiRunInput): Promise<void> {
+  const controller = new AbortController();
+  const runId = `responses:${randomUUID()}`;
+  const response = await fetch(responsesApiUrl(input.config.baseUrl), {
+    method: "POST",
+    signal: controller.signal,
+    headers: responsesApiHeaders(input.config, input.sessionId),
+    body: JSON.stringify({
+      model: "openclaw",
+      stream: true,
+      input: input.content,
+      user: input.sessionId,
+      metadata: {
+        source: "claw-control-center",
+        sessionId: input.sessionId
+      }
+    })
+  }).catch((error) => {
+    throw new ResponsesApiUnavailableError(error instanceof Error ? error.message : String(error));
+  });
+
+  if (response.status === 404 || response.status === 405 || response.status === 501) {
+    await response.body?.cancel().catch(() => {});
+    throw new ResponsesApiUnavailableError(`responses api unavailable: HTTP ${response.status}`);
+  }
+  if (!response.ok) {
+    const errorText = await response.text().catch(() => "");
+    throw new Error(`responses api failed: HTTP ${response.status}${errorText ? ` ${errorText}` : ""}`);
+  }
+
+  input.activeRuns.get(input.sessionId)?.abort();
+  input.activeRuns.set(input.sessionId, controller);
+  void consumeResponsesApiStream({
+    response,
+    controller,
+    runId,
+    sessionId: input.sessionId,
+    exposeRawThinking: input.config.exposeRawThinking !== false,
+    nextSeq: input.nextSeq,
+    emit: input.emit
+  }).finally(() => {
+    if (input.activeRuns.get(input.sessionId) === controller) {
+      input.activeRuns.delete(input.sessionId);
+    }
+  });
+}
+
+function responsesApiUrl(baseUrl: string): string {
+  const parsed = new URL(baseUrl);
+  if (parsed.protocol === "ws:") {
+    parsed.protocol = "http:";
+  } else if (parsed.protocol === "wss:") {
+    parsed.protocol = "https:";
+  }
+  parsed.pathname = "/v1/responses";
+  parsed.search = "";
+  parsed.hash = "";
+  return parsed.toString();
+}
+
+function responsesApiHeaders(config: GatewayConfig, sessionId: string): Record<string, string> {
+  const headers: Record<string, string> = {
+    "Accept": "text/event-stream",
+    "Content-Type": "application/json",
+    "x-openclaw-agent-id": "main",
+    "x-openclaw-session-key": sessionId,
+    "x-openclaw-message-channel": "claw-control-center"
+  };
+  if (config.secret) {
+    headers.Authorization = `Bearer ${config.secret}`;
+  }
+  if (config.modelOverride) {
+    headers["x-openclaw-model"] = config.modelOverride;
+  }
+  return headers;
+}
+
+function isResponsesApiUnavailableError(error: unknown): boolean {
+  return error instanceof ResponsesApiUnavailableError;
+}
+
+type ConsumeResponsesApiStreamInput = {
+  response: Response;
+  controller: AbortController;
+  runId: string;
+  sessionId: string;
+  exposeRawThinking: boolean;
+  nextSeq: () => number;
+  emit: (event: GatewayEvent) => void;
+};
+
+async function consumeResponsesApiStream(input: ConsumeResponsesApiStreamInput): Promise<void> {
+  let renderedText = "";
+  let completed = false;
+  let started = false;
+  let finalMessageEmitted = false;
+
+  const emit = (kind: string, payload: Record<string, unknown>) => {
+    input.emit({
+      id: `${input.sessionId}:responses:${kind}:${input.nextSeq()}`,
+      sessionId: input.sessionId,
+      seq: input.nextSeq(),
+      kind,
+      payload: {
+        ...payload,
+        transport: "responses-http",
+        runId: input.runId
+      },
+      createdAt: new Date().toISOString()
+    });
+  };
+
+  try {
+    for await (const sse of iterSseEvents(input.response)) {
+      if (sse.done) {
+        break;
+      }
+      const data = parseSseData(sse.data);
+      const type = sse.event || readStringFromUnknown(data, ["type"]) || "";
+      if (!type) {
+        continue;
+      }
+
+      if (type === "response.created" || type === "response.in_progress") {
+        if (!started) {
+          emit("run.started", { eventType: type, responseId: readStringFromUnknown(data, ["response", "id"]) });
+          started = true;
+        }
+        continue;
+      }
+
+      if (isReasoningSseEvent(type)) {
+        const thinking = extractResponsesTextDelta(data);
+        if (thinking.trim()) {
+          emit(
+            "assistant.thinking",
+            buildThinkingPayload(thinking, input.exposeRawThinking, {
+              eventType: type,
+              state: type.endsWith(".done") ? "final" : "delta",
+              mode: type.endsWith(".done") ? "replace" : "append",
+              replace: type.endsWith(".done")
+            })
+          );
+        }
+        continue;
+      }
+
+      if (type === "response.output_text.delta") {
+        const text = extractResponsesTextDelta(data);
+        if (text.trim()) {
+          for (const chunk of splitDeltaText(text)) {
+            renderedText += chunk;
+            emit("assistant.delta", {
+              content: chunk,
+              state: "delta",
+              mode: "append",
+              replace: false,
+              eventType: type
+            });
+          }
+        }
+        continue;
+      }
+
+      if (type === "response.output_text.done") {
+        const text = extractResponsesTextDelta(data) || renderedText;
+        if (text.trim()) {
+          finalMessageEmitted = true;
+          emit("assistant.message", {
+            content: normalizeFinalAssistantContent(text, renderedText),
+            state: "final",
+            mode: "replace",
+            replace: true,
+            eventType: type
+          });
+        }
+        continue;
+      }
+
+      const toolEvent = mapResponsesToolEvent(input.sessionId, input.nextSeq(), type, data);
+      if (toolEvent) {
+        input.emit(toolEvent);
+        continue;
+      }
+
+      if (type === "response.completed") {
+        completed = true;
+        if (!finalMessageEmitted) {
+          const text = extractResponseOutputText(data) || renderedText;
+          if (text.trim()) {
+            emit("assistant.message", {
+              content: normalizeFinalAssistantContent(text, renderedText),
+              state: "final",
+              mode: "replace",
+              replace: true,
+              eventType: type
+            });
+          }
+        }
+        emit("run.completed", {
+          eventType: type,
+          responseId: readStringFromUnknown(data, ["response", "id"]) ?? readStringFromUnknown(data, ["id"]),
+          usage: readUnknownPath(data, ["response", "usage"]) ?? readUnknownPath(data, ["usage"])
+        });
+        continue;
+      }
+
+      if (type === "response.failed") {
+        completed = true;
+        emit("run.failed", {
+          eventType: type,
+          error:
+            readStringFromUnknown(data, ["error", "message"]) ??
+            readStringFromUnknown(data, ["response", "error", "message"]) ??
+            "responses api stream failed"
+        });
+      }
+    }
+
+    if (!completed && !input.controller.signal.aborted) {
+      emit("run.completed", { eventType: "response.stream.done" });
+    }
+  } catch (error) {
+    if (input.controller.signal.aborted) {
+      return;
+    }
+    emit("run.failed", {
+      eventType: "response.stream.error",
+      error: error instanceof Error ? error.message : String(error)
+    });
+  }
+}
+
+type SseEvent = {
+  event: string;
+  data: string;
+  done: boolean;
+};
+
+async function* iterSseEvents(response: Response): AsyncGenerator<SseEvent> {
+  const body = response.body;
+  if (!body) {
+    return;
+  }
+
+  const reader = body.getReader();
+  const decoder = new TextDecoder();
+  let buffer = "";
+  while (true) {
+    const { value, done } = await reader.read();
+    if (done) {
+      break;
+    }
+    buffer += decoder.decode(value, { stream: true });
+
+    let separatorIndex = findSseSeparator(buffer);
+    while (separatorIndex >= 0) {
+      const rawEvent = buffer.slice(0, separatorIndex);
+      buffer = buffer.slice(buffer[separatorIndex] === "\r" ? separatorIndex + 4 : separatorIndex + 2);
+      const event = parseSseEvent(rawEvent);
+      if (event) {
+        yield event;
+      }
+      separatorIndex = findSseSeparator(buffer);
+    }
+  }
+
+  buffer += decoder.decode();
+  const trailing = parseSseEvent(buffer);
+  if (trailing) {
+    yield trailing;
+  }
+}
+
+function findSseSeparator(buffer: string): number {
+  const lf = buffer.indexOf("\n\n");
+  const crlf = buffer.indexOf("\r\n\r\n");
+  if (lf < 0) {
+    return crlf;
+  }
+  if (crlf < 0) {
+    return lf;
+  }
+  return Math.min(lf, crlf);
+}
+
+function parseSseEvent(raw: string): SseEvent | null {
+  const lines = raw.split(/\r?\n/);
+  let event = "";
+  const data: string[] = [];
+  for (const line of lines) {
+    if (!line || line.startsWith(":")) {
+      continue;
+    }
+    if (line.startsWith("event:")) {
+      event = line.slice("event:".length).trim();
+    } else if (line.startsWith("data:")) {
+      data.push(line.slice("data:".length).trimStart());
+    }
+  }
+  const joinedData = data.join("\n");
+  if (!event && !joinedData) {
+    return null;
+  }
+  return {
+    event,
+    data: joinedData,
+    done: joinedData === "[DONE]"
+  };
+}
+
+function parseSseData(data: string): unknown {
+  if (!data || data === "[DONE]") {
+    return {};
+  }
+  try {
+    return JSON.parse(data);
+  } catch {
+    return { text: data };
+  }
+}
+
+function isReasoningSseEvent(type: string): boolean {
+  const normalized = type.toLowerCase();
+  return normalized.includes("reasoning") || normalized.includes("thinking");
+}
+
+function extractResponsesTextDelta(data: unknown): string {
+  return (
+    readStringFromUnknown(data, ["delta"]) ??
+    readStringFromUnknown(data, ["text"]) ??
+    readStringFromUnknown(data, ["content"]) ??
+    readStringFromUnknown(data, ["item", "content"]) ??
+    readStringFromUnknown(data, ["part", "text"]) ??
+    ""
+  );
+}
+
+function extractResponseOutputText(data: unknown): string {
+  const direct =
+    readStringFromUnknown(data, ["output_text"]) ??
+    readStringFromUnknown(data, ["response", "output_text"]) ??
+    readStringFromUnknown(data, ["text"]) ??
+    readStringFromUnknown(data, ["response", "text"]);
+  if (direct) {
+    return direct;
+  }
+
+  const output = readUnknownPath(data, ["response", "output"]) ?? readUnknownPath(data, ["output"]);
+  if (!Array.isArray(output)) {
+    return "";
+  }
+
+  return output
+    .flatMap((item) => {
+      const content = readUnknownPath(item, ["content"]);
+      if (!Array.isArray(content)) {
+        return [];
+      }
+      return content.flatMap((part) => {
+        const text = readStringFromUnknown(part, ["text"]) ?? readStringFromUnknown(part, ["content"]);
+        return text ? [text] : [];
+      });
+    })
+    .join("");
+}
+
+function mapResponsesToolEvent(
+  sessionId: string,
+  seq: number,
+  eventType: string,
+  data: unknown
+): GatewayEvent | null {
+  const item = toRecord(readUnknownPath(data, ["item"]) ?? readUnknownPath(data, ["output_item"]));
+  const type = typeof item.type === "string" ? item.type : "";
+  if (!type.includes("function_call")) {
+    return null;
+  }
+
+  const name = typeof item.name === "string" ? item.name : "function";
+  const kind = eventType.endsWith(".done") ? "tool.result" : "tool.call";
+  return {
+    id: `${sessionId}:responses:${kind}:${seq}`,
+    sessionId,
+    seq,
+    kind,
+    payload: {
+      data: {
+        name,
+        args: item.arguments,
+        result: item.output
+      },
+      eventType,
+      transport: "responses-http"
+    },
+    createdAt: new Date().toISOString()
+  };
+}
+
+function readStringFromUnknown(value: unknown, path: string[]): string | undefined {
+  const current = readUnknownPath(value, path);
+  return typeof current === "string" && current.trim() ? current : undefined;
+}
+
+function readUnknownPath(value: unknown, path: string[]): unknown {
+  let current = value;
+  for (const segment of path) {
+    if (!current || typeof current !== "object" || !(segment in current)) {
+      return undefined;
+    }
+    current = (current as Record<string, unknown>)[segment];
+  }
+  return current;
 }
 
 class RpcSocketClient {

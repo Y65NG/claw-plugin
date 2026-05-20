@@ -10,6 +10,7 @@ type InstallInput = {
   gateway?: string;
   botId?: string;
   secret?: string;
+  gatewayModel?: string;
   hubWsUrl?: string;
   hubBotId?: string;
   hubSecret?: string;
@@ -25,6 +26,7 @@ type ParsedArgs = {
   gateway?: string;
   "bot-id"?: string;
   secret?: string;
+  "gateway-model"?: string;
   "hub-ws-url"?: string;
   "hub-bot-id"?: string;
   "hub-secret"?: string;
@@ -43,6 +45,9 @@ type OpenClawConfig = {
       mode?: unknown;
       token?: unknown;
       password?: unknown;
+    };
+    http?: {
+      endpoints?: Record<string, unknown>;
     };
   };
   channels?: {
@@ -150,6 +155,7 @@ async function installIntoHost(
   }
 
   const botId = input.botId?.trim();
+  const gatewayModel = input.gatewayModel?.trim();
   const hubWsUrl = input.hubWsUrl?.trim() || inferredHub53AI.wsUrl;
   const hubBotId = input.hubBotId?.trim() || inferredHub53AI.botId;
   const hubSecret = input.hubSecret?.trim() || inferredHub53AI.secret;
@@ -175,9 +181,19 @@ async function installIntoHost(
   const previousGateway = ensureObject(previousConfig, "gateway");
   previousGateway.baseUrl = gatewayBaseUrl;
   previousGateway.secret = secret;
+  previousGateway.preferResponsesApi = true;
   if (botId) {
     previousGateway.botId = botId;
   }
+  if (gatewayModel) {
+    previousGateway.modelOverride = gatewayModel;
+  }
+
+  const gatewayConfig = ensureObject(config, "gateway");
+  const gatewayHttp = ensureObject(gatewayConfig, "http");
+  const gatewayHttpEndpoints = ensureObject(gatewayHttp, "endpoints");
+  const responsesEndpoint = ensureObject(gatewayHttpEndpoints, "responses");
+  responsesEndpoint.enabled = true;
 
   if (hubConfigured || input.hubEnabled !== undefined) {
     const previousHub = ensureObject(previousConfig, "hub53ai");
@@ -246,6 +262,7 @@ export async function runInstallCommand(input: {
     gateway: args.gateway,
     botId: args["bot-id"],
     secret: args.secret,
+    gatewayModel: args["gateway-model"],
     hubWsUrl: args["hub-ws-url"],
     hubBotId: args["hub-bot-id"],
     hubSecret: args["hub-secret"],

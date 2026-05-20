@@ -30,6 +30,15 @@
           "streamReconnectMs": {
             "type": "number",
             "default": 2000
+          },
+          "preferResponsesApi": {
+            "type": "boolean",
+            "default": true,
+            "description": "Prefer Gateway HTTP POST /v1/responses SSE for local runs when the host gateway exposes it; falls back to WebSocket RPC if unavailable."
+          },
+          "modelOverride": {
+            "type": "string",
+            "description": "Optional model id sent as x-openclaw-model when using the HTTP /v1/responses API."
           }
         }
       },

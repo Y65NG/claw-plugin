@@ -61,6 +61,7 @@ describe("host helpers", () => {
     const config = resolvePluginConfigWithHostDefaults(configPath, {});
     expect(config.gateway.baseUrl).toBe("ws://127.0.0.1:28789");
     expect(config.gateway.secret).toBe("local-token");
+    expect(config.gateway.preferResponsesApi).toBe(true);
   });
 
   it("reads legacy 53AIHub channel defaults from openclaw.json", () => {

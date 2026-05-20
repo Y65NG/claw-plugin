@@ -48,6 +48,7 @@ describe("QClaw installer", () => {
       gateway: "ws://gateway.example.com:28789",
       botId: "bot-123",
       secret: "sk-secret",
+      gatewayModel: "openai/gpt-5.5",
       consolePort: 4321
     });
 
@@ -69,7 +70,9 @@ describe("QClaw installer", () => {
         gateway: {
           baseUrl: "ws://gateway.example.com:28789",
           botId: "bot-123",
-          secret: "sk-secret"
+          secret: "sk-secret",
+          preferResponsesApi: true,
+          modelOverride: "openai/gpt-5.5"
         },
         console: {
           port: 4321
@@ -138,7 +141,8 @@ describe("QClaw installer", () => {
       config: {
         gateway: {
           baseUrl: "ws://127.0.0.1:28789",
-          secret: "local-token"
+          secret: "local-token",
+          preferResponsesApi: true
         },
         console: {
           host: "127.0.0.1"
@@ -234,7 +238,8 @@ describe("QClaw installer", () => {
     expect(result.hub53aiConfigured).toBe(true);
     expect(updated.plugins.entries["claw-control-center"].config?.gateway).toEqual({
       baseUrl: "ws://127.0.0.1:28789",
-      secret: "local-token"
+      secret: "local-token",
+      preferResponsesApi: true
     });
     expect(updated.plugins.entries["claw-control-center"].config?.hub53ai).toEqual({
       enabled: true,
@@ -310,6 +315,7 @@ describe("QClaw installer", () => {
       sendThinkingMessage: false
     });
     expect(updated.channels["53aihub"].botId).toBe("legacy-bot");
+    expect((updated as any).gateway.http.endpoints.responses.enabled).toBe(true);
   });
 
   it("installs into OpenClaw paths when the openclaw target is selected", async () => {
@@ -381,7 +387,8 @@ describe("QClaw installer", () => {
       config: {
         gateway: {
           baseUrl: "ws://127.0.0.1:18789",
-          secret: "openclaw-password"
+          secret: "openclaw-password",
+          preferResponsesApi: true
         }
       }
     });
