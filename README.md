@@ -8,14 +8,15 @@
 1. 插件宿主层：负责读取宿主配置、注册服务、启动本地控制台。
 2. 本地控制台层：提供网页、REST API、WebSocket API。
 3. Gateway 适配层：把本地控制台请求转换为 QClaw / OpenClaw gateway RPC。
+4. 53AIHub 桥接层：通过公司 WebSocket 完成 Bot 鉴权，并把远端消息转发到本地 Claw。
 
 ## 快速使用
 
 发布到 npm 后，用户可以用：
 
 ```bash
-npx @claw-plugin/claw-control-center install --target qclaw
-npx @claw-plugin/claw-control-center install --target openclaw
+npx claw-control-center install --target qclaw
+npx claw-control-center install --target openclaw
 ```
 
 当前仓库本地开发时，使用下面的脚本入口。
@@ -42,6 +43,18 @@ node plugin/bin/install-qclaw.mjs install \
   --bot-id <bot-id>
 ```
 
+如果要替代旧的 53AIHub 插件，同时配置公司服务器鉴权：
+
+```bash
+node plugin/bin/install-qclaw.mjs install \
+  --target qclaw \
+  --hub-ws-url "wss://kmapirc.53ai.com/api/v1/openclaw/ws/connect" \
+  --hub-bot-id "<bot-id>" \
+  --hub-secret "<secret>"
+```
+
+`--gateway` / `--secret` 表示本地 QClaw/OpenClaw gateway；`--hub-*` 表示公司 53AIHub 服务器。两组配置不要混用。
+
 安装后重启对应宿主，然后访问：
 
 ```text
@@ -61,6 +74,7 @@ http://127.0.0.1:4318/
 - 宿主配置解析：[plugin/src/host.ts](./plugin/src/host.ts)
 - 本地控制台服务：[plugin/src/console-server.ts](./plugin/src/console-server.ts)
 - Gateway 适配器：[plugin/src/gateway-client.ts](./plugin/src/gateway-client.ts)
+- 53AIHub 桥接器：[plugin/src/53aihub-client.ts](./plugin/src/53aihub-client.ts)
 - 安装器：[plugin/src/install-qclaw.ts](./plugin/src/install-qclaw.ts)
 - 前端应用：[web/src/App.tsx](./web/src/App.tsx)
 - 前端 API 封装：[web/src/api.ts](./web/src/api.ts)
