@@ -198,16 +198,17 @@ OpenClaw upstream:
 
 - 拉取本地缓存与远端 Gateway 同步后的会话摘要。
 - 前端按 `updatedAt` 默认倒序显示，不再将 running session 强行置顶。
+- 支持 `limit` / `offset` 分页；未传参数时使用 `persistence.maxSessions` 作为默认第一页大小。
 
 Frontend:
 
-- `fetchSessions()` in [web/src/api.ts](./web/src/api.ts)
+- `fetchSessionsPage()` / `fetchSessions()` in [web/src/api.ts](./web/src/api.ts)
 - Session list rendering in [web/src/App.tsx](./web/src/App.tsx)
 
 Backend:
 
 - `GET /api/sessions` in [plugin/src/console-server.ts](./plugin/src/console-server.ts)
-- Calls `syncRemoteSessions()`
+- Calls `listSessionPage()` and caches returned page rows locally.
 
 OpenClaw upstream:
 
@@ -220,6 +221,7 @@ Gateway adapter call:
 ```ts
 transport.request("sessions.list", {
   limit,
+  offset,
   includeGlobal: true,
   includeUnknown: true,
   includeDerivedTitles: true,
@@ -242,7 +244,14 @@ Response example:
       "updatedAt": "2026-05-20T10:04:00.000Z",
       "lastEventSeq": 57
     }
-  ]
+  ],
+  "pagination": {
+    "limit": 100,
+    "offset": 0,
+    "total": 345,
+    "hasMore": true,
+    "nextOffset": 100
+  }
 }
 ```
 
@@ -343,8 +352,8 @@ OpenClaw upstream:
 
 | OpenClaw API | Purpose | Official doc |
 | --- | --- | --- |
-| `sessions.list` | Used by `getSession()` to find a matching session row. | [Session control](https://docs.openclaw.ai/gateway/protocol#session-control) |
-| `chat.history` | Load display-normalized message history. | [Session control](https://docs.openclaw.ai/gateway/protocol#session-control) |
+| `sessions.list` | Used by `getSession()` to find a matching session row; read by pages with `limit` / `offset`. | [Session control](https://docs.openclaw.ai/gateway/protocol#session-control) |
+| `chat.history` | Load display-normalized message history; read by pages with `limit` / `offset`. | [Session control](https://docs.openclaw.ai/gateway/protocol#session-control) |
 
 Response:
 
@@ -1286,9 +1295,10 @@ npx wscat -c ws://127.0.0.1:4318/ws/status
 | Surface | Current bound | Impact |
 | --- | --- | --- |
 | `cron.list` | 分页读取，每页 50 条，并带分页推进保护。 | 已不再局限于 50 条；只有上游返回异常游标或极端超大页数时会停止，避免无限循环。 |
-| `sessions.list` during sync | `persistence.maxSessions`，默认 100。 | 本地 console 只同步最近/最多这些 session；更早的远端 session 不一定出现在左侧列表。 |
-| `getSession()` fallback | `listSessions(200)` 查找指定 session。 | 如果直接打开一个未缓存且不在前 200 条远端列表里的 session，详情拉取可能失败。 |
-| `chat.history` for hydration | 200 条 message/history item。 | 刷新或首次打开历史很长的远端会话时，早期消息/事件可能不会被补齐；实时运行期间本地捕获的 event 不受这个历史读取窗口影响。 |
-| `retry` lookup | 最近 50 条 messages 中查找最后一条 user message。 | 极端情况下如果最后一条 user message 超出窗口，retry 会失败。 |
+| `sessions.list` during sync | 分页读取，每页 50 条；默认首页大小仍取 `persistence.maxSessions`。 | 左侧列表可以继续 `Load more sessions` 拉取后续远端页；本地后台同步仍只预取默认首页，避免启动时扫全量历史。 |
+| `getSession()` fallback | 分页查找，每页 50 条，最多 100 页。 | 已不再局限于前 200 条；如果上游超过 5000 条 session 或返回异常游标，仍会停止以避免无限循环。 |
+| `chat.history` for hydration | 分页读取，每页 200 条，最多 100 页。 | 刷新或首次打开长历史时会补齐多页历史；超过 20000 条或上游游标异常时仍会停止。 |
+| `retry` lookup | 使用分页后的 `chat.history` 查找最后一条 user message。 | 已不再局限于最近 50 条；实际边界与 `chat.history` 高水位保护一致。 |
 | Frontend Event List | 当前会话仅渲染最近 120 条 raw events。 | 这是 UI 展示截断，不是 API 数据丢失；`GET /api/sessions/:id/events?afterSeq=...` 仍可读取本地已保存事件。 |
 | Frontend Cron card | 状态栏只展示前 5 条 cron tasks。 | 这是状态面板摘要；完整列表仍在 `/api/status.cronTasks` 中返回。 |
+| Frontend Session List | 默认只加载第一页，用户点击 `Load more sessions` 后继续读取下一页。 | 这是 UI 懒加载策略，不是 Gateway 数据上限。 |

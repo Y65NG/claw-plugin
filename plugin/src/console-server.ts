@@ -304,10 +304,10 @@ export function createConsoleServer(input: CreateConsoleServerInput) {
     }
 
     if (method === "GET" && url.pathname === "/api/sessions") {
-      await syncRemoteSessions();
-      writeJson(response, 200, {
-        sessions: store.listSessions()
-      });
+      const limit = readPositiveInteger(url.searchParams.get("limit"), input.persistence.maxSessions);
+      const offset = readPositiveInteger(url.searchParams.get("offset"), 0);
+      const page = await listSessionPage(limit, offset);
+      writeJson(response, 200, page);
       return;
     }
 
@@ -550,6 +550,34 @@ export function createConsoleServer(input: CreateConsoleServerInput) {
     }
   }
 
+  async function listSessionPage(limit: number, offset: number) {
+    try {
+      const before = sessionListSignature(store.listSessions());
+      const page = await input.gateway.listSessionPage({ limit, offset });
+      lastGatewayError = null;
+      for (const session of page.sessions) {
+        await store.upsertSession(session);
+      }
+      if (before !== sessionListSignature(store.listSessions())) {
+        broadcastStatus();
+      }
+      return page;
+    } catch (error) {
+      lastGatewayError = error instanceof Error ? error : new Error(String(error));
+      const sessions = store.listSessions().slice(offset, offset + limit);
+      return {
+        sessions,
+        pagination: {
+          limit,
+          offset,
+          total: store.listSessions().length,
+          hasMore: offset + sessions.length < store.listSessions().length,
+          ...(offset + sessions.length < store.listSessions().length ? { nextOffset: offset + sessions.length } : {})
+        }
+      };
+    }
+  }
+
   async function hydrateSession(sessionId: string) {
     const session = await input.gateway.getSession(sessionId);
     lastGatewayError = null;
@@ -738,6 +766,17 @@ function sessionListSignature(sessions: SessionSummary[]): string {
     .map((session) => `${session.id}:${session.updatedAt}:${session.status}:${session.lastEventSeq}`)
     .sort()
     .join("|");
+}
+
+function readPositiveInteger(value: string | null, fallback: number): number {
+  if (value === null || !value.trim()) {
+    return fallback;
+  }
+  const parsed = Number(value);
+  if (!Number.isFinite(parsed) || parsed < 0) {
+    return fallback;
+  }
+  return Math.floor(parsed);
 }
 
 function hasNearbyDuplicateMessage(

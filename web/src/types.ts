@@ -39,6 +39,19 @@ export type SessionDetail = {
   messages: SessionMessage[];
 };
 
+export type PaginationSnapshot = {
+  limit: number;
+  offset: number;
+  total?: number;
+  hasMore: boolean;
+  nextOffset?: number;
+};
+
+export type SessionListPayload = {
+  sessions: SessionSummary[];
+  pagination?: PaginationSnapshot;
+};
+
 export type PluginStatusSnapshot = {
   hostKind: string;
   stateDir?: string;

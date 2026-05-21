@@ -53,6 +53,17 @@ export type GatewayHealthSnapshot = {
   durationMs?: number;
   lastError?: string;
 };
+export type GatewayPagination = {
+  limit: number;
+  offset: number;
+  total?: number;
+  hasMore: boolean;
+  nextOffset?: number;
+};
+export type GatewaySessionPage = {
+  sessions: GatewaySession[];
+  pagination: GatewayPagination;
+};
 
 type GatewayFrame =
   | {
@@ -77,6 +88,7 @@ type GatewayClient = {
   getRuntimeInfo(): Promise<GatewayRuntimeInfo>;
   getHealth(): Promise<GatewayHealthSnapshot>;
   listSessions(limit?: number): Promise<GatewaySession[]>;
+  listSessionPage(options?: { limit?: number; offset?: number }): Promise<GatewaySessionPage>;
   createSession(title: string, initialPrompt?: string): Promise<GatewaySession>;
   getSession(sessionId: string): Promise<GatewaySession>;
   getSessionMessages(sessionId: string, limit?: number): Promise<SessionMessage[]>;
@@ -119,6 +131,10 @@ type SessionSubscription = {
 const DEFAULT_SCOPES = ["operator.read", "operator.write"];
 const MAX_DELTA_CHUNK_CHARS = 240;
 const MIN_DELTA_CHUNK_CHARS = 80;
+const SESSION_LIST_PAGE_LIMIT = 50;
+const SESSION_LIST_MAX_PAGES = 100;
+const CHAT_HISTORY_PAGE_LIMIT = 200;
+const CHAT_HISTORY_MAX_PAGES = 100;
 const CRON_LIST_PAGE_LIMIT = 50;
 const CRON_LIST_MAX_PAGES = 100;
 
@@ -131,6 +147,7 @@ type RpcTransport = {
 
 export function createGatewayClient(config: Partial<GatewayConfig>): GatewayClient {
   const resolved = resolveGatewayConfig(config);
+  const hostKind = resolved.hostKind ?? "openclaw";
   const transport = createTransport(resolved);
   const subscriptions = new Map<string, SessionSubscription>();
   const responsesRuns = new Map<string, AbortController>();
@@ -203,15 +220,14 @@ export function createGatewayClient(config: Partial<GatewayConfig>): GatewayClie
         };
       }
     },
-    async listSessions(limit = 50) {
-      const payload = await transport.request("sessions.list", {
-        limit,
-        includeGlobal: true,
-        includeUnknown: true,
-        includeDerivedTitles: true,
-        includeLastMessage: true
+    async listSessions(limit = SESSION_LIST_PAGE_LIMIT) {
+      return readSessionListPages(transport, hostKind, limit);
+    },
+    async listSessionPage(options = {}) {
+      return readSessionListPage(transport, hostKind, {
+        limit: options.limit ?? SESSION_LIST_PAGE_LIMIT,
+        offset: options.offset ?? 0
       });
-      return extractSessions(payload, resolved.hostKind);
     },
     async createSession(title) {
       const payload = await transport.request("sessions.create", {
@@ -219,21 +235,17 @@ export function createGatewayClient(config: Partial<GatewayConfig>): GatewayClie
         agentId: "main"
       });
       return {
-        ...normalizeSession(extractCreatedSession(payload), title, resolved.hostKind),
+        ...normalizeSession(extractCreatedSession(payload), title, hostKind),
         title
       };
     },
     async getSession(sessionId) {
-      const sessions = await this.listSessions(200);
-      const match = sessions.find((session) => session.id === sessionId);
-      return match ?? fallbackSession(sessionId, resolved.hostKind);
+      const match = await findSessionById(transport, hostKind, sessionId);
+      return match ?? fallbackSession(sessionId, hostKind);
     },
-    async getSessionMessages(sessionId, limit = 200) {
-      const payload = await transport.request("chat.history", {
-        sessionKey: sessionId,
-        limit
-      });
-      return extractMessages(sessionId, payload);
+    async getSessionMessages(sessionId, limit = CHAT_HISTORY_PAGE_LIMIT * CHAT_HISTORY_MAX_PAGES) {
+      const rawMessages = await readChatHistoryPages(transport, sessionId, limit);
+      return extractMessagesFromRaw(sessionId, rawMessages);
     },
     async sendMessage(sessionId, content) {
       if (resolved.preferResponsesApi) {
@@ -296,7 +308,7 @@ export function createGatewayClient(config: Partial<GatewayConfig>): GatewayClie
         return;
       }
       if (action === "retry") {
-        const messages = await this.getSessionMessages(sessionId, 50);
+        const messages = await this.getSessionMessages(sessionId);
         const lastUserMessage = [...messages].reverse().find((message) => message.role === "user");
         if (!lastUserMessage?.content.trim()) {
           throw new Error("cannot retry a session without a previous user message");
@@ -305,11 +317,8 @@ export function createGatewayClient(config: Partial<GatewayConfig>): GatewayClie
       }
     },
     async listEvents(sessionId, afterSeq = 0) {
-      const history = await transport.request("chat.history", {
-        sessionKey: sessionId,
-        limit: 200
-      });
-      return synthesizeEventsFromHistory(sessionId, history, afterSeq);
+      const rawMessages = await readChatHistoryPages(transport, sessionId);
+      return synthesizeEventsFromHistoryMessages(sessionId, rawMessages, afterSeq);
     },
     subscribe(sessionId, afterSeq, handlers) {
       const subscription = subscriptions.get(sessionId) ?? {
@@ -1218,10 +1227,117 @@ function normalizeGatewayUrl(raw: string): string {
 }
 
 function extractSessions(payload: unknown, hostKind = "openclaw"): GatewaySession[] {
-  const sessions = Array.isArray((payload as { sessions?: unknown[] } | null)?.sessions)
-    ? ((payload as { sessions: unknown[] }).sessions ?? [])
-    : [];
-  return sessions.map((session) => normalizeSession(session, "Untitled session", hostKind));
+  return readSessionArray(payload).map((session) => normalizeSession(session, "Untitled session", hostKind));
+}
+
+async function readSessionListPage(
+  transport: RpcTransport,
+  hostKind: string,
+  options: { limit: number; offset: number }
+): Promise<GatewaySessionPage> {
+  const limit = clampPositiveInteger(options.limit, SESSION_LIST_PAGE_LIMIT);
+  const offset = Math.max(0, Math.floor(options.offset));
+  const payload = await transport.request("sessions.list", {
+    limit,
+    offset,
+    includeGlobal: true,
+    includeUnknown: true,
+    includeDerivedTitles: true,
+    includeLastMessage: true
+  });
+  const sessions = extractSessions(payload, hostKind);
+  return {
+    sessions,
+    pagination: extractPagination(payload, {
+      limit,
+      offset,
+      itemCount: sessions.length
+    })
+  };
+}
+
+async function readSessionListPages(
+  transport: RpcTransport,
+  hostKind: string,
+  maxItems: number
+): Promise<GatewaySession[]> {
+  const target = clampPositiveInteger(maxItems, SESSION_LIST_PAGE_LIMIT);
+  const sessions: GatewaySession[] = [];
+  const seen = new Set<string>();
+  let offset = 0;
+
+  for (let page = 0; page < SESSION_LIST_MAX_PAGES && sessions.length < target; page += 1) {
+    const pageLimit = Math.min(SESSION_LIST_PAGE_LIMIT, target - sessions.length);
+    const result = await readSessionListPage(transport, hostKind, { limit: pageLimit, offset });
+    const before = sessions.length;
+    for (const session of result.sessions) {
+      if (!seen.has(session.id)) {
+        seen.add(session.id);
+        sessions.push(session);
+      }
+    }
+    if (!result.pagination.hasMore || sessions.length >= target) {
+      break;
+    }
+    const nextOffset = result.pagination.nextOffset;
+    if (nextOffset !== undefined && nextOffset > offset) {
+      offset = nextOffset;
+      continue;
+    }
+    if (result.sessions.length > 0) {
+      offset += result.sessions.length;
+      continue;
+    }
+    if (sessions.length === before) {
+      break;
+    }
+  }
+
+  return sessions;
+}
+
+async function findSessionById(
+  transport: RpcTransport,
+  hostKind: string,
+  sessionId: string
+): Promise<GatewaySession | undefined> {
+  let offset = 0;
+  for (let page = 0; page < SESSION_LIST_MAX_PAGES; page += 1) {
+    const result = await readSessionListPage(transport, hostKind, {
+      limit: SESSION_LIST_PAGE_LIMIT,
+      offset
+    });
+    const match = result.sessions.find((session) => session.id === sessionId);
+    if (match || !result.pagination.hasMore) {
+      return match;
+    }
+    const nextOffset = result.pagination.nextOffset;
+    if (nextOffset !== undefined && nextOffset > offset) {
+      offset = nextOffset;
+      continue;
+    }
+    if (result.sessions.length > 0) {
+      offset += result.sessions.length;
+      continue;
+    }
+    break;
+  }
+  return undefined;
+}
+
+function readSessionArray(payload: unknown): unknown[] {
+  const record = toRecord(payload);
+  const candidates = [record.sessions, record.items, record.data];
+  for (const candidate of candidates) {
+    if (Array.isArray(candidate)) {
+      return candidate;
+    }
+  }
+  const nested = toRecord(record.data);
+  if (Array.isArray(nested.sessions)) {
+    return nested.sessions;
+  }
+  return [];
 }
 
 async function readRuntimeInfo(transport: RpcTransport): Promise<GatewayRuntimeInfo> {
@@ -1637,18 +1753,132 @@ function booleanProperty(record: Record<string, unknown>, keys: string[]): boole
   return undefined;
 }
 
+function extractPagination(
+  payload: unknown,
+  fallback: {
+    limit: number;
+    offset: number;
+    itemCount: number;
+  }
+): GatewayPagination {
+  const record = toRecord(payload);
+  const limit = numberProperty(record, ["limit", "pageSize"]) ?? fallback.limit;
+  const offset = numberProperty(record, ["offset", "skip"]) ?? fallback.offset;
+  const total = numberProperty(record, ["total", "count"]);
+  const nextOffset = numberProperty(record, ["nextOffset", "next"]);
+  const explicitHasMore = booleanProperty(record, ["hasMore", "more"]);
+  const inferredHasMore =
+    total !== undefined
+      ? offset + fallback.itemCount < total
+      : fallback.itemCount >= limit && fallback.itemCount > 0;
+  const hasMore = explicitHasMore ?? inferredHasMore;
+  const fallbackNextOffset = offset + fallback.itemCount;
+
+  return {
+    limit,
+    offset,
+    ...(total !== undefined ? { total } : {}),
+    hasMore,
+    ...(hasMore ? { nextOffset: nextOffset && nextOffset > offset ? nextOffset : fallbackNextOffset } : {})
+  };
+}
+
+function clampPositiveInteger(value: number, fallback: number): number {
+  if (!Number.isFinite(value) || value <= 0) {
+    return fallback;
+  }
+  return Math.max(1, Math.floor(value));
+}
+
 function extractCreatedSession(payload: unknown): Record<string, unknown> {
   return typeof payload === "object" && payload ? (payload as Record<string, unknown>) : {};
 }
 
 function extractMessages(sessionId: string, payload: unknown): SessionMessage[] {
-  const rawMessages = Array.isArray((payload as { messages?: unknown[] } | null)?.messages)
-    ? ((payload as { messages: unknown[] }).messages ?? [])
-    : [];
+  return extractMessagesFromRaw(sessionId, readHistoryMessageArray(payload));
+}
 
+function extractMessagesFromRaw(sessionId: string, rawMessages: unknown[]): SessionMessage[] {
   return rawMessages
     .map((message) => normalizeMessage(sessionId, message))
     .filter((message): message is SessionMessage => message !== null);
+}
+
+async function readChatHistoryPages(
+  transport: RpcTransport,
+  sessionId: string,
+  maxItems = CHAT_HISTORY_PAGE_LIMIT * CHAT_HISTORY_MAX_PAGES
+): Promise<unknown[]> {
+  const target = clampPositiveInteger(maxItems, CHAT_HISTORY_PAGE_LIMIT * CHAT_HISTORY_MAX_PAGES);
+  const messages: unknown[] = [];
+  const seen = new Set<string>();
+  let offset = 0;
+
+  for (let page = 0; page < CHAT_HISTORY_MAX_PAGES && messages.length < target; page += 1) {
+    const pageLimit = Math.min(CHAT_HISTORY_PAGE_LIMIT, target - messages.length);
+    const payload = await transport.request("chat.history", {
+      sessionKey: sessionId,
+      limit: pageLimit,
+      offset
+    });
+    const pageMessages = readHistoryMessageArray(payload);
+    const before = messages.length;
+    for (const message of pageMessages) {
+      const key = messageIdentity(message);
+      if (!seen.has(key)) {
+        seen.add(key);
+        messages.push(message);
+      }
+    }
+
+    const pagination = extractPagination(payload, {
+      limit: pageLimit,
+      offset,
+      itemCount: pageMessages.length
+    });
+    if (!pagination.hasMore || messages.length >= target) {
+      break;
+    }
+    if (pagination.nextOffset !== undefined && pagination.nextOffset > offset) {
+      offset = pagination.nextOffset;
+      continue;
+    }
+    if (pageMessages.length > 0) {
+      offset += pageMessages.length;
+      continue;
+    }
+    if (messages.length === before) {
+      break;
+    }
+  }
+
+  return messages;
+}
+
+function readHistoryMessageArray(payload: unknown): unknown[] {
+  const record = toRecord(payload);
+  const candidates = [record.messages, record.items, record.data];
+  for (const candidate of candidates) {
+    if (Array.isArray(candidate)) {
+      return candidate;
+    }
+  }
+  const nested = toRecord(record.data);
+  if (Array.isArray(nested.messages)) {
+    return nested.messages;
+  }
+  return [];
+}
+
+function messageIdentity(message: unknown): string {
+  const record = toRecord(message);
+  const rawMeta = toRecord(record.__openclaw);
+  return JSON.stringify({
+    role: record.role,
+    seq: rawMeta.seq,
+    timestamp: record.timestamp,
+    content: record.content
+  });
 }
 
 function normalizeSession(payload: unknown, fallbackTitle = "Untitled session", hostKind = "openclaw"): GatewaySession {
@@ -1709,10 +1939,14 @@ function normalizeMessage(sessionId: string, payload: unknown): SessionMessage |
 }
 
 function synthesizeEventsFromHistory(sessionId: string, payload: unknown, afterSeq: number): GatewayEvent[] {
-  const rawMessages = Array.isArray((payload as { messages?: unknown[] } | null)?.messages)
-    ? ((payload as { messages: unknown[] }).messages ?? [])
-    : [];
+  return synthesizeEventsFromHistoryMessages(sessionId, readHistoryMessageArray(payload), afterSeq);
+}
 
+function synthesizeEventsFromHistoryMessages(
+  sessionId: string,
+  rawMessages: unknown[],
+  afterSeq: number
+): GatewayEvent[] {
   return rawMessages
     .flatMap((message) => {
       if (!message || typeof message !== "object") {

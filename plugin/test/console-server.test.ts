@@ -669,6 +669,68 @@ describe("console server", () => {
       await server.stop();
     }
   });
+
+  it("returns paginated session list pages without being capped by the default cache window", async () => {
+    const stateDir = await mkdtemp(join(tmpdir(), "claw-control-center-"));
+    cleanupPaths.push(stateDir);
+
+    const now = new Date().toISOString();
+    const gateway = new FakeGateway();
+    for (let index = 0; index < 5; index += 1) {
+      gateway.seedSession({
+        session: {
+          id: `session-${index}`,
+          title: `Session ${index}`,
+          status: "idle",
+          hostKind: "qclaw",
+          runnerCommand: "gateway",
+          createdAt: now,
+          updatedAt: new Date(Date.parse(now) - index).toISOString(),
+          lastEventSeq: index
+        },
+        messages: [],
+        events: []
+      });
+    }
+    const server = createConsoleServer({
+      stateDir,
+      configPath: join(stateDir, "openclaw.json"),
+      hostKind: "qclaw",
+      pluginVersion: "1.0.0",
+      token: "local-token",
+      gatewayConfig: {
+        baseUrl: "https://gateway.example.com",
+        botId: "bot-123",
+        secret: "sk-secret"
+      },
+      consoleConfig: {
+        host: "127.0.0.1",
+        port: 0
+      },
+      persistence: {
+        maxSessions: 2
+      },
+      gateway
+    });
+
+    await server.start();
+    try {
+      const payload = await fetchJson<{
+        sessions: GatewaySession[];
+        pagination: { limit: number; offset: number; total?: number; hasMore: boolean; nextOffset?: number };
+      }>(`${server.baseUrl}/api/sessions?limit=2&offset=2`);
+      expect(payload.sessions.map((session) => session.id)).toEqual(["session-2", "session-3"]);
+      expect(payload.pagination).toEqual({
+        limit: 2,
+        offset: 2,
+        total: 5,
+        hasMore: true,
+        nextOffset: 4
+      });
+    } finally {
+      await server.stop();
+    }
+  });
 });
 
 class FakeGateway {
@@ -686,8 +748,28 @@ class FakeGateway {
   health?: { ok?: boolean; status: "ok" | "degraded" | "error" | "unknown"; checkedAt?: string; durationMs?: number; lastError?: string };
   healthError?: Error;
 
-  async listSessions(): Promise<GatewaySession[]> {
-    return [...this.sessions.values()];
+  async listSessions(limit?: number): Promise<GatewaySession[]> {
+    return this.sortedSessions().slice(0, limit ?? this.sessions.size);
+  }
+
+  async listSessionPage(options?: { limit?: number; offset?: number }): Promise<{
+    sessions: GatewaySession[];
+    pagination: { limit: number; offset: number; total?: number; hasMore: boolean; nextOffset?: number };
+  }> {
+    const limit = options?.limit ?? 50;
+    const offset = options?.offset ?? 0;
+    const sessions = this.sortedSessions();
+    const page = sessions.slice(offset, offset + limit);
+    return {
+      sessions: page,
+      pagination: {
+        limit,
+        offset,
+        total: sessions.length,
+        hasMore: offset + page.length < sessions.length,
+        ...(offset + page.length < sessions.length ? { nextOffset: offset + page.length } : {})
+      }
+    };
   }
 
   async getRuntimeInfo(): Promise<NonNullable<FakeGateway["runtimeInfo"]>> {
@@ -807,6 +889,10 @@ class FakeGateway {
     this.sessions.set(input.session.id, input.session);
     this.messageHistory.set(input.session.id, input.messages);
     this.eventHistory.set(input.session.id, input.events);
+  }
+
+  private sortedSessions(): GatewaySession[] {
+    return [...this.sessions.values()].sort((left, right) => right.updatedAt.localeCompare(left.updatedAt));
   }
 }
 

@@ -1,5 +1,6 @@
 import type {
   BootstrapPayload,
+  SessionListPayload,
   SessionDetail,
   SessionSummary,
   TimelineEvent
@@ -10,8 +11,20 @@ export async function fetchBootstrap(): Promise<BootstrapPayload> {
 }
 
 export async function fetchSessions(): Promise<SessionSummary[]> {
-  const payload = await fetchJson<{ sessions: SessionSummary[] }>("/api/sessions");
+  const payload = await fetchSessionsPage();
   return payload.sessions ?? [];
+}
+
+export async function fetchSessionsPage(options: { limit?: number; offset?: number } = {}): Promise<SessionListPayload> {
+  const params = new URLSearchParams();
+  if (typeof options.limit === "number") {
+    params.set("limit", String(options.limit));
+  }
+  if (typeof options.offset === "number") {
+    params.set("offset", String(options.offset));
+  }
+  const suffix = params.size ? `?${params.toString()}` : "";
+  return fetchJson<SessionListPayload>(`/api/sessions${suffix}`);
 }
 
 export async function fetchSessionDetail(sessionId: string): Promise<SessionDetail> {

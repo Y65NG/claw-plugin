@@ -605,6 +605,172 @@ describe("gateway client", () => {
     await new Promise<void>((resolve) => wss.close(() => resolve()));
   });
 
+  it("paginates Gateway session lists and can find sessions beyond the first page", async () => {
+    const capturedListParams: Array<Record<string, unknown>> = [];
+    const sessions = Array.from({ length: 120 }, (_, index) => ({
+      key: `session-${index}`,
+      label: `Session ${index}`,
+      status: "idle",
+      startedAt: 1779335000000 + index,
+      updatedAt: 1779335000000 + index,
+      messageSeq: index
+    }));
+    const httpServer = createServer();
+    servers.add(httpServer);
+    const wss = new WebSocketServer({ noServer: true });
+
+    httpServer.on("upgrade", (request, socket, head) => {
+      wss.handleUpgrade(request, socket, head, (client) => {
+        client.send(
+          JSON.stringify({
+            type: "event",
+            event: "connect.challenge",
+            payload: { nonce: "nonce-1" }
+          })
+        );
+
+        client.on("message", (data) => {
+          const frame = JSON.parse(data.toString()) as {
+            id: string;
+            method: string;
+            params?: Record<string, unknown>;
+          };
+          if (frame.method === "connect") {
+            client.send(JSON.stringify({ type: "res", id: frame.id, ok: true, payload: { protocol: 4 } }));
+            return;
+          }
+          if (frame.method === "sessions.list") {
+            capturedListParams.push(frame.params ?? {});
+            const offset = Number(frame.params?.offset ?? 0);
+            const limit = Number(frame.params?.limit ?? 50);
+            const page = sessions.slice(offset, offset + limit);
+            client.send(
+              JSON.stringify({
+                type: "res",
+                id: frame.id,
+                ok: true,
+                payload: {
+                  sessions: page,
+                  total: sessions.length,
+                  offset,
+                  hasMore: offset + page.length < sessions.length,
+                  nextOffset: offset + page.length
+                }
+              })
+            );
+            return;
+          }
+          client.send(JSON.stringify({ type: "res", id: frame.id, ok: true, payload: { ok: true } }));
+        });
+      });
+    });
+
+    const address = await listen(httpServer);
+    const client = createGatewayClient({
+      baseUrl: address.replace("http://", "ws://"),
+      secret: "shared-token"
+    });
+
+    const allSessions = await client.listSessions(120);
+    expect(allSessions).toHaveLength(120);
+    expect(allSessions.at(-1)?.id).toBe("session-119");
+    const session = await client.getSession("session-119");
+    expect(session.title).toBe("Session 119");
+    expect(capturedListParams).toMatchObject([
+      { limit: 50, offset: 0 },
+      { limit: 50, offset: 50 },
+      { limit: 20, offset: 100 },
+      { limit: 50, offset: 0 },
+      { limit: 50, offset: 50 },
+      { limit: 50, offset: 100 }
+    ]);
+    await client.stop();
+    await new Promise<void>((resolve) => wss.close(() => resolve()));
+  });
+
+  it("paginates chat history for messages, event replay, and retry lookup", async () => {
+    const capturedHistoryParams: Array<Record<string, unknown>> = [];
+    const sentMessages: string[] = [];
+    const history = Array.from({ length: 210 }, (_, index) => ({
+      role: index === 205 ? "user" : "assistant",
+      content: index === 205 ? "retry this old prompt" : `assistant ${index}`,
+      timestamp: 1779335000000 + index,
+      __openclaw: {
+        seq: index + 1
+      }
+    }));
+    const httpServer = createServer();
+    servers.add(httpServer);
+    const wss = new WebSocketServer({ noServer: true });
+
+    httpServer.on("upgrade", (request, socket, head) => {
+      wss.handleUpgrade(request, socket, head, (client) => {
+        client.send(
+          JSON.stringify({
+            type: "event",
+            event: "connect.challenge",
+            payload: { nonce: "nonce-1" }
+          })
+        );
+
+        client.on("message", (data) => {
+          const frame = JSON.parse(data.toString()) as {
+            id: string;
+            method: string;
+            params?: Record<string, unknown>;
+          };
+          if (frame.method === "connect") {
+            client.send(JSON.stringify({ type: "res", id: frame.id, ok: true, payload: { protocol: 4 } }));
+            return;
+          }
+          if (frame.method === "chat.history") {
+            capturedHistoryParams.push(frame.params ?? {});
+            const offset = Number(frame.params?.offset ?? 0);
+            const limit = Number(frame.params?.limit ?? 200);
+            const page = history.slice(offset, offset + limit);
+            client.send(
+              JSON.stringify({
+                type: "res",
+                id: frame.id,
+                ok: true,
+                payload: {
+                  messages: page,
+                  total: history.length,
+                  offset,
+                  hasMore: offset + page.length < history.length,
+                  nextOffset: offset + page.length
+                }
+              })
+            );
+            return;
+          }
+          if (frame.method === "chat.send") {
+            sentMessages.push(String(frame.params?.message ?? ""));
+            client.send(JSON.stringify({ type: "res", id: frame.id, ok: true, payload: { ok: true } }));
+            return;
+          }
+          client.send(JSON.stringify({ type: "res", id: frame.id, ok: true, payload: { ok: true } }));
+        });
+      });
+    });
+
+    const address = await listen(httpServer);
+    const client = createGatewayClient({
+      baseUrl: address.replace("http://", "ws://"),
+      secret: "shared-token"
+    });
+
+    await expect(client.getSessionMessages("session-1")).resolves.toHaveLength(210);
+    const events = await client.listEvents("session-1", 205);
+    expect(events.map((event) => event.seq)).toEqual([207, 208, 209, 210]);
+    await client.controlSession("session-1", "retry");
+    expect(sentMessages).toEqual(["retry this old prompt"]);
+    expect(capturedHistoryParams).toContainEqual(expect.objectContaining({ sessionKey: "session-1", limit: 200, offset: 0 }));
+    expect(capturedHistoryParams).toContainEqual(expect.objectContaining({ sessionKey: "session-1", limit: 200, offset: 200 }));
+    await client.stop();
+    await new Promise<void>((resolve) => wss.close(() => resolve()));
+  });
+
   it("drops replayed stream events at or below the subscribed sequence", async () => {
     const received: string[] = [];
     const httpServer = createServer();

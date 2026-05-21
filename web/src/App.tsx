@@ -5,13 +5,14 @@ import {
   fetchBootstrap,
   fetchSessionDetail,
   fetchSessionEvents,
-  fetchSessions,
+  fetchSessionsPage,
   sendMessage
 } from "./api";
 import "./App.css";
 import type {
   BootstrapPayload,
   PluginStatusSnapshot,
+  PaginationSnapshot,
   SessionMessage,
   SessionSummary,
   TimelineEvent
@@ -84,6 +85,7 @@ export function App() {
   const [status, setStatus] = useState<PluginStatusSnapshot | null>(null);
   const [config, setConfig] = useState<ConfigView>(null);
   const [sessions, setSessions] = useState<SessionSummary[]>([]);
+  const [sessionPagination, setSessionPagination] = useState<PaginationSnapshot | null>(null);
   const [activeSessionId, setActiveSessionId] = useState<string>("");
   const [messages, setMessages] = useState<SessionMessage[]>([]);
   const [events, setEvents] = useState<TimelineEvent[]>([]);
@@ -91,6 +93,7 @@ export function App() {
   const [newSessionTitle, setNewSessionTitle] = useState("");
   const [error, setError] = useState("");
   const [loading, setLoading] = useState(true);
+  const [loadingMoreSessions, setLoadingMoreSessions] = useState(false);
   const conversationBodyRef = useRef<HTMLDivElement | null>(null);
   const refreshStateRef = useRef({
     inFlight: false,
@@ -119,9 +122,11 @@ export function App() {
     try {
       do {
         refreshStateRef.current.queued = false;
-        const nextSessions = await fetchSessions();
+        const page = await fetchSessionsPage();
+        const nextSessions = page.sessions;
         startTransition(() => {
           setSessions(nextSessions);
+          setSessionPagination(page.pagination ?? null);
           setActiveSessionId((current) => {
             if (current && nextSessions.some((session) => session.id === current)) {
               return current;
@@ -148,15 +153,17 @@ export function App() {
     let cancelled = false;
     async function load() {
       try {
-        const [bootstrap, nextSessions] = await Promise.all([fetchBootstrap(), fetchSessions()]);
+        const [bootstrap, sessionPage] = await Promise.all([fetchBootstrap(), fetchSessionsPage()]);
         if (cancelled) {
           return;
         }
+        const nextSessions = sessionPage.sessions;
         setToken(bootstrap.token);
         setStatus(bootstrap.status);
         setConfig(bootstrap.config);
         startTransition(() => {
           setSessions(nextSessions);
+          setSessionPagination(sessionPage.pagination ?? null);
           setActiveSessionId((current) => current || mostRecentlyUpdatedSession(nextSessions)?.id || "");
         });
       } catch (loadError) {
@@ -296,6 +303,25 @@ export function App() {
     }
   }
 
+  async function handleLoadMoreSessions() {
+    if (!sessionPagination?.hasMore || loadingMoreSessions) {
+      return;
+    }
+    setLoadingMoreSessions(true);
+    try {
+      const page = await fetchSessionsPage({
+        limit: sessionPagination.limit,
+        offset: sessionPagination.nextOffset ?? sessionPagination.offset + sessionPagination.limit
+      });
+      setSessions((current) => mergeSessions(current, page.sessions));
+      setSessionPagination(page.pagination ?? null);
+    } catch (loadMoreError) {
+      setError((loadMoreError as Error).message);
+    } finally {
+      setLoadingMoreSessions(false);
+    }
+  }
+
   async function handleSendMessage(event: React.FormEvent<HTMLFormElement>) {
     event.preventDefault();
     if (!activeSessionId || !draft.trim()) {
@@ -364,6 +390,16 @@ export function App() {
           ))}
           {!deferredSessions.length && !loading ? (
             <div className="empty-state">No sessions yet. Create one to start driving Claw.</div>
+          ) : null}
+          {sessionPagination?.hasMore ? (
+            <button
+              className="secondary-button load-more-button"
+              type="button"
+              onClick={handleLoadMoreSessions}
+              disabled={loadingMoreSessions}
+            >
+              {loadingMoreSessions ? "Loading more..." : "Load more sessions"}
+            </button>
           ) : null}
         </div>
       </nav>
@@ -592,6 +628,10 @@ function EventDetail({ item }: { item: EventListItem }) {
 
 function sortSessions(sessions: SessionSummary[]): SessionSummary[] {
   return [...sessions].sort((left, right) => right.updatedAt.localeCompare(left.updatedAt));
+}
+
+function mergeSessions(current: SessionSummary[], incoming: SessionSummary[]): SessionSummary[] {
+  return sortSessions(Array.from(new Map([...current, ...incoming].map((session) => [session.id, session])).values()));
 }
 
 function mostRecentlyUpdatedSession(sessions: SessionSummary[]): SessionSummary | null {

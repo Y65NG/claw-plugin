@@ -620,6 +620,11 @@ input.secondary-button {
   color: #2f3946;
 }
 
+.load-more-button {
+  width: 100%;
+  text-align: center;
+}
+
 .empty-state,
 .loading-state,
 .error-banner {
