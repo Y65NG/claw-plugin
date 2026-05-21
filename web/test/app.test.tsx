@@ -529,6 +529,12 @@ describe("App", () => {
             activeSessionCount: 1,
             runningSessionCount: 0,
             healthy: true,
+            connectionHealthy: true,
+            gatewayHealth: {
+              ok: true,
+              status: "ok",
+              durationMs: 42
+            },
             modelPrimary: "qclaw/modelroute",
             enabledSkills: ["browser", "online-search"],
             cronScheduler: {
@@ -719,6 +725,10 @@ describe("App", () => {
 
       expect(screen.getByText("Model")).toBeInTheDocument();
       expect(screen.getByText("qclaw/modelroute")).toBeInTheDocument();
+      expect(sidebar.getByText("Gateway health")).toBeInTheDocument();
+      expect(sidebar.getByText("ok · 42ms")).toBeInTheDocument();
+      expect(sidebar.getByText("Console link")).toBeInTheDocument();
+      expect(sidebar.getByText("Connected")).toBeInTheDocument();
       expect(screen.getByText("Enabled skills")).toBeInTheDocument();
       expect(screen.getByText("browser, online-search")).toBeInTheDocument();
       expect(sidebar.getByText("Cron tasks")).toBeInTheDocument();

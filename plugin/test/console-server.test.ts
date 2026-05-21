@@ -556,6 +556,58 @@ describe("console server", () => {
     }
   });
 
+  it("prefers official Gateway health while preserving local connection health", async () => {
+    const stateDir = await mkdtemp(join(tmpdir(), "claw-control-center-"));
+    cleanupPaths.push(stateDir);
+
+    const gateway = new FakeGateway();
+    gateway.health = {
+      ok: false,
+      status: "degraded",
+      checkedAt: "2026-05-21T03:45:13.816Z",
+      durationMs: 984
+    };
+    const server = createConsoleServer({
+      stateDir,
+      configPath: join(stateDir, "openclaw.json"),
+      hostKind: "openclaw",
+      pluginVersion: "1.0.0",
+      token: "local-token",
+      gatewayConfig: {
+        baseUrl: "https://gateway.example.com",
+        botId: "bot-123",
+        secret: "sk-secret"
+      },
+      consoleConfig: {
+        host: "127.0.0.1",
+        port: 0
+      },
+      persistence: {
+        maxSessions: 20
+      },
+      gateway
+    });
+
+    await server.start();
+    try {
+      const status = await fetchJson<{
+        healthy: boolean;
+        connectionHealthy?: boolean;
+        gatewayHealth?: { ok?: boolean; status?: string; checkedAt?: string; durationMs?: number };
+      }>(`${server.baseUrl}/api/status`);
+      expect(status.healthy).toBe(false);
+      expect(status.connectionHealthy).toBe(true);
+      expect(status.gatewayHealth).toEqual({
+        ok: false,
+        status: "degraded",
+        checkedAt: "2026-05-21T03:45:13.816Z",
+        durationMs: 984
+      });
+    } finally {
+      await server.stop();
+    }
+  });
+
   it("surfaces redacted 53AIHub bridge config and status", async () => {
     const stateDir = await mkdtemp(join(tmpdir(), "claw-control-center-"));
     cleanupPaths.push(stateDir);
@@ -631,6 +683,8 @@ class FakeGateway {
     cronTasks?: Array<{ id: string; name: string; enabled: boolean; schedule?: string; nextRunAt?: string }>;
   };
   runtimeInfoError?: Error;
+  health?: { ok?: boolean; status: "ok" | "degraded" | "error" | "unknown"; checkedAt?: string; durationMs?: number; lastError?: string };
+  healthError?: Error;
 
   async listSessions(): Promise<GatewaySession[]> {
     return [...this.sessions.values()];
@@ -641,6 +695,13 @@ class FakeGateway {
       throw this.runtimeInfoError;
     }
     return this.runtimeInfo ?? { enabledSkills: [] };
+  }
+
+  async getHealth(): Promise<NonNullable<FakeGateway["health"]>> {
+    if (this.healthError) {
+      throw this.healthError;
+    }
+    return this.health ?? { ok: true, status: "ok" };
   }
 
   async createSession(title: string): Promise<GatewaySession> {

@@ -46,6 +46,13 @@ export type GatewayRuntimeInfo = {
   cronScheduler?: GatewayCronScheduler;
   cronTasks?: GatewayCronTask[];
 };
+export type GatewayHealthSnapshot = {
+  ok?: boolean;
+  status: "ok" | "degraded" | "error" | "unknown";
+  checkedAt?: string;
+  durationMs?: number;
+  lastError?: string;
+};
 
 type GatewayFrame =
   | {
@@ -68,6 +75,7 @@ type GatewayFrame =
 
 type GatewayClient = {
   getRuntimeInfo(): Promise<GatewayRuntimeInfo>;
+  getHealth(): Promise<GatewayHealthSnapshot>;
   listSessions(limit?: number): Promise<GatewaySession[]>;
   createSession(title: string, initialPrompt?: string): Promise<GatewaySession>;
   getSession(sessionId: string): Promise<GatewaySession>;
@@ -183,6 +191,17 @@ export function createGatewayClient(config: Partial<GatewayConfig>): GatewayClie
         ...runtimeInfo,
         ...cronInfo
       };
+    },
+    async getHealth() {
+      try {
+        const payload = await transport.request("health", {}, { timeoutMs: 2_000 });
+        return extractGatewayHealth(payload);
+      } catch (error) {
+        return {
+          status: "unknown",
+          lastError: error instanceof Error ? error.message : String(error)
+        };
+      }
     },
     async listSessions(limit = 50) {
       const payload = await transport.request("sessions.list", {
@@ -1300,6 +1319,50 @@ function extractRuntimeInfo(payload: unknown): GatewayRuntimeInfo {
     ...(modelPrimary ? { modelPrimary } : {}),
     enabledSkills
   };
+}
+
+function extractGatewayHealth(payload: unknown): GatewayHealthSnapshot {
+  const record = toRecord(payload);
+  const ok = booleanProperty(record, ["ok", "healthy"]);
+  const rawStatus = stringProperty(record, ["status", "state"]);
+  const status = normalizeGatewayHealthStatus(ok, rawStatus);
+  const checkedAt = optionalIsoString(record.ts ?? record.timestamp ?? record.checkedAt ?? record.time);
+  const durationMs = numberProperty(record, ["durationMs", "latencyMs"]);
+  const lastError =
+    readStringFromUnknown(record, ["lastError"]) ??
+    readStringFromUnknown(record, ["error"]) ??
+    readStringFromUnknown(record, ["error", "message"]);
+
+  return {
+    ...(ok !== undefined ? { ok } : {}),
+    status,
+    ...(checkedAt ? { checkedAt } : {}),
+    ...(durationMs !== undefined ? { durationMs } : {}),
+    ...(lastError ? { lastError } : {})
+  };
+}
+
+function normalizeGatewayHealthStatus(
+  ok: boolean | undefined,
+  rawStatus: string | undefined
+): GatewayHealthSnapshot["status"] {
+  const normalized = rawStatus?.toLowerCase();
+  if (normalized === "ok" || normalized === "healthy" || normalized === "ready") {
+    return "ok";
+  }
+  if (normalized === "degraded" || normalized === "warning" || normalized === "warn") {
+    return "degraded";
+  }
+  if (normalized === "error" || normalized === "failed" || normalized === "unhealthy") {
+    return "error";
+  }
+  if (ok === true) {
+    return "ok";
+  }
+  if (ok === false) {
+    return "error";
+  }
+  return "unknown";
 }
 
 function extractCronScheduler(

@@ -9,7 +9,13 @@ import WebSocket, { WebSocketServer } from "ws";
 import { createHub53AIBridge, type Hub53AIConfig, type Hub53AIStatusSnapshot } from "./53aihub-client";
 import type { AgentEventProbe, AgentEventProbeSnapshot } from "./agent-event-probe";
 import { FileSessionStore } from "./file-store";
-import type { GatewayClient, GatewayConfig, GatewayEvent, GatewayRuntimeInfo } from "./gateway-client";
+import type {
+  GatewayClient,
+  GatewayConfig,
+  GatewayEvent,
+  GatewayHealthSnapshot,
+  GatewayRuntimeInfo
+} from "./gateway-client";
 import { readHostRuntimeInfo, type HostRuntimeInfo } from "./host";
 import type { ControlAction, SessionDetail, SessionMessage, SessionStatus, SessionSummary, TimelineEvent } from "./models";
 
@@ -50,6 +56,8 @@ type StatusSnapshot = {
   activeSessionCount: number;
   runningSessionCount: number;
   healthy: boolean;
+  connectionHealthy: boolean;
+  gatewayHealth?: GatewayHealthSnapshot;
   modelPrimary?: string;
   enabledSkills: string[];
   cronScheduler?: GatewayRuntimeInfo["cronScheduler"];
@@ -59,6 +67,7 @@ type StatusSnapshot = {
 };
 
 const RUNTIME_INFO_CACHE_TTL_MS = 5_000;
+const HEALTH_INFO_CACHE_TTL_MS = 5_000;
 
 export function createConsoleServer(input: CreateConsoleServerInput) {
   const hostRuntime = input.hostRuntime ?? readHostRuntimeInfo(input.configPath);
@@ -76,6 +85,15 @@ export function createConsoleServer(input: CreateConsoleServerInput) {
   let remoteSyncInFlight = false;
   let runtimeInfoCache: {
     value: GatewayRuntimeInfo | null;
+    updatedAtMs: number;
+    inFlight: Promise<void> | null;
+  } = {
+    value: null,
+    updatedAtMs: 0,
+    inFlight: null
+  };
+  let healthInfoCache: {
+    value: GatewayHealthSnapshot | null;
     updatedAtMs: number;
     inFlight: Promise<void> | null;
   } = {
@@ -133,6 +151,7 @@ export function createConsoleServer(input: CreateConsoleServerInput) {
     await store.init();
     await syncRemoteSessions();
     await refreshRuntimeInfo(true);
+    await refreshGatewayHealth(true);
     await hub53ai?.start();
     await new Promise<void>((resolvePromise) => {
       httpServer.listen(input.consoleConfig.port, input.consoleConfig.host, () => resolvePromise());
@@ -586,12 +605,49 @@ export function createConsoleServer(input: CreateConsoleServerInput) {
     return runtimeInfoCache.value ?? { enabledSkills: [] };
   }
 
+  async function refreshGatewayHealth(force = false) {
+    const now = Date.now();
+    if (!force && healthInfoCache.value && now - healthInfoCache.updatedAtMs < HEALTH_INFO_CACHE_TTL_MS) {
+      return;
+    }
+    if (healthInfoCache.inFlight) {
+      await healthInfoCache.inFlight;
+      return;
+    }
+
+    healthInfoCache.inFlight = (async () => {
+      try {
+        healthInfoCache.value = await input.gateway.getHealth();
+        healthInfoCache.updatedAtMs = Date.now();
+      } catch (error) {
+        healthInfoCache.value = {
+          status: "unknown",
+          lastError: error instanceof Error ? error.message : String(error)
+        };
+        healthInfoCache.updatedAtMs = Date.now();
+      } finally {
+        healthInfoCache.inFlight = null;
+      }
+    })();
+    await healthInfoCache.inFlight;
+  }
+
+  function getGatewayHealthSnapshot(): GatewayHealthSnapshot | undefined {
+    if (!healthInfoCache.inFlight && Date.now() - healthInfoCache.updatedAtMs >= HEALTH_INFO_CACHE_TTL_MS) {
+      void refreshGatewayHealth();
+    }
+    return healthInfoCache.value ?? undefined;
+  }
+
   function buildStatusSnapshot(): StatusSnapshot {
     const sessions = store.listSessions();
     const runtimeInfo = getRuntimeInfoSnapshot();
+    const gatewayHealth = getGatewayHealthSnapshot();
     const runtimeSkills = runtimeInfo.enabledSkills.filter((skill) => skill.trim());
     const runtimeCronTasks = runtimeInfo.cronTasks;
     const cronTasks = runtimeCronTasks ?? hostRuntime.cronTasks ?? [];
+    const connectionHealthy = lastGatewayError === null;
+    const healthy = typeof gatewayHealth?.ok === "boolean" ? gatewayHealth.ok : connectionHealthy;
     return {
       hostKind: input.hostKind,
       stateDir: input.stateDir,
@@ -603,7 +659,9 @@ export function createConsoleServer(input: CreateConsoleServerInput) {
       runnerCommand: "gateway",
       activeSessionCount: sessions.length,
       runningSessionCount: sessions.filter((session) => session.status === "running").length,
-      healthy: lastGatewayError === null,
+      healthy,
+      connectionHealthy,
+      gatewayHealth,
       modelPrimary: runtimeInfo.modelPrimary ?? hostRuntime.modelPrimary,
       enabledSkills: runtimeSkills.length ? runtimeSkills : hostRuntime.enabledSkills,
       cronScheduler: runtimeInfo.cronScheduler ?? hostRuntime.cronScheduler,

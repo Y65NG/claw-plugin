@@ -541,6 +541,70 @@ describe("gateway client", () => {
     await new Promise<void>((resolve) => wss.close(() => resolve()));
   });
 
+  it("reads official Gateway health summary", async () => {
+    const capturedMethods: string[] = [];
+    const httpServer = createServer();
+    servers.add(httpServer);
+    const wss = new WebSocketServer({ noServer: true });
+
+    httpServer.on("upgrade", (request, socket, head) => {
+      wss.handleUpgrade(request, socket, head, (client) => {
+        client.send(
+          JSON.stringify({
+            type: "event",
+            event: "connect.challenge",
+            payload: { nonce: "nonce-1" }
+          })
+        );
+
+        client.on("message", (data) => {
+          const frame = JSON.parse(data.toString()) as {
+            id: string;
+            method: string;
+          };
+          capturedMethods.push(frame.method);
+          if (frame.method === "connect") {
+            client.send(JSON.stringify({ type: "res", id: frame.id, ok: true, payload: { protocol: 4 } }));
+            return;
+          }
+          if (frame.method === "health") {
+            client.send(
+              JSON.stringify({
+                type: "res",
+                id: frame.id,
+                ok: true,
+                payload: {
+                  ok: false,
+                  status: "degraded",
+                  ts: 1779335113816,
+                  durationMs: 984
+                }
+              })
+            );
+            return;
+          }
+          client.send(JSON.stringify({ type: "res", id: frame.id, ok: true, payload: { ok: true } }));
+        });
+      });
+    });
+
+    const address = await listen(httpServer);
+    const client = createGatewayClient({
+      baseUrl: address.replace("http://", "ws://"),
+      secret: "shared-token"
+    });
+
+    await expect(client.getHealth()).resolves.toEqual({
+      ok: false,
+      status: "degraded",
+      checkedAt: "2026-05-21T03:45:13.816Z",
+      durationMs: 984
+    });
+    expect(capturedMethods).toContain("health");
+    await client.stop();
+    await new Promise<void>((resolve) => wss.close(() => resolve()));
+  });
+
   it("drops replayed stream events at or below the subscribed sequence", async () => {
     const received: string[] = [];
     const httpServer = createServer();

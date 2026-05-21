@@ -487,8 +487,12 @@ export function App() {
               <span className="stat-value">{status?.hostKind ?? "unknown"}</span>
             </div>
             <div className="stat-card">
-              <span className="stat-label">Health</span>
-              <span className="stat-value">{status?.healthy ? "Healthy" : "Unknown"}</span>
+              <span className="stat-label">Gateway health</span>
+              <span className="stat-value stat-value-compact">{formatGatewayHealth(status)}</span>
+            </div>
+            <div className="stat-card">
+              <span className="stat-label">Console link</span>
+              <span className="stat-value">{status?.connectionHealthy === false ? "Disconnected" : "Connected"}</span>
             </div>
             <div className="stat-card">
               <span className="stat-label">Active</span>
@@ -1579,6 +1583,22 @@ function formatCronTaskMeta(task: NonNullable<PluginStatusSnapshot["cronTasks"]>
     parts.push(task.agentId);
   }
   return parts.join(" · ") || task.status || task.payloadKind || "No schedule details";
+}
+
+function formatGatewayHealth(status: PluginStatusSnapshot | null): string {
+  const health = status?.gatewayHealth;
+  if (!health) {
+    return status?.healthy ? "Healthy" : "Unknown";
+  }
+
+  const parts = [health.status];
+  if (typeof health.durationMs === "number") {
+    parts.push(`${Math.round(health.durationMs)}ms`);
+  }
+  if (health.lastError) {
+    parts.push(health.lastError);
+  }
+  return parts.join(" · ");
 }
 
 function formatUpdatedAt(value: string): string {

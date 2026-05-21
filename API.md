@@ -93,7 +93,7 @@ Backend:
 
 OpenClaw upstream:
 
-- 无直接 RPC。此接口组合本地 runtime 状态、插件配置、宿主配置读取结果。
+- 通过本地 status 聚合路径读取 Gateway `health`、`skills.status`、`cron.status`、`cron.list`；同时组合插件配置、宿主配置读取结果。
 
 Response example:
 
@@ -112,6 +112,13 @@ Response example:
     "activeSessionCount": 4,
     "runningSessionCount": 1,
     "healthy": true,
+    "connectionHealthy": true,
+    "gatewayHealth": {
+      "ok": true,
+      "status": "ok",
+      "checkedAt": "2026-05-21T03:45:13.816Z",
+      "durationMs": 984
+    },
     "modelPrimary": "openai/gpt-5.1",
     "enabledSkills": ["browser", "weather"],
     "cronScheduler": {
@@ -686,9 +693,10 @@ Backend:
 
 OpenClaw upstream:
 
-- 当前实现不调用 Gateway `status` / `health` RPC；`healthy` 由本地 Gateway adapter 最近错误状态推断。
+- 当前实现会调用 Gateway `health` RPC，并将摘要写入 `gatewayHealth`；`healthy` 优先采用官方 `gatewayHealth.ok`，如果该字段不可用则回退到本地 Gateway adapter 最近错误状态。
+- `connectionHealthy` 单独表示本地 console server 与 Gateway adapter 最近是否出现连接/执行错误，便于区分“官方 Gateway 健康检查异常”和“插件本地连接异常”。
 - 当前实现会调用 `skills.status`、`cron.status` 与 `cron.list` 汇总运行时模型、skill 与 cron tasks；如果 cron RPC 不可用，则状态页仍保持可用，并在可读时回退到本地 `cron/jobs.json`。
-- 官方可选 RPC:
+- 官方 RPC:
 
 | OpenClaw API | Purpose | Official doc |
 | --- | --- | --- |
@@ -712,6 +720,13 @@ Response:
   "activeSessionCount": 4,
   "runningSessionCount": 1,
   "healthy": true,
+  "connectionHealthy": true,
+  "gatewayHealth": {
+    "ok": true,
+    "status": "ok",
+    "checkedAt": "2026-05-21T03:45:13.816Z",
+    "durationMs": 984
+  },
   "modelPrimary": "openai/gpt-5.1",
   "enabledSkills": ["browser", "weather"],
   "cronScheduler": {
@@ -763,7 +778,7 @@ Backend:
 
 OpenClaw upstream:
 
-- `skills.status`、`cron.status`、`cron.list`。插件会先尝试读取运行时 skill/model/cron 摘要，再推送本地 `buildStatusSnapshot()` 的结果；如果对应 RPC 不可用，则回退到宿主 `openclaw.json` 与本地 cron store。
+- `health`、`skills.status`、`cron.status`、`cron.list`。插件会先尝试读取官方 Gateway 健康检查、运行时 skill/model/cron 摘要，再推送本地 `buildStatusSnapshot()` 的结果；如果对应 RPC 不可用，则健康状态回退到本地连接状态，skill/model/cron 回退到宿主 `openclaw.json` 与本地 cron store。
 
 Message example:
 
@@ -773,6 +788,12 @@ Message example:
   "activeSessionCount": 12,
   "runningSessionCount": 2,
   "healthy": true,
+  "connectionHealthy": true,
+  "gatewayHealth": {
+    "ok": true,
+    "status": "ok",
+    "durationMs": 42
+  },
   "modelPrimary": "qclaw/modelroute",
   "enabledSkills": ["browser", "online-search"],
   "cronScheduler": {
@@ -979,10 +1000,10 @@ Bridge to OpenClaw upstream:
 | `skills.status` | Runtime skill/model summary for status panel | `getRuntimeInfo()` in [plugin/src/gateway-client.ts](./plugin/src/gateway-client.ts) | [Operator helper methods](https://docs.openclaw.ai/gateway/protocol#operator-helper-methods) |
 | `cron.status` | Runtime cron scheduler summary for status panel | `getRuntimeInfo()` in [plugin/src/gateway-client.ts](./plugin/src/gateway-client.ts) | [Cron CLI](https://docs.openclaw.ai/cli/cron) |
 | `cron.list` | Runtime cron job list for status panel | `getRuntimeInfo()` in [plugin/src/gateway-client.ts](./plugin/src/gateway-client.ts) | [Cron CLI](https://docs.openclaw.ai/cli/cron) |
+| `health` | Official Gateway health summary for status panel | `getHealth()` in [plugin/src/gateway-client.ts](./plugin/src/gateway-client.ts) | [System and identity](https://docs.openclaw.ai/gateway/protocol#system-and-identity) |
 | `models.list` | Not currently called as a standalone model catalog source | N/A | [Models and usage](https://docs.openclaw.ai/gateway/protocol#models-and-usage) |
 | `tools.effective` | Not currently called; recommended future source for session-scoped tool inventory | N/A | [Operator helper methods](https://docs.openclaw.ai/gateway/protocol#operator-helper-methods) |
 | `status` | Not currently called; optional future Gateway status source | N/A | [System and identity](https://docs.openclaw.ai/gateway/protocol#system-and-identity) |
-| `health` | Not currently called; optional future Gateway health source | N/A | [System and identity](https://docs.openclaw.ai/gateway/protocol#system-and-identity) |
 
 ## 10. Data Types
 
@@ -1046,6 +1067,14 @@ type PluginStatusSnapshot = {
   activeSessionCount: number;
   runningSessionCount: number;
   healthy: boolean;
+  connectionHealthy?: boolean;
+  gatewayHealth?: {
+    ok?: boolean;
+    status: "ok" | "degraded" | "error" | "unknown";
+    checkedAt?: string;
+    durationMs?: number;
+    lastError?: string;
+  };
   modelPrimary?: string;
   enabledSkills?: string[];
   cronScheduler?: {

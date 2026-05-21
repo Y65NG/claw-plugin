@@ -51,11 +51,21 @@ export type PluginStatusSnapshot = {
   activeSessionCount: number;
   runningSessionCount: number;
   healthy: boolean;
+  connectionHealthy?: boolean;
+  gatewayHealth?: GatewayHealthSnapshot;
   modelPrimary?: string;
   enabledSkills?: string[];
   cronScheduler?: CronSchedulerSnapshot;
   cronTasks?: CronTaskSummary[];
   hub53ai?: Hub53AIStatusSnapshot;
+};
+
+export type GatewayHealthSnapshot = {
+  ok?: boolean;
+  status: "ok" | "degraded" | "error" | "unknown";
+  checkedAt?: string;
+  durationMs?: number;
+  lastError?: string;
 };
 
 export type CronSchedulerSnapshot = {
