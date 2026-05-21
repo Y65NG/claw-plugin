@@ -361,6 +361,59 @@ describe("gateway client", () => {
             );
             return;
           }
+          if (frame.method === "cron.status") {
+            client.send(
+              JSON.stringify({
+                type: "res",
+                id: frame.id,
+                ok: true,
+                payload: {
+                  enabled: true,
+                  storePath: "/Users/me/.openclaw/cron/jobs.json",
+                  jobs: 2,
+                  nextWakeAtMs: 1770000000000
+                }
+              })
+            );
+            return;
+          }
+          if (frame.method === "cron.list") {
+            client.send(
+              JSON.stringify({
+                type: "res",
+                id: frame.id,
+                ok: true,
+                payload: {
+                  total: 2,
+                  jobs: [
+                    {
+                      id: "job-1",
+                      name: "Daily digest",
+                      enabled: true,
+                      agentId: "main",
+                      schedule: {
+                        kind: "cron",
+                        expr: "0 8 * * *",
+                        timezone: "America/New_York"
+                      },
+                      nextRunAtMs: 1770000000000,
+                      lastRunAtMs: 1769900000000
+                    },
+                    {
+                      id: "job-2",
+                      name: "Disabled cleanup",
+                      enabled: false,
+                      schedule: {
+                        kind: "every",
+                        everyMs: 3600000
+                      }
+                    }
+                  ]
+                }
+              })
+            );
+            return;
+          }
           client.send(JSON.stringify({ type: "res", id: frame.id, ok: true, payload: { ok: true } }));
         });
       });
@@ -374,9 +427,34 @@ describe("gateway client", () => {
 
     await expect(client.getRuntimeInfo()).resolves.toEqual({
       modelPrimary: "openai/gpt-5.5",
-      enabledSkills: ["browser", "weather", "web_search"]
+      enabledSkills: ["browser", "weather", "web_search"],
+      cronScheduler: {
+        enabled: true,
+        storePath: "/Users/me/.openclaw/cron/jobs.json",
+        jobCount: 2,
+        nextWakeAt: "2026-02-02T02:40:00.000Z"
+      },
+      cronTasks: [
+        {
+          id: "job-1",
+          name: "Daily digest",
+          enabled: true,
+          agentId: "main",
+          schedule: "cron 0 8 * * * · America/New_York",
+          nextRunAt: "2026-02-02T02:40:00.000Z",
+          lastRunAt: "2026-01-31T22:53:20.000Z"
+        },
+        {
+          id: "job-2",
+          name: "Disabled cleanup",
+          enabled: false,
+          schedule: "every 1h"
+        }
+      ]
     });
     expect(capturedMethods).toContain("skills.status");
+    expect(capturedMethods).toContain("cron.status");
+    expect(capturedMethods).toContain("cron.list");
     await client.stop();
     await new Promise<void>((resolve) => wss.close(() => resolve()));
   });

@@ -114,6 +114,22 @@ Response example:
     "healthy": true,
     "modelPrimary": "openai/gpt-5.1",
     "enabledSkills": ["browser", "weather"],
+    "cronScheduler": {
+      "enabled": true,
+      "jobCount": 2,
+      "nextWakeAt": "2026-05-21T08:00:00.000Z",
+      "storePath": "/Users/me/.openclaw/cron/jobs.json"
+    },
+    "cronTasks": [
+      {
+        "id": "daily-brief",
+        "name": "Daily brief",
+        "enabled": true,
+        "agentId": "main",
+        "schedule": "cron 0 8 * * *",
+        "nextRunAt": "2026-05-21T08:00:00.000Z"
+      }
+    ],
     "hub53ai": {
       "enabled": true,
       "configured": true,
@@ -648,7 +664,7 @@ Activity summarization implementation:
 
 ## 7. Frontend Feature: Claw Status
 
-右侧 status 面板展示当前 Claw、插件、本地服务、模型、skill、53AIHub bridge 状态。
+右侧 status 面板展示当前 Claw、插件、本地服务、模型、skill、cron tasks、53AIHub bridge 状态。
 
 ### 7.1 `GET /api/status`
 
@@ -671,12 +687,15 @@ Backend:
 OpenClaw upstream:
 
 - 当前实现不调用 Gateway `status` / `health` RPC；`healthy` 由本地 Gateway adapter 最近错误状态推断。
+- 当前实现会调用 `skills.status`、`cron.status` 与 `cron.list` 汇总运行时模型、skill 与 cron tasks；如果 cron RPC 不可用，则状态页仍保持可用，并在可读时回退到本地 `cron/jobs.json`。
 - 官方可选 RPC:
 
 | OpenClaw API | Purpose | Official doc |
 | --- | --- | --- |
 | `status` | Return `/status`-style Gateway summary. | [System and identity](https://docs.openclaw.ai/gateway/protocol#system-and-identity) |
 | `health` | Return cached or freshly probed Gateway health snapshot. | [System and identity](https://docs.openclaw.ai/gateway/protocol#system-and-identity) |
+| `cron.status` | Return scheduler enabled state, store path, job count, and next wake time. | [Cron CLI](https://docs.openclaw.ai/cli/cron) |
+| `cron.list` | Return scheduled cron jobs, including disabled jobs when requested. | [Cron CLI](https://docs.openclaw.ai/cli/cron) |
 
 Response:
 
@@ -695,6 +714,22 @@ Response:
   "healthy": true,
   "modelPrimary": "openai/gpt-5.1",
   "enabledSkills": ["browser", "weather"],
+  "cronScheduler": {
+    "enabled": true,
+    "jobCount": 2,
+    "nextWakeAt": "2026-05-21T08:00:00.000Z",
+    "storePath": "/Users/me/.openclaw/cron/jobs.json"
+  },
+  "cronTasks": [
+    {
+      "id": "daily-brief",
+      "name": "Daily brief",
+      "enabled": true,
+      "agentId": "main",
+      "schedule": "cron 0 8 * * *",
+      "nextRunAt": "2026-05-21T08:00:00.000Z"
+    }
+  ],
   "hub53ai": {
     "enabled": true,
     "configured": true,
@@ -728,7 +763,7 @@ Backend:
 
 OpenClaw upstream:
 
-- `skills.status`。插件会先尝试读取运行时 skill/model 摘要，再推送本地 `buildStatusSnapshot()` 的结果；如果该 RPC 不可用，则回退到宿主 `openclaw.json`。
+- `skills.status`、`cron.status`、`cron.list`。插件会先尝试读取运行时 skill/model/cron 摘要，再推送本地 `buildStatusSnapshot()` 的结果；如果对应 RPC 不可用，则回退到宿主 `openclaw.json` 与本地 cron store。
 
 Message example:
 
@@ -739,7 +774,20 @@ Message example:
   "runningSessionCount": 2,
   "healthy": true,
   "modelPrimary": "qclaw/modelroute",
-  "enabledSkills": ["browser", "online-search"]
+  "enabledSkills": ["browser", "online-search"],
+  "cronScheduler": {
+    "enabled": true,
+    "jobCount": 1,
+    "nextWakeAt": "2026-05-21T08:00:00.000Z"
+  },
+  "cronTasks": [
+    {
+      "id": "daily-brief",
+      "name": "Daily brief",
+      "enabled": true,
+      "schedule": "cron 0 8 * * *"
+    }
+  ]
 }
 ```
 
@@ -764,6 +812,30 @@ OpenClaw 官方可选 RPC：
 
 - 当前插件已调用 `skills.status`，并对结果做 5 秒缓存，避免状态页高频刷新反复访问 Gateway。
 - `models.list` 仍未作为独立模型目录来源使用；如果之后需要展示完整模型目录、skill eligibility、缺失依赖、安装状态，可以继续扩展上述 Gateway RPC。
+
+### 7.4 Cron tasks
+
+当前实现：
+
+- [plugin/src/gateway-client.ts](./plugin/src/gateway-client.ts) 在 `getRuntimeInfo()` 中并行调用 `cron.status` 与 `cron.list`。
+- `cron.list` 参数固定包含 `{ "includeDisabled": true, "limit": 50 }`，这样状态页能同时展示启用和禁用的定时任务。
+- [plugin/src/console-server.ts](./plugin/src/console-server.ts) 将结果并入 `/api/status` 与 `/ws/status` 的 `cronScheduler`、`cronTasks` 字段。
+- [plugin/src/host.ts](./plugin/src/host.ts) 在运行时 RPC 失败时尝试读取 `cron/jobs.json`，作为本地回退。
+
+字段说明：
+
+| Field | Meaning |
+| --- | --- |
+| `cronScheduler.enabled` | Cron scheduler 是否启用。 |
+| `cronScheduler.jobCount` | Gateway 报告的 job 总数，缺失时使用已读取任务数量。 |
+| `cronScheduler.nextWakeAt` | 下一次唤醒时间，标准化为 ISO timestamp。 |
+| `cronScheduler.storePath` | 本地 cron store 路径；仅展示路径，不展示任务 payload secret。 |
+| `cronTasks[].id` | Cron job id。 |
+| `cronTasks[].name` | 用户可读任务名称。 |
+| `cronTasks[].enabled` | 当前任务是否启用。 |
+| `cronTasks[].schedule` | 人类可读 schedule 摘要，例如 `cron 0 8 * * *` 或 `every 1h`。 |
+| `cronTasks[].nextRunAt` | 下一次运行时间，标准化为 ISO timestamp。 |
+| `cronTasks[].lastRunAt` | 最近一次运行时间，标准化为 ISO timestamp。 |
 
 ## 8. Frontend Feature: 53AIHub Bridge Status
 
@@ -904,6 +976,8 @@ Bridge to OpenClaw upstream:
 | `session.tool` event | Tool call/result activity | `mapGatewayFrameToEvents()` in [plugin/src/gateway-client.ts](./plugin/src/gateway-client.ts) | [Common event families](https://docs.openclaw.ai/gateway/protocol#common-event-families) |
 | `sessions.changed` event | Run started/completed/status update | `mapGatewayFrameToEvents()` in [plugin/src/gateway-client.ts](./plugin/src/gateway-client.ts) | [Common event families](https://docs.openclaw.ai/gateway/protocol#common-event-families) |
 | `skills.status` | Runtime skill/model summary for status panel | `getRuntimeInfo()` in [plugin/src/gateway-client.ts](./plugin/src/gateway-client.ts) | [Operator helper methods](https://docs.openclaw.ai/gateway/protocol#operator-helper-methods) |
+| `cron.status` | Runtime cron scheduler summary for status panel | `getRuntimeInfo()` in [plugin/src/gateway-client.ts](./plugin/src/gateway-client.ts) | [Cron CLI](https://docs.openclaw.ai/cli/cron) |
+| `cron.list` | Runtime cron job list for status panel | `getRuntimeInfo()` in [plugin/src/gateway-client.ts](./plugin/src/gateway-client.ts) | [Cron CLI](https://docs.openclaw.ai/cli/cron) |
 | `models.list` | Not currently called as a standalone model catalog source | N/A | [Models and usage](https://docs.openclaw.ai/gateway/protocol#models-and-usage) |
 | `tools.effective` | Not currently called; recommended future source for session-scoped tool inventory | N/A | [Operator helper methods](https://docs.openclaw.ai/gateway/protocol#operator-helper-methods) |
 | `status` | Not currently called; optional future Gateway status source | N/A | [System and identity](https://docs.openclaw.ai/gateway/protocol#system-and-identity) |
@@ -973,6 +1047,24 @@ type PluginStatusSnapshot = {
   healthy: boolean;
   modelPrimary?: string;
   enabledSkills?: string[];
+  cronScheduler?: {
+    enabled?: boolean;
+    storePath?: string;
+    jobCount?: number;
+    nextWakeAt?: string;
+    lastError?: string;
+  };
+  cronTasks?: Array<{
+    id: string;
+    name: string;
+    enabled: boolean;
+    status?: string;
+    agentId?: string;
+    schedule?: string;
+    nextRunAt?: string;
+    lastRunAt?: string;
+    payloadKind?: string;
+  }>;
   hub53ai?: Hub53AIStatusSnapshot;
 };
 ```
@@ -1153,5 +1245,6 @@ npx wscat -c ws://127.0.0.1:4318/ws/status
 3. UI disconnects do not stop a Claw run; they only drop the browser subscription.
 4. Session history and events are persisted locally in JSON/JSONL-style plugin state.
 5. `modelPrimary` and `enabledSkills` prefer runtime `skills.status`, then fall back to `openclaw.json`.
-6. 53AIHub protocol is company-specific and separate from OpenClaw Gateway Protocol.
-7. Secrets are never returned in `/api/bootstrap`, `/api/config`, `/api/status`, or frontend state.
+6. `cronScheduler` and `cronTasks` prefer runtime `cron.status` / `cron.list`, then fall back to local cron store when readable.
+7. 53AIHub protocol is company-specific and separate from OpenClaw Gateway Protocol.
+8. Secrets are never returned in `/api/bootstrap`, `/api/config`, `/api/status`, or frontend state.

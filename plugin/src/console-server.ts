@@ -52,6 +52,8 @@ type StatusSnapshot = {
   healthy: boolean;
   modelPrimary?: string;
   enabledSkills: string[];
+  cronScheduler?: GatewayRuntimeInfo["cronScheduler"];
+  cronTasks?: NonNullable<GatewayRuntimeInfo["cronTasks"]>;
   hub53ai?: Hub53AIStatusSnapshot;
   agentEvents?: AgentEventProbeSnapshot;
 };
@@ -588,6 +590,8 @@ export function createConsoleServer(input: CreateConsoleServerInput) {
     const sessions = store.listSessions();
     const runtimeInfo = getRuntimeInfoSnapshot();
     const runtimeSkills = runtimeInfo.enabledSkills.filter((skill) => skill.trim());
+    const runtimeCronTasks = runtimeInfo.cronTasks;
+    const cronTasks = runtimeCronTasks ?? hostRuntime.cronTasks ?? [];
     return {
       hostKind: input.hostKind,
       stateDir: input.stateDir,
@@ -602,6 +606,8 @@ export function createConsoleServer(input: CreateConsoleServerInput) {
       healthy: lastGatewayError === null,
       modelPrimary: runtimeInfo.modelPrimary ?? hostRuntime.modelPrimary,
       enabledSkills: runtimeSkills.length ? runtimeSkills : hostRuntime.enabledSkills,
+      cronScheduler: runtimeInfo.cronScheduler ?? hostRuntime.cronScheduler,
+      cronTasks,
       hub53ai: hub53ai?.getStatus(),
       agentEvents: input.agentEventProbe?.getSnapshot()
     };

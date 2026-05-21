@@ -476,7 +476,21 @@ describe("console server", () => {
     const gateway = new FakeGateway();
     gateway.runtimeInfo = {
       modelPrimary: "runtime/model",
-      enabledSkills: ["weather", "web_search"]
+      enabledSkills: ["weather", "web_search"],
+      cronScheduler: {
+        enabled: true,
+        jobCount: 1,
+        nextWakeAt: "2026-05-21T08:00:00.000Z"
+      },
+      cronTasks: [
+        {
+          id: "cron-1",
+          name: "Morning brief",
+          enabled: true,
+          schedule: "cron 0 8 * * *",
+          nextRunAt: "2026-05-21T08:00:00.000Z"
+        }
+      ]
     };
     const server = createConsoleServer({
       stateDir,
@@ -505,18 +519,38 @@ describe("console server", () => {
         status: {
           modelPrimary?: string;
           enabledSkills?: string[];
+          cronScheduler?: { enabled?: boolean; jobCount?: number; nextWakeAt?: string };
+          cronTasks?: Array<{ id: string; name: string; enabled: boolean; schedule?: string }>;
         };
       }>(`${server.baseUrl}/api/bootstrap`);
       expect(bootstrap.status.modelPrimary).toBe("runtime/model");
       expect(bootstrap.status.enabledSkills).toEqual(["weather", "web_search"]);
+      expect(bootstrap.status.cronScheduler).toMatchObject({
+        enabled: true,
+        jobCount: 1,
+        nextWakeAt: "2026-05-21T08:00:00.000Z"
+      });
+      expect(bootstrap.status.cronTasks).toEqual([
+        {
+          id: "cron-1",
+          name: "Morning brief",
+          enabled: true,
+          schedule: "cron 0 8 * * *",
+          nextRunAt: "2026-05-21T08:00:00.000Z"
+        }
+      ]);
 
       gateway.runtimeInfoError = new Error("skills.status unsupported");
       const status = await fetchJson<{
         modelPrimary?: string;
         enabledSkills?: string[];
+        cronScheduler?: { enabled?: boolean; jobCount?: number; nextWakeAt?: string };
+        cronTasks?: Array<{ id: string; name: string; enabled: boolean; schedule?: string }>;
       }>(`${server.baseUrl}/api/status`);
       expect(status.modelPrimary).toBe("runtime/model");
       expect(status.enabledSkills).toEqual(["weather", "web_search"]);
+      expect(status.cronScheduler?.jobCount).toBe(1);
+      expect(status.cronTasks?.[0]?.name).toBe("Morning brief");
     } finally {
       await server.stop();
     }
@@ -590,14 +624,19 @@ class FakeGateway {
   private messageHistory = new Map<string, Array<{ id: string; sessionId: string; role: string; content: string; createdAt: string }>>();
   private eventHistory = new Map<string, GatewayEvent[]>();
   private listeners = new Map<string, Set<(event: GatewayEvent) => void>>();
-  runtimeInfo?: { modelPrimary?: string; enabledSkills: string[] };
+  runtimeInfo?: {
+    modelPrimary?: string;
+    enabledSkills: string[];
+    cronScheduler?: { enabled?: boolean; jobCount?: number; nextWakeAt?: string };
+    cronTasks?: Array<{ id: string; name: string; enabled: boolean; schedule?: string; nextRunAt?: string }>;
+  };
   runtimeInfoError?: Error;
 
   async listSessions(): Promise<GatewaySession[]> {
     return [...this.sessions.values()];
   }
 
-  async getRuntimeInfo(): Promise<{ modelPrimary?: string; enabledSkills: string[] }> {
+  async getRuntimeInfo(): Promise<NonNullable<FakeGateway["runtimeInfo"]>> {
     if (this.runtimeInfoError) {
       throw this.runtimeInfoError;
     }

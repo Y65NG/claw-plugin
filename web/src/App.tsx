@@ -508,6 +508,22 @@ export function App() {
                 {status?.enabledSkills?.length ? status.enabledSkills.join(", ") : "None detected"}
               </span>
             </div>
+            <div className="stat-card stat-card-wide cron-card">
+              <span className="stat-label">Cron tasks</span>
+              <span className="stat-value stat-value-compact">{formatCronStatus(status)}</span>
+              {status?.cronTasks?.length ? (
+                <div className="cron-task-list">
+                  {status.cronTasks.slice(0, 5).map((task) => (
+                    <div key={task.id} className={`cron-task ${task.enabled ? "is-enabled" : "is-disabled"}`}>
+                      <span className="cron-task-name">{task.name}</span>
+                      <span className="cron-task-meta">{formatCronTaskMeta(task)}</span>
+                    </div>
+                  ))}
+                </div>
+              ) : (
+                <span className="cron-empty">No cron tasks detected</span>
+              )}
+            </div>
             <div className="stat-card stat-card-wide">
               <span className="stat-label">53AIHub</span>
               <span className="stat-value stat-value-compact">
@@ -1539,6 +1555,30 @@ function formatEventPayload(payload: Record<string, unknown>): string {
   } catch {
     return String(payload);
   }
+}
+
+function formatCronStatus(status: PluginStatusSnapshot | null): string {
+  const count = status?.cronScheduler?.jobCount ?? status?.cronTasks?.length ?? 0;
+  const prefix = status?.cronScheduler?.enabled === false ? "disabled · " : "";
+  const nextWake = status?.cronScheduler?.nextWakeAt ? ` · next ${formatUpdatedAt(status.cronScheduler.nextWakeAt)}` : "";
+  return `${prefix}${count} ${count === 1 ? "job" : "jobs"}${nextWake}`;
+}
+
+function formatCronTaskMeta(task: NonNullable<PluginStatusSnapshot["cronTasks"]>[number]): string {
+  const parts = [];
+  if (!task.enabled) {
+    parts.push("disabled");
+  }
+  if (task.schedule) {
+    parts.push(task.schedule);
+  }
+  if (task.nextRunAt) {
+    parts.push(`next ${formatUpdatedAt(task.nextRunAt)}`);
+  }
+  if (task.agentId) {
+    parts.push(task.agentId);
+  }
+  return parts.join(" · ") || task.status || task.payloadKind || "No schedule details";
 }
 
 function formatUpdatedAt(value: string): string {

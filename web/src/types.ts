@@ -53,7 +53,29 @@ export type PluginStatusSnapshot = {
   healthy: boolean;
   modelPrimary?: string;
   enabledSkills?: string[];
+  cronScheduler?: CronSchedulerSnapshot;
+  cronTasks?: CronTaskSummary[];
   hub53ai?: Hub53AIStatusSnapshot;
+};
+
+export type CronSchedulerSnapshot = {
+  enabled?: boolean;
+  storePath?: string;
+  jobCount?: number;
+  nextWakeAt?: string;
+  lastError?: string;
+};
+
+export type CronTaskSummary = {
+  id: string;
+  name: string;
+  enabled: boolean;
+  status?: string;
+  agentId?: string;
+  schedule?: string;
+  nextRunAt?: string;
+  lastRunAt?: string;
+  payloadKind?: string;
 };
 
 export type RunnerConfig = {

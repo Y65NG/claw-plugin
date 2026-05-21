@@ -506,6 +506,44 @@ button {
   word-break: break-word;
 }
 
+.cron-card {
+  display: grid;
+  gap: 8px;
+}
+
+.cron-task-list {
+  display: grid;
+  gap: 7px;
+}
+
+.cron-task {
+  display: grid;
+  gap: 3px;
+  padding: 8px 9px;
+  border: 1px solid #eef1f4;
+  border-radius: 11px;
+  background: #f8f9fa;
+}
+
+.cron-task.is-disabled {
+  opacity: 0.68;
+}
+
+.cron-task-name {
+  color: #333c49;
+  font-size: 0.78rem;
+  font-weight: 700;
+  overflow-wrap: anywhere;
+}
+
+.cron-task-meta,
+.cron-empty {
+  color: #8793a1;
+  font-size: 0.71rem;
+  line-height: 1.38;
+  overflow-wrap: anywhere;
+}
+
 .config-card details {
   margin-top: 10px;
 }

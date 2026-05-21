@@ -22,9 +22,29 @@ export type GatewayConfig = {
 
 export type GatewaySession = SessionSummary;
 export type GatewayEvent = TimelineEvent;
+export type GatewayCronScheduler = {
+  enabled?: boolean;
+  storePath?: string;
+  jobCount?: number;
+  nextWakeAt?: string;
+  lastError?: string;
+};
+export type GatewayCronTask = {
+  id: string;
+  name: string;
+  enabled: boolean;
+  status?: string;
+  agentId?: string;
+  schedule?: string;
+  nextRunAt?: string;
+  lastRunAt?: string;
+  payloadKind?: string;
+};
 export type GatewayRuntimeInfo = {
   modelPrimary?: string;
   enabledSkills: string[];
+  cronScheduler?: GatewayCronScheduler;
+  cronTasks?: GatewayCronTask[];
 };
 
 type GatewayFrame =
@@ -156,14 +176,11 @@ export function createGatewayClient(config: Partial<GatewayConfig>): GatewayClie
 
   return {
     async getRuntimeInfo() {
-      try {
-        const payload = await transport.request("skills.status", { agentId: "main" }, { timeoutMs: 2_000 });
-        return extractRuntimeInfo(payload);
-      } catch {
-        return {
-          enabledSkills: []
-        };
-      }
+      const [runtimeInfo, cronInfo] = await Promise.all([readRuntimeInfo(transport), readCronInfo(transport)]);
+      return {
+        ...runtimeInfo,
+        ...cronInfo
+      };
     },
     async listSessions(limit = 50) {
       const payload = await transport.request("sessions.list", {
@@ -1186,6 +1203,39 @@ function extractSessions(payload: unknown, hostKind = "openclaw"): GatewaySessio
   return sessions.map((session) => normalizeSession(session, "Untitled session", hostKind));
 }
 
+async function readRuntimeInfo(transport: RpcTransport): Promise<GatewayRuntimeInfo> {
+  try {
+    const payload = await transport.request("skills.status", { agentId: "main" }, { timeoutMs: 2_000 });
+    return extractRuntimeInfo(payload);
+  } catch {
+    return {
+      enabledSkills: []
+    };
+  }
+}
+
+async function readCronInfo(
+  transport: RpcTransport
+): Promise<Pick<GatewayRuntimeInfo, "cronScheduler" | "cronTasks">> {
+  const [statusResult, listResult] = await Promise.allSettled([
+    transport.request("cron.status", {}, { timeoutMs: 2_000 }),
+    transport.request("cron.list", { includeDisabled: true, limit: 50 }, { timeoutMs: 2_000 })
+  ]);
+  const statusPayload = statusResult.status === "fulfilled" ? statusResult.value : undefined;
+  const listPayload = listResult.status === "fulfilled" ? listResult.value : undefined;
+
+  if (!statusPayload && !listPayload) {
+    return {};
+  }
+
+  const cronTasks = extractCronTasks(listPayload);
+  const cronScheduler = extractCronScheduler(statusPayload, listPayload, cronTasks.length);
+  return {
+    ...(cronScheduler ? { cronScheduler } : {}),
+    cronTasks
+  };
+}
+
 function extractRuntimeInfo(payload: unknown): GatewayRuntimeInfo {
   const record = toRecord(payload);
   const modelPrimary =
@@ -1203,6 +1253,170 @@ function extractRuntimeInfo(payload: unknown): GatewayRuntimeInfo {
     ...(modelPrimary ? { modelPrimary } : {}),
     enabledSkills
   };
+}
+
+function extractCronScheduler(
+  statusPayload: unknown,
+  listPayload: unknown,
+  observedTaskCount: number
+): GatewayCronScheduler | undefined {
+  const status = toRecord(statusPayload);
+  const list = toRecord(listPayload);
+  const enabled =
+    booleanProperty(status, ["enabled", "running"]) ??
+    booleanProperty(status, ["schedulerEnabled"]) ??
+    booleanProperty(list, ["enabled"]);
+  const storePath =
+    stringProperty(status, ["storePath", "path"]) ??
+    readStringFromUnknown(status, ["store", "path"]) ??
+    readStringFromUnknown(list, ["store", "path"]);
+  const jobCount =
+    numberProperty(status, ["jobCount", "jobs", "count", "total"]) ??
+    numberProperty(list, ["total", "count", "jobCount"]) ??
+    observedTaskCount;
+  const nextWakeAt =
+    optionalIsoString(readUnknownPath(status, ["nextWakeAt"])) ??
+    optionalIsoString(readUnknownPath(status, ["nextWakeAtMs"])) ??
+    optionalIsoString(readUnknownPath(status, ["nextRunAt"])) ??
+    optionalIsoString(readUnknownPath(status, ["nextRunAtMs"]));
+  const lastError =
+    readStringFromUnknown(status, ["lastError"]) ??
+    readStringFromUnknown(status, ["error"]) ??
+    readStringFromUnknown(list, ["error"]);
+
+  if (
+    enabled === undefined &&
+    !storePath &&
+    jobCount === undefined &&
+    !nextWakeAt &&
+    !lastError &&
+    observedTaskCount === 0
+  ) {
+    return undefined;
+  }
+
+  return {
+    ...(enabled !== undefined ? { enabled } : {}),
+    ...(storePath ? { storePath } : {}),
+    ...(jobCount !== undefined ? { jobCount } : {}),
+    ...(nextWakeAt ? { nextWakeAt } : {}),
+    ...(lastError ? { lastError } : {})
+  };
+}
+
+function extractCronTasks(payload: unknown): GatewayCronTask[] {
+  const jobs = readCronJobArray(payload);
+  return jobs.map((job, index) => normalizeCronTask(job, index));
+}
+
+function readCronJobArray(payload: unknown): unknown[] {
+  const record = toRecord(payload);
+  const candidates = [
+    record.jobs,
+    record.tasks,
+    record.items,
+    readUnknownPath(record, ["data", "jobs"]),
+    readUnknownPath(record, ["data", "tasks"]),
+    Array.isArray(payload) ? payload : undefined
+  ];
+  for (const candidate of candidates) {
+    if (Array.isArray(candidate)) {
+      return candidate;
+    }
+  }
+  return [];
+}
+
+function normalizeCronTask(raw: unknown, index: number): GatewayCronTask {
+  const job = toRecord(raw);
+  const id = stringProperty(job, ["id", "jobId", "key", "name"]) ?? `cron-${index + 1}`;
+  const name = stringProperty(job, ["name", "title", "description"]) ?? id;
+  const status = stringProperty(job, ["status", "state"]);
+  const enabled = booleanProperty(job, ["enabled"]) ?? status?.toLowerCase() !== "disabled";
+  const agentId = stringProperty(job, ["agentId", "agent", "owner"]);
+  const schedule = formatCronSchedule(job.schedule ?? job.cron ?? job.expr ?? job.everyMs ?? job.at ?? job.atMs);
+  const nextRunAt =
+    optionalIsoString(readUnknownPath(job, ["nextRunAt"])) ??
+    optionalIsoString(readUnknownPath(job, ["nextRunAtMs"])) ??
+    optionalIsoString(readUnknownPath(job, ["nextAt"])) ??
+    optionalIsoString(readUnknownPath(job, ["nextAtMs"])) ??
+    optionalIsoString(readUnknownPath(job, ["nextWakeAtMs"]));
+  const lastRunAt =
+    optionalIsoString(readUnknownPath(job, ["lastRunAt"])) ??
+    optionalIsoString(readUnknownPath(job, ["lastRunAtMs"])) ??
+    optionalIsoString(readUnknownPath(job, ["lastAt"])) ??
+    optionalIsoString(readUnknownPath(job, ["lastAtMs"]));
+  const payloadKind =
+    readStringFromUnknown(job, ["payloadKind"]) ??
+    readStringFromUnknown(job, ["payload", "kind"]) ??
+    readStringFromUnknown(job, ["task", "kind"]);
+
+  return {
+    id,
+    name,
+    enabled,
+    ...(status ? { status } : {}),
+    ...(agentId ? { agentId } : {}),
+    ...(schedule ? { schedule } : {}),
+    ...(nextRunAt ? { nextRunAt } : {}),
+    ...(lastRunAt ? { lastRunAt } : {}),
+    ...(payloadKind ? { payloadKind } : {})
+  };
+}
+
+function formatCronSchedule(value: unknown): string | undefined {
+  if (typeof value === "string" && value.trim()) {
+    return value.trim();
+  }
+  if (typeof value === "number" && Number.isFinite(value) && value > 0) {
+    return `every ${formatDurationMs(value)}`;
+  }
+  if (!value || typeof value !== "object") {
+    return undefined;
+  }
+
+  const schedule = value as Record<string, unknown>;
+  const kind = stringProperty(schedule, ["kind", "type"]);
+  if (kind === "cron") {
+    const expr = stringProperty(schedule, ["expr", "cron", "expression"]);
+    const timezone = stringProperty(schedule, ["timezone", "timeZone", "tz"]);
+    return [`cron${expr ? ` ${expr}` : ""}`, timezone].filter(Boolean).join(" · ");
+  }
+  if (kind === "every") {
+    const everyMs = numberProperty(schedule, ["everyMs", "intervalMs", "ms"]);
+    return everyMs ? `every ${formatDurationMs(everyMs)}` : "every";
+  }
+  if (kind === "at") {
+    const at = optionalIsoString(schedule.at ?? schedule.atMs);
+    return at ? `at ${at}` : "at";
+  }
+
+  const expr = stringProperty(schedule, ["expr", "cron", "expression"]);
+  if (expr) {
+    return expr;
+  }
+  const everyMs = numberProperty(schedule, ["everyMs", "intervalMs", "ms"]);
+  if (everyMs) {
+    return `every ${formatDurationMs(everyMs)}`;
+  }
+  const at = optionalIsoString(schedule.at ?? schedule.atMs);
+  return at ? `at ${at}` : undefined;
+}
+
+function formatDurationMs(value: number): string {
+  if (value % 86_400_000 === 0) {
+    return `${value / 86_400_000}d`;
+  }
+  if (value % 3_600_000 === 0) {
+    return `${value / 3_600_000}h`;
+  }
+  if (value % 60_000 === 0) {
+    return `${value / 60_000}m`;
+  }
+  if (value % 1_000 === 0) {
+    return `${value / 1_000}s`;
+  }
+  return `${value}ms`;
 }
 
 function collectRuntimeSkills(value: unknown): string[] {
@@ -1282,6 +1496,32 @@ function stringProperty(record: Record<string, unknown>, keys: string[]): string
     const value = record[key];
     if (typeof value === "string" && value.trim()) {
       return value.trim();
+    }
+  }
+  return undefined;
+}
+
+function numberProperty(record: Record<string, unknown>, keys: string[]): number | undefined {
+  for (const key of keys) {
+    const value = record[key];
+    if (typeof value === "number" && Number.isFinite(value)) {
+      return value;
+    }
+    if (typeof value === "string" && value.trim()) {
+      const parsed = Number(value);
+      if (Number.isFinite(parsed)) {
+        return parsed;
+      }
+    }
+  }
+  return undefined;
+}
+
+function booleanProperty(record: Record<string, unknown>, keys: string[]): boolean | undefined {
+  for (const key of keys) {
+    const value = record[key];
+    if (typeof value === "boolean") {
+      return value;
     }
   }
   return undefined;
@@ -1928,6 +2168,23 @@ function toIsoString(value: unknown): string {
     }
   }
   return new Date().toISOString();
+}
+
+function optionalIsoString(value: unknown): string | undefined {
+  if (typeof value === "number" && Number.isFinite(value)) {
+    return new Date(value).toISOString();
+  }
+  if (typeof value === "string" && value.trim()) {
+    const asNumber = Number(value);
+    if (Number.isFinite(asNumber)) {
+      return new Date(asNumber).toISOString();
+    }
+    const date = new Date(value);
+    if (!Number.isNaN(date.getTime())) {
+      return date.toISOString();
+    }
+  }
+  return undefined;
 }
 
 function fallbackSession(sessionId: string, hostKind = "openclaw"): GatewaySession {

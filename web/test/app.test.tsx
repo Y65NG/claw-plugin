@@ -530,7 +530,27 @@ describe("App", () => {
             runningSessionCount: 0,
             healthy: true,
             modelPrimary: "qclaw/modelroute",
-            enabledSkills: ["browser", "online-search"]
+            enabledSkills: ["browser", "online-search"],
+            cronScheduler: {
+              enabled: true,
+              jobCount: 2,
+              nextWakeAt: "2026-05-21T08:00:00.000Z"
+            },
+            cronTasks: [
+              {
+                id: "cron-1",
+                name: "Morning brief",
+                enabled: true,
+                schedule: "cron 0 8 * * *",
+                nextRunAt: "2026-05-21T08:00:00.000Z"
+              },
+              {
+                id: "cron-2",
+                name: "Hourly inbox scan",
+                enabled: false,
+                schedule: "every 60m"
+              }
+            ]
           },
           config: {
             gateway: {},
@@ -701,6 +721,12 @@ describe("App", () => {
       expect(screen.getByText("qclaw/modelroute")).toBeInTheDocument();
       expect(screen.getByText("Enabled skills")).toBeInTheDocument();
       expect(screen.getByText("browser, online-search")).toBeInTheDocument();
+      expect(sidebar.getByText("Cron tasks")).toBeInTheDocument();
+      expect(sidebar.getByText("2 jobs · next 5/21, 4:00 PM")).toBeInTheDocument();
+      expect(sidebar.getByText("Morning brief")).toBeInTheDocument();
+      expect(sidebar.getByText("cron 0 8 * * * · next 5/21, 4:00 PM")).toBeInTheDocument();
+      expect(sidebar.getByText("Hourly inbox scan")).toBeInTheDocument();
+      expect(sidebar.getByText("disabled · every 60m")).toBeInTheDocument();
       expect(conversation.getByText("Inspected skill weather")).toBeInTheDocument();
       expect(conversation.getByText("Used Weather")).toBeInTheDocument();
       expect(conversation.getByText("Model reasoning")).toBeInTheDocument();

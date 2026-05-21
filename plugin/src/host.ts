@@ -2,7 +2,7 @@ export type HostKind = "openclaw" | "qclaw";
 
 import { existsSync, readFileSync } from "node:fs";
 import { homedir } from "node:os";
-import { join } from "node:path";
+import { dirname, join } from "node:path";
 
 export type PluginConfig = {
   gateway?: {
@@ -77,6 +77,24 @@ export type ResolvedPluginConfig = {
 export type HostRuntimeInfo = {
   modelPrimary?: string;
   enabledSkills: string[];
+  cronScheduler?: {
+    enabled?: boolean;
+    storePath?: string;
+    jobCount?: number;
+    nextWakeAt?: string;
+    lastError?: string;
+  };
+  cronTasks?: Array<{
+    id: string;
+    name: string;
+    enabled: boolean;
+    status?: string;
+    agentId?: string;
+    schedule?: string;
+    nextRunAt?: string;
+    lastRunAt?: string;
+    payloadKind?: string;
+  }>;
 };
 
 const SENSITIVE_KEY_PATTERN = /(token|secret|password|key|credential)/i;
@@ -193,15 +211,190 @@ export function readHostRuntimeInfo(configPath: string): HostRuntimeInfo {
       .map(([skillName]) => skillName)
       .sort((left, right) => left.localeCompare(right));
 
+    const cronInfo = readHostCronInfo(resolvedPath);
+
     return {
       modelPrimary,
-      enabledSkills
+      enabledSkills,
+      ...cronInfo
     };
   } catch {
     return {
       enabledSkills: []
     };
   }
+}
+
+function readHostCronInfo(configPath: string): Pick<HostRuntimeInfo, "cronScheduler" | "cronTasks"> {
+  const cronPath = resolveHostCronPath(configPath);
+  if (!cronPath) {
+    return {};
+  }
+
+  try {
+    const raw = readFileSync(cronPath, "utf8");
+    const parsed = JSON.parse(raw) as {
+      jobs?: unknown[];
+      tasks?: unknown[];
+    };
+    const jobs = Array.isArray(parsed.jobs) ? parsed.jobs : Array.isArray(parsed.tasks) ? parsed.tasks : [];
+    const cronTasks = jobs.map((job, index) => normalizeHostCronTask(job, index));
+    return {
+      cronScheduler: {
+        enabled: true,
+        storePath: cronPath,
+        jobCount: cronTasks.length
+      },
+      cronTasks
+    };
+  } catch {
+    return {};
+  }
+}
+
+function resolveHostCronPath(configPath: string): string | undefined {
+  const configDir = dirname(configPath);
+  const candidates = [
+    join(configDir, "cron", "jobs.json"),
+    join(dirname(configDir), "cron", "jobs.json"),
+    join(homedir(), ".openclaw", "cron", "jobs.json"),
+    join(homedir(), ".qclaw", "cron", "jobs.json")
+  ];
+  return candidates.find((candidate) => existsSync(candidate));
+}
+
+function normalizeHostCronTask(raw: unknown, index: number): NonNullable<HostRuntimeInfo["cronTasks"]>[number] {
+  const job = raw && typeof raw === "object" ? (raw as Record<string, unknown>) : {};
+  const id = readString(job, ["id", "jobId", "key", "name"]) ?? `cron-${index + 1}`;
+  const name = readString(job, ["name", "title", "description"]) ?? id;
+  const status = readString(job, ["status", "state"]);
+  const enabled = typeof job.enabled === "boolean" ? job.enabled : status?.toLowerCase() !== "disabled";
+  const agentId = readString(job, ["agentId", "agent", "owner"]);
+  const schedule = formatHostCronSchedule(job.schedule ?? job.cron ?? job.expr ?? job.everyMs ?? job.at ?? job.atMs);
+  const nextRunAt = optionalIsoString(job.nextRunAt ?? job.nextRunAtMs ?? job.nextAt ?? job.nextAtMs);
+  const lastRunAt = optionalIsoString(job.lastRunAt ?? job.lastRunAtMs ?? job.lastAt ?? job.lastAtMs);
+  const payloadKind = readString(job, ["payloadKind"]) ?? readNestedString(job, ["payload", "kind"]);
+
+  return {
+    id,
+    name,
+    enabled,
+    ...(status ? { status } : {}),
+    ...(agentId ? { agentId } : {}),
+    ...(schedule ? { schedule } : {}),
+    ...(nextRunAt ? { nextRunAt } : {}),
+    ...(lastRunAt ? { lastRunAt } : {}),
+    ...(payloadKind ? { payloadKind } : {})
+  };
+}
+
+function formatHostCronSchedule(value: unknown): string | undefined {
+  if (typeof value === "string" && value.trim()) {
+    return value.trim();
+  }
+  if (typeof value === "number" && Number.isFinite(value) && value > 0) {
+    return `every ${formatDurationMs(value)}`;
+  }
+  if (!value || typeof value !== "object") {
+    return undefined;
+  }
+
+  const schedule = value as Record<string, unknown>;
+  const kind = readString(schedule, ["kind", "type"]);
+  if (kind === "cron") {
+    const expr = readString(schedule, ["expr", "cron", "expression"]);
+    const timezone = readString(schedule, ["timezone", "timeZone", "tz"]);
+    return [`cron${expr ? ` ${expr}` : ""}`, timezone].filter(Boolean).join(" · ");
+  }
+  if (kind === "every") {
+    const everyMs = readNumber(schedule, ["everyMs", "intervalMs", "ms"]);
+    return everyMs ? `every ${formatDurationMs(everyMs)}` : "every";
+  }
+  if (kind === "at") {
+    const at = optionalIsoString(schedule.at ?? schedule.atMs);
+    return at ? `at ${at}` : "at";
+  }
+
+  const expr = readString(schedule, ["expr", "cron", "expression"]);
+  if (expr) {
+    return expr;
+  }
+  const everyMs = readNumber(schedule, ["everyMs", "intervalMs", "ms"]);
+  if (everyMs) {
+    return `every ${formatDurationMs(everyMs)}`;
+  }
+  const at = optionalIsoString(schedule.at ?? schedule.atMs);
+  return at ? `at ${at}` : undefined;
+}
+
+function readString(record: Record<string, unknown>, keys: string[]): string | undefined {
+  for (const key of keys) {
+    const value = record[key];
+    if (typeof value === "string" && value.trim()) {
+      return value.trim();
+    }
+  }
+  return undefined;
+}
+
+function readNestedString(record: Record<string, unknown>, path: string[]): string | undefined {
+  let current: unknown = record;
+  for (const segment of path) {
+    if (!current || typeof current !== "object" || !(segment in current)) {
+      return undefined;
+    }
+    current = (current as Record<string, unknown>)[segment];
+  }
+  return typeof current === "string" && current.trim() ? current.trim() : undefined;
+}
+
+function readNumber(record: Record<string, unknown>, keys: string[]): number | undefined {
+  for (const key of keys) {
+    const value = record[key];
+    if (typeof value === "number" && Number.isFinite(value)) {
+      return value;
+    }
+    if (typeof value === "string" && value.trim()) {
+      const parsed = Number(value);
+      if (Number.isFinite(parsed)) {
+        return parsed;
+      }
+    }
+  }
+  return undefined;
+}
+
+function optionalIsoString(value: unknown): string | undefined {
+  if (typeof value === "number" && Number.isFinite(value)) {
+    return new Date(value).toISOString();
+  }
+  if (typeof value === "string" && value.trim()) {
+    const asNumber = Number(value);
+    if (Number.isFinite(asNumber)) {
+      return new Date(asNumber).toISOString();
+    }
+    const date = new Date(value);
+    if (!Number.isNaN(date.getTime())) {
+      return date.toISOString();
+    }
+  }
+  return undefined;
+}
+
+function formatDurationMs(value: number): string {
+  if (value % 86_400_000 === 0) {
+    return `${value / 86_400_000}d`;
+  }
+  if (value % 3_600_000 === 0) {
+    return `${value / 3_600_000}h`;
+  }
+  if (value % 60_000 === 0) {
+    return `${value / 60_000}m`;
+  }
+  if (value % 1_000 === 0) {
+    return `${value / 1_000}s`;
+  }
+  return `${value}ms`;
 }
 
 function readHostGatewayConfig(configPath: string): {
