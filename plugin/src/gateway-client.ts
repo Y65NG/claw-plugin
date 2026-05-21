@@ -111,6 +111,8 @@ type SessionSubscription = {
 const DEFAULT_SCOPES = ["operator.read", "operator.write"];
 const MAX_DELTA_CHUNK_CHARS = 240;
 const MIN_DELTA_CHUNK_CHARS = 80;
+const CRON_LIST_PAGE_LIMIT = 50;
+const CRON_LIST_MAX_PAGES = 100;
 
 type RpcTransport = {
   request(method: string, params: Record<string, unknown>, options?: GatewayRequestOptions): Promise<any>;
@@ -1219,7 +1221,7 @@ async function readCronInfo(
 ): Promise<Pick<GatewayRuntimeInfo, "cronScheduler" | "cronTasks">> {
   const [statusResult, listResult] = await Promise.allSettled([
     transport.request("cron.status", {}, { timeoutMs: 2_000 }),
-    transport.request("cron.list", { includeDisabled: true, limit: 50 }, { timeoutMs: 2_000 })
+    readCronListPages(transport)
   ]);
   const statusPayload = statusResult.status === "fulfilled" ? statusResult.value : undefined;
   const listPayload = listResult.status === "fulfilled" ? listResult.value : undefined;
@@ -1233,6 +1235,51 @@ async function readCronInfo(
   return {
     ...(cronScheduler ? { cronScheduler } : {}),
     cronTasks
+  };
+}
+
+async function readCronListPages(transport: RpcTransport): Promise<unknown> {
+  const jobs: unknown[] = [];
+  let offset = 0;
+  let lastPayload: unknown = undefined;
+
+  for (let page = 0; page < CRON_LIST_MAX_PAGES; page += 1) {
+    const payload = await transport.request(
+      "cron.list",
+      {
+        includeDisabled: true,
+        limit: CRON_LIST_PAGE_LIMIT,
+        offset
+      },
+      { timeoutMs: 2_000 }
+    );
+    lastPayload = payload;
+
+    const pageJobs = readCronJobArray(payload);
+    jobs.push(...pageJobs);
+
+    const record = toRecord(payload);
+    const nextOffset = numberProperty(record, ["nextOffset"]);
+    const total = numberProperty(record, ["total", "count"]);
+    const hasMore = booleanProperty(record, ["hasMore"]) ?? (total !== undefined && jobs.length < total);
+
+    if (!hasMore) {
+      break;
+    }
+    if (nextOffset !== undefined && nextOffset > offset) {
+      offset = nextOffset;
+      continue;
+    }
+    if (pageJobs.length > 0) {
+      offset += pageJobs.length;
+      continue;
+    }
+    break;
+  }
+
+  return {
+    ...toRecord(lastPayload),
+    jobs
   };
 }
 

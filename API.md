@@ -818,7 +818,8 @@ OpenClaw 官方可选 RPC：
 当前实现：
 
 - [plugin/src/gateway-client.ts](./plugin/src/gateway-client.ts) 在 `getRuntimeInfo()` 中并行调用 `cron.status` 与 `cron.list`。
-- `cron.list` 参数固定包含 `{ "includeDisabled": true, "limit": 50 }`，这样状态页能同时展示启用和禁用的定时任务。
+- `cron.list` 按页读取；每页参数包含 `{ "includeDisabled": true, "limit": 50, "offset": <offset> }`，并根据 `hasMore`、`nextOffset`、`total` 继续补拉后续页面。
+- 为避免上游分页游标异常造成无限循环，客户端会在分页没有推进时停止，并设置了一个高水位页数保护。
 - [plugin/src/console-server.ts](./plugin/src/console-server.ts) 将结果并入 `/api/status` 与 `/ws/status` 的 `cronScheduler`、`cronTasks` 字段。
 - [plugin/src/host.ts](./plugin/src/host.ts) 在运行时 RPC 失败时尝试读取 `cron/jobs.json`，作为本地回退。
 
@@ -1248,3 +1249,17 @@ npx wscat -c ws://127.0.0.1:4318/ws/status
 6. `cronScheduler` and `cronTasks` prefer runtime `cron.status` / `cron.list`, then fall back to local cron store when readable.
 7. 53AIHub protocol is company-specific and separate from OpenClaw Gateway Protocol.
 8. Secrets are never returned in `/api/bootstrap`, `/api/config`, `/api/status`, or frontend state.
+
+## 14. Known Bounded Reads
+
+这些限制不会影响正常小规模使用，但属于需要明确记录的读取边界：
+
+| Surface | Current bound | Impact |
+| --- | --- | --- |
+| `cron.list` | 分页读取，每页 50 条，并带分页推进保护。 | 已不再局限于 50 条；只有上游返回异常游标或极端超大页数时会停止，避免无限循环。 |
+| `sessions.list` during sync | `persistence.maxSessions`，默认 100。 | 本地 console 只同步最近/最多这些 session；更早的远端 session 不一定出现在左侧列表。 |
+| `getSession()` fallback | `listSessions(200)` 查找指定 session。 | 如果直接打开一个未缓存且不在前 200 条远端列表里的 session，详情拉取可能失败。 |
+| `chat.history` for hydration | 200 条 message/history item。 | 刷新或首次打开历史很长的远端会话时，早期消息/事件可能不会被补齐；实时运行期间本地捕获的 event 不受这个历史读取窗口影响。 |
+| `retry` lookup | 最近 50 条 messages 中查找最后一条 user message。 | 极端情况下如果最后一条 user message 超出窗口，retry 会失败。 |
+| Frontend Event List | 当前会话仅渲染最近 120 条 raw events。 | 这是 UI 展示截断，不是 API 数据丢失；`GET /api/sessions/:id/events?afterSeq=...` 仍可读取本地已保存事件。 |
+| Frontend Cron card | 状态栏只展示前 5 条 cron tasks。 | 这是状态面板摘要；完整列表仍在 `/api/status.cronTasks` 中返回。 |

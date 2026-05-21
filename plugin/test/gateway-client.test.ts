@@ -317,6 +317,7 @@ describe("gateway client", () => {
 
   it("reads runtime model and enabled skills from Gateway runtime metadata", async () => {
     const capturedMethods: string[] = [];
+    const capturedCronListParams: Array<Record<string, unknown> | undefined> = [];
     const httpServer = createServer();
     servers.add(httpServer);
     const wss = new WebSocketServer({ noServer: true });
@@ -335,6 +336,7 @@ describe("gateway client", () => {
           const frame = JSON.parse(data.toString()) as {
             id: string;
             method: string;
+            params?: Record<string, unknown>;
           };
           capturedMethods.push(frame.method);
           if (frame.method === "connect") {
@@ -370,7 +372,7 @@ describe("gateway client", () => {
                 payload: {
                   enabled: true,
                   storePath: "/Users/me/.openclaw/cron/jobs.json",
-                  jobs: 2,
+                  jobs: 3,
                   nextWakeAtMs: 1770000000000
                 }
               })
@@ -378,37 +380,56 @@ describe("gateway client", () => {
             return;
           }
           if (frame.method === "cron.list") {
+            capturedCronListParams.push(frame.params);
+            const offset = Number(frame.params?.offset ?? 0);
             client.send(
               JSON.stringify({
                 type: "res",
                 id: frame.id,
                 ok: true,
                 payload: {
-                  total: 2,
-                  jobs: [
-                    {
-                      id: "job-1",
-                      name: "Daily digest",
-                      enabled: true,
-                      agentId: "main",
-                      schedule: {
-                        kind: "cron",
-                        expr: "0 8 * * *",
-                        timezone: "America/New_York"
-                      },
-                      nextRunAtMs: 1770000000000,
-                      lastRunAtMs: 1769900000000
-                    },
-                    {
-                      id: "job-2",
-                      name: "Disabled cleanup",
-                      enabled: false,
-                      schedule: {
-                        kind: "every",
-                        everyMs: 3600000
-                      }
-                    }
-                  ]
+                  total: 3,
+                  offset,
+                  limit: 2,
+                  hasMore: offset === 0,
+                  nextOffset: offset === 0 ? 2 : null,
+                  jobs:
+                    offset === 0
+                      ? [
+                          {
+                            id: "job-1",
+                            name: "Daily digest",
+                            enabled: true,
+                            agentId: "main",
+                            schedule: {
+                              kind: "cron",
+                              expr: "0 8 * * *",
+                              timezone: "America/New_York"
+                            },
+                            nextRunAtMs: 1770000000000,
+                            lastRunAtMs: 1769900000000
+                          },
+                          {
+                            id: "job-2",
+                            name: "Disabled cleanup",
+                            enabled: false,
+                            schedule: {
+                              kind: "every",
+                              everyMs: 3600000
+                            }
+                          }
+                        ]
+                      : [
+                          {
+                            id: "job-3",
+                            name: "Weekly planning",
+                            enabled: true,
+                            schedule: {
+                              kind: "cron",
+                              expr: "0 9 * * 1"
+                            }
+                          }
+                        ]
                 }
               })
             );
@@ -431,7 +452,7 @@ describe("gateway client", () => {
       cronScheduler: {
         enabled: true,
         storePath: "/Users/me/.openclaw/cron/jobs.json",
-        jobCount: 2,
+        jobCount: 3,
         nextWakeAt: "2026-02-02T02:40:00.000Z"
       },
       cronTasks: [
@@ -449,12 +470,22 @@ describe("gateway client", () => {
           name: "Disabled cleanup",
           enabled: false,
           schedule: "every 1h"
+        },
+        {
+          id: "job-3",
+          name: "Weekly planning",
+          enabled: true,
+          schedule: "cron 0 9 * * 1"
         }
       ]
     });
     expect(capturedMethods).toContain("skills.status");
     expect(capturedMethods).toContain("cron.status");
     expect(capturedMethods).toContain("cron.list");
+    expect(capturedCronListParams).toMatchObject([
+      { includeDisabled: true, limit: 50, offset: 0 },
+      { includeDisabled: true, limit: 50, offset: 2 }
+    ]);
     await client.stop();
     await new Promise<void>((resolve) => wss.close(() => resolve()));
   });
