@@ -598,6 +598,14 @@ describe("53AIHub client", () => {
           data: {}
         })
       );
+      connection.socket.send(
+        JSON.stringify({
+          req_id: "rpc-server-response",
+          action: "sessions.list",
+          status: "done",
+          data: { sessions: [] }
+        })
+      );
 
       await waitFor(() => {
         expect(frameByReq(server.frames, "rpc-sessions")).toMatchObject({
@@ -649,6 +657,7 @@ describe("53AIHub client", () => {
           }
         });
       });
+      expect(frameByReq(server.frames, "rpc-server-response")).toBeUndefined();
       expect(gateway.sentMessages).toEqual([]);
     } finally {
       await bridge.stop();

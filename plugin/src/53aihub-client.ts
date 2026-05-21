@@ -808,6 +808,10 @@ export function parseIncomingMessage(rawJson: string): Hub53AIIncomingMessage | 
       };
     }
 
+    if (typeof wsMsg.status === "string" && wsMsg.status !== "request") {
+      return null;
+    }
+
     const data = toRecord(wsMsg.data);
     const userObject = toRecord(data.user);
     const chatId = stringOr(data.chatId, data.userId, "default-chat");
@@ -844,6 +848,9 @@ function parseRPCRequest(rawJson: string): Hub53AIRPCRequest | null {
         action,
         data: parsed.data
       };
+    }
+    if (status) {
+      return null;
     }
     if (!HUB_RPC_ACTIONS.has(action)) {
       return null;

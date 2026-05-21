@@ -1237,15 +1237,16 @@ async function readSessionListPage(
 ): Promise<GatewaySessionPage> {
   const limit = clampPositiveInteger(options.limit, SESSION_LIST_PAGE_LIMIT);
   const offset = Math.max(0, Math.floor(options.offset));
+  const fetchLimit = offset + limit;
   const payload = await transport.request("sessions.list", {
-    limit,
-    offset,
+    limit: fetchLimit,
     includeGlobal: true,
     includeUnknown: true,
     includeDerivedTitles: true,
     includeLastMessage: true
   });
-  const sessions = extractSessions(payload, hostKind);
+  const fetchedSessions = extractSessions(payload, hostKind);
+  const sessions = fetchedSessions.slice(offset, offset + limit);
   return {
     sessions,
     pagination: extractPagination(payload, {
@@ -1816,12 +1817,13 @@ async function readChatHistoryPages(
 
   for (let page = 0; page < CHAT_HISTORY_MAX_PAGES && messages.length < target; page += 1) {
     const pageLimit = Math.min(CHAT_HISTORY_PAGE_LIMIT, target - messages.length);
+    const fetchLimit = offset + pageLimit;
     const payload = await transport.request("chat.history", {
       sessionKey: sessionId,
-      limit: pageLimit,
-      offset
+      limit: fetchLimit
     });
-    const pageMessages = readHistoryMessageArray(payload);
+    const fetchedMessages = readHistoryMessageArray(payload);
+    const pageMessages = fetchedMessages.slice(offset, offset + pageLimit);
     const before = messages.length;
     for (const message of pageMessages) {
       const key = messageIdentity(message);
