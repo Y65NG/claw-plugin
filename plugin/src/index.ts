@@ -59,7 +59,9 @@ export {
   parseIncomingMessage as parseHub53AIIncomingMessage,
   type Hub53AIConfig,
   type Hub53AIIncomingMessage,
+  type Hub53AIOutgoingFrame,
   type Hub53AIOutgoingChunk,
+  type Hub53AIOutgoingRPCFrame,
   type Hub53AIStatusSnapshot
 } from "./53aihub-client";
 export { createConsoleServer } from "./console-server";

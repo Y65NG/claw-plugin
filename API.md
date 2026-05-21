@@ -980,6 +980,47 @@ Bridge to OpenClaw upstream:
 | Convert visible assistant output | `chat` / `session.message` events | [Common event families](https://docs.openclaw.ai/gateway/protocol#common-event-families) |
 | Convert visible tool/status activity | `session.tool` / `sessions.changed` events | [Common event families](https://docs.openclaw.ai/gateway/protocol#common-event-families) |
 
+### 8.3 Company server request-response RPC
+
+公司服务器也可以通过同一条 53AIHub WebSocket 发送查询型 RPC。插件会优先识别带 `req_id` 且 `status: "request"` 的帧，按 `req_id` 回传 `status: "done"` 或 `status: "error"`，不会创建本地聊天会话。
+
+Request example:
+
+```json
+{
+  "req_id": "rpc-1",
+  "action": "sessions.list",
+  "status": "request",
+  "data": {
+    "limit": 50,
+    "offset": 0
+  }
+}
+```
+
+Supported actions:
+
+| 53AIHub action | Plugin source | Response summary |
+| --- | --- | --- |
+| `sessions.list` | `gateway.listSessionPage()` | `{ sessions, pagination }` |
+| `sessions.messages` | `gateway.getSessionMessages()` | `{ messages, pagination }`; accepts `session_id` or `conversation_id` |
+| `runtime.get` | local status/config snapshots plus `gateway.getRuntimeInfo()` | `include=status` / `config` / `skills` |
+| `cron.tasks` | `gateway.getRuntimeInfo().cronTasks` | `{ tasks, cronTasks, scheduler, pagination }` |
+
+Error response example:
+
+```json
+{
+  "req_id": "rpc-1",
+  "action": "future.unsupported",
+  "status": "error",
+  "data": {
+    "code": "FEATURE_NOT_AVAILABLE",
+    "message": "Unsupported RPC action: future.unsupported"
+  }
+}
+```
+
 ## 9. OpenClaw Gateway RPC Mapping
 
 此表是当前插件实际使用或明确映射的 OpenClaw Gateway API。

@@ -4,7 +4,12 @@ import { dirname, join } from "node:path";
 
 import WebSocket from "ws";
 
-import type { GatewayClient, GatewayEvent, GatewaySession } from "./gateway-client";
+import type {
+  GatewayClient,
+  GatewayEvent,
+  GatewayRuntimeInfo,
+  GatewaySession
+} from "./gateway-client";
 import type { SessionMessage, SessionStatus, TimelineEvent } from "./models";
 
 export type Hub53AIConfig = {
@@ -71,6 +76,15 @@ export type Hub53AIOutgoingChunk = {
   };
 };
 
+export type Hub53AIOutgoingRPCFrame = {
+  req_id: string;
+  action: string;
+  status: "done" | "error";
+  data: unknown;
+};
+
+export type Hub53AIOutgoingFrame = Hub53AIOutgoingChunk | Hub53AIOutgoingRPCFrame;
+
 type StoredHubState = {
   mappings: Record<string, string>;
   outbox: Hub53AIOutgoingChunk[];
@@ -89,6 +103,10 @@ type HubBridgeInput = {
   stateDir: string;
   config: Hub53AIConfig;
   gateway: GatewayClient;
+  rpcContext?: {
+    getStatusSnapshot?: () => unknown | Promise<unknown>;
+    getConfigSnapshot?: () => unknown | Promise<unknown>;
+  };
   callbacks: HubBridgeCallbacks;
   logger?: {
     info?(message: string): void;
@@ -103,6 +121,29 @@ const MAX_OUTBOX_FRAMES = 200;
 const RUN_WAIT_TIMEOUT_MS = 30 * 60 * 1000;
 const HUB_SESSION_TITLE_PREFIX = "53AI Hub-";
 const HUB_TITLE_SUMMARY_LENGTH = 40;
+const HUB_RPC_ACTIONS = new Set(["sessions.list", "sessions.messages", "runtime.get", "cron.tasks"]);
+
+type Hub53AIRPCRequest = {
+  reqId: string;
+  action: string;
+  data: unknown;
+};
+
+type RPCPagination = {
+  limit: number;
+  offset: number;
+};
+
+class HubRPCError extends Error {
+  constructor(
+    readonly code: string,
+    message: string,
+    readonly details?: string
+  ) {
+    super(message);
+    this.name = "HubRPCError";
+  }
+}
 
 export function createHub53AIBridge(input: HubBridgeInput) {
   const statePath = join(input.stateDir, "claw-control-center-53aihub.json");
@@ -264,6 +305,12 @@ export function createHub53AIBridge(input: HubBridgeInput) {
       return;
     }
 
+    const rpcRequest = parseRPCRequest(rawPayload);
+    if (rpcRequest) {
+      await processRPCRequest(rpcRequest);
+      return;
+    }
+
     const message = parseIncomingMessage(rawPayload);
     if (!message) {
       return;
@@ -281,6 +328,111 @@ export function createHub53AIBridge(input: HubBridgeInput) {
         chatQueues.delete(message.chatId);
       }
     });
+  }
+
+  async function processRPCRequest(request: Hub53AIRPCRequest) {
+    try {
+      const data = await resolveRPCRequest(request);
+      sendRPCFrame({
+        req_id: request.reqId,
+        action: request.action,
+        status: "done",
+        data
+      });
+    } catch (error) {
+      const rpcError = normalizeRPCError(error);
+      sendRPCFrame({
+        req_id: request.reqId,
+        action: request.action,
+        status: "error",
+        data: rpcError
+      });
+    }
+  }
+
+  async function resolveRPCRequest(request: Hub53AIRPCRequest): Promise<unknown> {
+    if (request.action === "sessions.list") {
+      const pagination = readRPCPagination(request.data, 50);
+      return input.gateway.listSessionPage({
+        limit: pagination.limit,
+        offset: pagination.offset
+      });
+    }
+
+    if (request.action === "sessions.messages") {
+      const payload = toRecord(request.data);
+      const sessionId = stringOr(payload.session_id, payload.sessionId, payload.conversation_id, payload.conversationId);
+      if (!sessionId) {
+        throw new HubRPCError("PARAM_ERROR", "session_id or conversation_id is required");
+      }
+      const pagination = readRPCPagination(payload, 100);
+      const fetchLimit = pagination.offset + pagination.limit;
+      const messages = await input.gateway.getSessionMessages(sessionId, fetchLimit);
+      const pageMessages = messages.slice(pagination.offset, pagination.offset + pagination.limit);
+      return {
+        messages: pageMessages,
+        pagination: buildPagination(pagination.limit, pagination.offset, messages.length, pageMessages.length)
+      };
+    }
+
+    if (request.action === "runtime.get") {
+      return resolveRuntimeRPC(request.data);
+    }
+
+    if (request.action === "cron.tasks") {
+      const pagination = readRPCPagination(request.data, 100);
+      const runtimeInfo = await input.gateway.getRuntimeInfo();
+      const tasks = runtimeInfo.cronTasks ?? [];
+      const pageTasks = tasks.slice(pagination.offset, pagination.offset + pagination.limit);
+      return {
+        tasks: pageTasks,
+        cronTasks: pageTasks,
+        ...(runtimeInfo.cronScheduler ? { scheduler: runtimeInfo.cronScheduler, cronScheduler: runtimeInfo.cronScheduler } : {}),
+        pagination: buildPagination(pagination.limit, pagination.offset, tasks.length, pageTasks.length)
+      };
+    }
+
+    throw new HubRPCError("FEATURE_NOT_AVAILABLE", `Unsupported RPC action: ${request.action}`);
+  }
+
+  async function resolveRuntimeRPC(payload: unknown): Promise<unknown> {
+    const include = stringOr(toRecord(payload).include, "all").toLowerCase();
+    if (include === "status") {
+      return input.rpcContext?.getStatusSnapshot ? await input.rpcContext.getStatusSnapshot() : await buildFallbackStatus();
+    }
+    if (include === "config") {
+      return input.rpcContext?.getConfigSnapshot ? await input.rpcContext.getConfigSnapshot() : buildFallbackConfig();
+    }
+    if (include === "skills") {
+      return buildSkillsPayload(await input.gateway.getRuntimeInfo());
+    }
+
+    const runtimeInfo = await input.gateway.getRuntimeInfo();
+    return {
+      status: input.rpcContext?.getStatusSnapshot ? await input.rpcContext.getStatusSnapshot() : await buildFallbackStatus(),
+      config: input.rpcContext?.getConfigSnapshot ? await input.rpcContext.getConfigSnapshot() : buildFallbackConfig(),
+      skills: buildSkillsPayload(runtimeInfo),
+      cronTasks: runtimeInfo.cronTasks ?? []
+    };
+  }
+
+  async function buildFallbackStatus() {
+    const [gatewayHealth, runtimeInfo] = await Promise.allSettled([input.gateway.getHealth(), input.gateway.getRuntimeInfo()]);
+    return {
+      hub53ai: getStatus(),
+      gatewayHealth: gatewayHealth.status === "fulfilled" ? gatewayHealth.value : undefined,
+      runtime: runtimeInfo.status === "fulfilled" ? runtimeInfo.value : undefined
+    };
+  }
+
+  function buildFallbackConfig() {
+    return {
+      hub53ai: redactHubConfig(input.config)
+    };
+  }
+
+  function sendRPCFrame(frame: Hub53AIOutgoingRPCFrame): boolean {
+    return sendRaw(JSON.stringify(frame), true);
   }
 
   async function processIncomingMessage(message: Hub53AIIncomingMessage) {
@@ -675,6 +827,101 @@ export function parseIncomingMessage(rawJson: string): Hub53AIIncomingMessage | 
   } catch {
     return null;
   }
+}
+
+function parseRPCRequest(rawJson: string): Hub53AIRPCRequest | null {
+  try {
+    const parsed = JSON.parse(rawJson) as Record<string, unknown>;
+    const reqId = stringOr(parsed.req_id, parsed.reqId);
+    const action = stringOr(parsed.action);
+    const status = stringOr(parsed.status);
+    if (!reqId || !action) {
+      return null;
+    }
+    if (status === "request") {
+      return {
+        reqId,
+        action,
+        data: parsed.data
+      };
+    }
+    if (!HUB_RPC_ACTIONS.has(action)) {
+      return null;
+    }
+    return {
+      reqId,
+      action,
+      data: parsed.data
+    };
+  } catch {
+    return null;
+  }
+}
+
+function readRPCPagination(payload: unknown, defaultLimit: number): RPCPagination {
+  const record = toRecord(payload);
+  return {
+    limit: clampPositiveInteger(record.limit, defaultLimit, 200),
+    offset: clampNonNegativeInteger(record.offset, 0)
+  };
+}
+
+function clampPositiveInteger(value: unknown, fallback: number, max: number): number {
+  const numberValue = typeof value === "number" ? value : typeof value === "string" ? Number(value) : NaN;
+  if (!Number.isInteger(numberValue) || numberValue <= 0) {
+    return fallback;
+  }
+  return Math.min(numberValue, max);
+}
+
+function clampNonNegativeInteger(value: unknown, fallback: number): number {
+  const numberValue = typeof value === "number" ? value : typeof value === "string" ? Number(value) : NaN;
+  if (!Number.isInteger(numberValue) || numberValue < 0) {
+    return fallback;
+  }
+  return numberValue;
+}
+
+function buildPagination(limit: number, offset: number, total: number, pageSize: number) {
+  const nextOffset = offset + pageSize;
+  const hasMore = nextOffset < total;
+  return {
+    limit,
+    offset,
+    total,
+    hasMore,
+    ...(hasMore ? { nextOffset } : {})
+  };
+}
+
+function buildSkillsPayload(runtimeInfo: GatewayRuntimeInfo) {
+  return {
+    ...(runtimeInfo.modelPrimary ? { modelPrimary: runtimeInfo.modelPrimary } : {}),
+    skills: runtimeInfo.enabledSkills,
+    enabledSkills: runtimeInfo.enabledSkills
+  };
+}
+
+function redactHubConfig(config: Hub53AIConfig): Omit<Hub53AIConfig, "secret"> & { secret: string } {
+  return {
+    ...config,
+    secret: "[redacted]"
+  };
+}
+
+function normalizeRPCError(error: unknown) {
+  if (error instanceof HubRPCError) {
+    return {
+      code: error.code,
+      message: error.message,
+      ...(error.details ? { details: error.details } : {})
+    };
+  }
+  const message = error instanceof Error ? error.message : String(error);
+  return {
+    code: inferErrorCode(message),
+    message
+  };
 }
 
 function extractUserName(...sources: unknown[]): string | undefined {

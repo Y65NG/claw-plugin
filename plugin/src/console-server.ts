@@ -106,6 +106,10 @@ export function createConsoleServer(input: CreateConsoleServerInput) {
         stateDir: input.stateDir,
         config: input.hub53aiConfig,
         gateway: input.gateway,
+        rpcContext: {
+          getStatusSnapshot: () => buildStatusSnapshot(),
+          getConfigSnapshot: () => buildConfigSnapshot()
+        },
         callbacks: {
           onSessionUpsert: async (session) => {
             await store.upsertSession(session);
@@ -233,32 +237,7 @@ export function createConsoleServer(input: CreateConsoleServerInput) {
       writeJson(response, 200, {
         token: input.token,
         status: buildStatusSnapshot(),
-        config: {
-          gateway: {
-            ...input.gatewayConfig,
-            secret: "[redacted]"
-          },
-          hub53ai: input.hub53aiConfig
-            ? {
-                ...input.hub53aiConfig,
-                secret: "[redacted]"
-              }
-            : undefined,
-          config: {
-            gateway: {
-              ...input.gatewayConfig,
-              secret: "[redacted]"
-            },
-            hub53ai: input.hub53aiConfig
-              ? {
-                  ...input.hub53aiConfig,
-                  secret: "[redacted]"
-                }
-              : undefined,
-            console: input.consoleConfig,
-            persistence: input.persistence
-          }
-        }
+        config: buildConfigSnapshot()
       });
       return;
     }
@@ -278,28 +257,7 @@ export function createConsoleServer(input: CreateConsoleServerInput) {
     }
 
     if (method === "GET" && url.pathname === "/api/config") {
-      writeJson(response, 200, {
-        gateway: {
-          ...input.gatewayConfig,
-          secret: "[redacted]"
-        },
-        hub53ai: input.hub53aiConfig
-          ? {
-              ...input.hub53aiConfig,
-              secret: "[redacted]"
-            }
-          : undefined,
-        config: {
-          hub53ai: input.hub53aiConfig
-            ? {
-                ...input.hub53aiConfig,
-                secret: "[redacted]"
-              }
-            : undefined,
-          console: input.consoleConfig,
-          persistence: input.persistence
-        }
-      });
+      writeJson(response, 200, buildConfigSnapshot());
       return;
     }
 
@@ -696,6 +654,35 @@ export function createConsoleServer(input: CreateConsoleServerInput) {
       cronTasks,
       hub53ai: hub53ai?.getStatus(),
       agentEvents: input.agentEventProbe?.getSnapshot()
+    };
+  }
+
+  function buildConfigSnapshot() {
+    return {
+      gateway: {
+        ...input.gatewayConfig,
+        secret: "[redacted]"
+      },
+      hub53ai: input.hub53aiConfig
+        ? {
+            ...input.hub53aiConfig,
+            secret: "[redacted]"
+          }
+        : undefined,
+      config: {
+        gateway: {
+          ...input.gatewayConfig,
+          secret: "[redacted]"
+        },
+        hub53ai: input.hub53aiConfig
+          ? {
+              ...input.hub53aiConfig,
+              secret: "[redacted]"
+            }
+          : undefined,
+        console: input.consoleConfig,
+        persistence: input.persistence
+      }
     };
   }
 

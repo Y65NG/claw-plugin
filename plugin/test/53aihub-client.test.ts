@@ -6,7 +6,7 @@ import { join } from "node:path";
 import { afterEach, describe, expect, it } from "vitest";
 import WebSocket, { WebSocketServer } from "ws";
 
-import { createHub53AIBridge, parseIncomingMessage, type Hub53AIOutgoingChunk } from "../src/53aihub-client";
+import { createHub53AIBridge, parseIncomingMessage, type Hub53AIOutgoingFrame } from "../src/53aihub-client";
 import type { GatewayEvent, GatewaySession } from "../src/gateway-client";
 import type { SessionMessage, SessionStatus } from "../src/models";
 
@@ -446,6 +446,214 @@ describe("53AIHub client", () => {
       await bridge.stop();
     }
   });
+
+  it("responds to request-response RPC actions without starting a chat run", async () => {
+    const stateDir = await mkdtemp(join(tmpdir(), "claw-53aihub-rpc-"));
+    cleanupPaths.push(stateDir);
+
+    const server = await createFakeHubServer();
+    cleanupServers.push(server.close);
+
+    const gateway = new FakeGateway();
+    gateway.sessionPage = {
+      sessions: [
+        {
+          id: "session-1",
+          title: "First session",
+          status: "completed",
+          hostKind: "qclaw",
+          runnerCommand: "gateway",
+          createdAt: "2026-05-20T10:00:00.000Z",
+          updatedAt: "2026-05-20T10:04:00.000Z",
+          lastEventSeq: 2
+        }
+      ],
+      pagination: {
+        limit: 1,
+        offset: 0,
+        total: 1,
+        hasMore: false
+      }
+    };
+    gateway.messagesBySession.set("session-1", [
+      {
+        id: "message-1",
+        sessionId: "session-1",
+        role: "user",
+        content: "hello",
+        createdAt: "2026-05-20T10:00:00.000Z"
+      },
+      {
+        id: "message-2",
+        sessionId: "session-1",
+        role: "assistant",
+        content: "hi",
+        createdAt: "2026-05-20T10:00:01.000Z"
+      }
+    ]);
+    gateway.runtimeInfo = {
+      modelPrimary: "openai/gpt-5.5",
+      enabledSkills: ["browser", "weather"],
+      cronScheduler: {
+        enabled: true,
+        jobCount: 1,
+        nextWakeAt: "2026-05-21T08:00:00.000Z"
+      },
+      cronTasks: [
+        {
+          id: "daily-brief",
+          name: "Daily brief",
+          enabled: true,
+          schedule: "cron 0 8 * * *"
+        }
+      ]
+    };
+
+    const bridge = createHub53AIBridge({
+      stateDir,
+      config: {
+        enabled: true,
+        botId: "bot-123",
+        secret: "sk-secret",
+        wsUrl: server.url,
+        accessPolicy: "open",
+        allowFrom: [],
+        sendThinkingMessage: false,
+        reconnectBaseMs: 20,
+        maxReconnectAttempts: 2
+      },
+      gateway,
+      rpcContext: {
+        getStatusSnapshot: () => ({
+          healthy: true,
+          enabledSkills: ["browser", "weather"]
+        }),
+        getConfigSnapshot: () => ({
+          hub53ai: {
+            enabled: true,
+            secret: "[redacted]"
+          }
+        })
+      },
+      callbacks: {
+        onSessionUpsert: async (session) => {
+          gateway.upsertSession(session);
+        },
+        onUserMessage: async () => undefined,
+        onSessionStatus: async () => undefined,
+        onEnsureSessionStream: async () => undefined,
+        getLastEventSeq: () => 0,
+        onStatusChange: () => undefined
+      }
+    });
+
+    await bridge.start();
+    try {
+      const connection = await server.connected;
+      connection.socket.send(
+        JSON.stringify({
+          req_id: "rpc-sessions",
+          action: "sessions.list",
+          status: "request",
+          data: { limit: 1, offset: 0 }
+        })
+      );
+      connection.socket.send(
+        JSON.stringify({
+          req_id: "rpc-messages",
+          action: "sessions.messages",
+          status: "request",
+          data: { session_id: "session-1", limit: 1, offset: 1 }
+        })
+      );
+      connection.socket.send(
+        JSON.stringify({
+          req_id: "rpc-skills",
+          action: "runtime.get",
+          status: "request",
+          data: { include: "skills" }
+        })
+      );
+      connection.socket.send(
+        JSON.stringify({
+          req_id: "rpc-config",
+          action: "runtime.get",
+          status: "request",
+          data: { include: "config" }
+        })
+      );
+      connection.socket.send(
+        JSON.stringify({
+          req_id: "rpc-cron",
+          action: "cron.tasks",
+          status: "request",
+          data: { limit: 10, offset: 0 }
+        })
+      );
+      connection.socket.send(
+        JSON.stringify({
+          req_id: "rpc-unsupported",
+          action: "future.unsupported",
+          status: "request",
+          data: {}
+        })
+      );
+
+      await waitFor(() => {
+        expect(frameByReq(server.frames, "rpc-sessions")).toMatchObject({
+          action: "sessions.list",
+          status: "done",
+          data: {
+            sessions: [{ id: "session-1" }],
+            pagination: { limit: 1, offset: 0, hasMore: false }
+          }
+        });
+        expect(frameByReq(server.frames, "rpc-messages")).toMatchObject({
+          action: "sessions.messages",
+          status: "done",
+          data: {
+            messages: [{ id: "message-2", content: "hi" }],
+            pagination: { limit: 1, offset: 1, total: 2, hasMore: false }
+          }
+        });
+        expect(frameByReq(server.frames, "rpc-skills")).toMatchObject({
+          action: "runtime.get",
+          status: "done",
+          data: {
+            skills: ["browser", "weather"],
+            enabledSkills: ["browser", "weather"]
+          }
+        });
+        expect(frameByReq(server.frames, "rpc-config")).toMatchObject({
+          action: "runtime.get",
+          status: "done",
+          data: {
+            hub53ai: {
+              secret: "[redacted]"
+            }
+          }
+        });
+        expect(frameByReq(server.frames, "rpc-cron")).toMatchObject({
+          action: "cron.tasks",
+          status: "done",
+          data: {
+            tasks: [{ id: "daily-brief", name: "Daily brief" }],
+            pagination: { limit: 10, offset: 0, total: 1, hasMore: false }
+          }
+        });
+        expect(frameByReq(server.frames, "rpc-unsupported")).toMatchObject({
+          action: "future.unsupported",
+          status: "error",
+          data: {
+            code: "FEATURE_NOT_AVAILABLE"
+          }
+        });
+      });
+      expect(gateway.sentMessages).toEqual([]);
+    } finally {
+      await bridge.stop();
+    }
+  });
 });
 
 class FakeGateway {
@@ -455,13 +663,37 @@ class FakeGateway {
   eventsToEmit?: GatewayEvent[];
   createdTitles: string[] = [];
   renames: Array<{ sessionId: string; title: string }> = [];
+  sessionPage?: { sessions: GatewaySession[]; pagination: { limit: number; offset: number; total?: number; hasMore: boolean } };
+  messagesBySession = new Map<string, SessionMessage[]>();
+  runtimeInfo?: {
+    modelPrimary?: string;
+    enabledSkills: string[];
+    cronScheduler?: { enabled?: boolean; jobCount?: number; nextWakeAt?: string };
+    cronTasks?: Array<{ id: string; name: string; enabled: boolean; schedule?: string }>;
+  };
 
   async listSessions(): Promise<GatewaySession[]> {
     return [...this.sessions.values()];
   }
 
+  async listSessionPage(): Promise<{ sessions: GatewaySession[]; pagination: { limit: number; offset: number; total?: number; hasMore: boolean } }> {
+    return this.sessionPage ?? {
+      sessions: [...this.sessions.values()],
+      pagination: {
+        limit: this.sessions.size,
+        offset: 0,
+        total: this.sessions.size,
+        hasMore: false
+      }
+    };
+  }
+
   async getRuntimeInfo(): Promise<{ enabledSkills: string[] }> {
-    return { enabledSkills: [] };
+    return this.runtimeInfo ?? { enabledSkills: [] };
+  }
+
+  async getHealth(): Promise<{ ok: boolean; status: "ok" }> {
+    return { ok: true, status: "ok" };
   }
 
   async createSession(title: string): Promise<GatewaySession> {
@@ -493,8 +725,8 @@ class FakeGateway {
     return session;
   }
 
-  async getSessionMessages(): Promise<SessionMessage[]> {
-    return [];
+  async getSessionMessages(sessionId: string): Promise<SessionMessage[]> {
+    return this.messagesBySession.get(sessionId) ?? [];
   }
 
   async sendMessage(sessionId: string, content: string): Promise<void> {
@@ -573,13 +805,13 @@ class FakeGateway {
 
 async function createFakeHubServer(): Promise<{
   url: string;
-  frames: Hub53AIOutgoingChunk[];
+  frames: Hub53AIOutgoingFrame[];
   connected: Promise<{ socket: WebSocket; headers: Record<string, string | undefined> }>;
   close: () => Promise<void>;
 }> {
   const httpServer = createServer();
   const wsServer = new WebSocketServer({ server: httpServer });
-  const frames: Hub53AIOutgoingChunk[] = [];
+  const frames: Hub53AIOutgoingFrame[] = [];
   let resolveConnected!: (value: { socket: WebSocket; headers: Record<string, string | undefined> }) => void;
   const connected = new Promise<{ socket: WebSocket; headers: Record<string, string | undefined> }>((resolve) => {
     resolveConnected = resolve;
@@ -596,7 +828,10 @@ async function createFakeHubServer(): Promise<{
         socket.send(JSON.stringify({ action: "pong", data: { ok: true } }));
       }
       if (payload?.action === "chat") {
-        frames.push(payload as Hub53AIOutgoingChunk);
+        frames.push(payload as Hub53AIOutgoingFrame);
+      }
+      if (payload?.req_id && payload?.action !== "ping" && payload?.action !== "chat") {
+        frames.push(payload as Hub53AIOutgoingFrame);
       }
     });
   });
@@ -621,6 +856,10 @@ async function createFakeHubServer(): Promise<{
       await new Promise<void>((resolve) => httpServer.close(() => resolve()));
     }
   };
+}
+
+function frameByReq(frames: Hub53AIOutgoingFrame[], reqId: string): Hub53AIOutgoingFrame | undefined {
+  return frames.find((frame) => frame.req_id === reqId);
 }
 
 function safeParse(raw: string): Record<string, unknown> | null {
