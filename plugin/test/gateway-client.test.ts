@@ -677,13 +677,14 @@ describe("gateway client", () => {
     const session = await client.getSession("session-119");
     expect(session.title).toBe("Session 119");
     expect(capturedListParams).toMatchObject([
-      { limit: 50, offset: 0 },
-      { limit: 50, offset: 50 },
-      { limit: 20, offset: 100 },
-      { limit: 50, offset: 0 },
-      { limit: 50, offset: 50 },
-      { limit: 50, offset: 100 }
+      { limit: 50 },
+      { limit: 100 },
+      { limit: 120 },
+      { limit: 50 },
+      { limit: 100 },
+      { limit: 150 }
     ]);
+    expect(capturedListParams.every((params) => params.offset === undefined)).toBe(true);
     await client.stop();
     await new Promise<void>((resolve) => wss.close(() => resolve()));
   });
@@ -765,8 +766,9 @@ describe("gateway client", () => {
     expect(events.map((event) => event.seq)).toEqual([207, 208, 209, 210]);
     await client.controlSession("session-1", "retry");
     expect(sentMessages).toEqual(["retry this old prompt"]);
-    expect(capturedHistoryParams).toContainEqual(expect.objectContaining({ sessionKey: "session-1", limit: 200, offset: 0 }));
-    expect(capturedHistoryParams).toContainEqual(expect.objectContaining({ sessionKey: "session-1", limit: 200, offset: 200 }));
+    expect(capturedHistoryParams).toContainEqual(expect.objectContaining({ sessionKey: "session-1", limit: 200 }));
+    expect(capturedHistoryParams).toContainEqual(expect.objectContaining({ sessionKey: "session-1", limit: 400 }));
+    expect(capturedHistoryParams.every((params) => params.offset === undefined)).toBe(true);
     await client.stop();
     await new Promise<void>((resolve) => wss.close(() => resolve()));
   });
