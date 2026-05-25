@@ -263,6 +263,48 @@ describe("53AIHub client", () => {
     cleanupServers.push(server.close);
 
     const gateway = new FakeGateway();
+    gateway.eventsToEmit = [
+      {
+        id: "evt-status-running",
+        sessionId: "session-1",
+        seq: 1,
+        kind: "status.update",
+        payload: { status: "running" },
+        createdAt: new Date().toISOString()
+      },
+      {
+        id: "evt-thinking",
+        sessionId: "session-1",
+        seq: 2,
+        kind: "assistant.thinking",
+        payload: { content: "Thinking through the request" },
+        createdAt: new Date().toISOString()
+      },
+      {
+        id: "evt-1",
+        sessionId: "session-1",
+        seq: 3,
+        kind: "assistant.delta",
+        payload: { content: "Hello from local Claw" },
+        createdAt: new Date().toISOString()
+      },
+      {
+        id: "evt-status-done",
+        sessionId: "session-1",
+        seq: 4,
+        kind: "status.update",
+        payload: { status: "done" },
+        createdAt: new Date().toISOString()
+      },
+      {
+        id: "evt-2",
+        sessionId: "session-1",
+        seq: 5,
+        kind: "run.completed",
+        payload: { ok: true },
+        createdAt: new Date().toISOString()
+      }
+    ];
     const userMessages: SessionMessage[] = [];
     const statuses: Array<{ sessionId: string; status: SessionStatus }> = [];
 
@@ -327,6 +369,19 @@ describe("53AIHub client", () => {
       await waitFor(() => {
         const chatFrames = server.frames.filter((frame) => frame.action === "chat");
         expect(chatFrames.some((frame) => frame.status === "thinking")).toBe(true);
+        expect(
+          chatFrames.some(
+            (frame) =>
+              frame.status === "thinking" &&
+              frame.data.choices[0]?.delta.content === "Thinking through the request"
+          )
+        ).toBe(true);
+        const thinkingText = chatFrames
+          .filter((frame) => frame.status === "thinking")
+          .map((frame) => frame.data.choices[0]?.delta.content)
+          .join("\n");
+        expect(thinkingText).not.toContain("running");
+        expect(thinkingText).not.toContain("done");
         expect(chatFrames.some((frame) => frame.status === "streaming")).toBe(true);
         const streaming = chatFrames.find((frame) => frame.status === "streaming");
         expect(streaming?.data.choices[0]?.delta.content).toBe("Hello from local Claw");
@@ -341,6 +396,170 @@ describe("53AIHub client", () => {
         botId: "bo***23",
         receivedMessageCount: 1
       });
+    } finally {
+      await bridge.stop();
+    }
+  });
+
+  it("sends chat frames directly to existing OpenClaw session ids", async () => {
+    const stateDir = await mkdtemp(join(tmpdir(), "claw-53aihub-"));
+    cleanupPaths.push(stateDir);
+    const server = await createFakeHubServer();
+    cleanupServers.push(server.close);
+    const gateway = new FakeGateway();
+    const existingSessionId = "agent:main:dashboard:0ea52c76-4a2d-410f-985a-ed1771a67e28";
+    gateway.upsertSession({
+      id: existingSessionId,
+      title: "Existing OpenClaw session",
+      status: "idle",
+      hostKind: "openclaw",
+      runnerCommand: "gateway",
+      createdAt: new Date().toISOString(),
+      updatedAt: new Date().toISOString(),
+      lastEventSeq: 0
+    });
+
+    const bridge = createHub53AIBridge({
+      stateDir,
+      config: {
+        enabled: true,
+        botId: "bot-123",
+        secret: "sk-secret",
+        wsUrl: server.url,
+        accessPolicy: "open",
+        allowFrom: [],
+        sendThinkingMessage: false,
+        reconnectBaseMs: 20,
+        maxReconnectAttempts: 2
+      },
+      gateway,
+      callbacks: {
+        onSessionUpsert: async (session) => {
+          gateway.upsertSession(session);
+        },
+        onUserMessage: async () => undefined,
+        onSessionStatus: async () => undefined,
+        onEnsureSessionStream: async () => undefined,
+        getLastEventSeq: () => 0,
+        onStatusChange: () => undefined
+      }
+    });
+
+    await bridge.start();
+    try {
+      const connection = await server.connected;
+      connection.socket.send(
+        JSON.stringify({
+          req_id: "req-existing-session",
+          action: "chat",
+          data: {
+            user: "user-1",
+            conversation_id: existingSessionId,
+            messages: [{ role: "user", content: "test" }]
+          }
+        })
+      );
+
+      await waitFor(() => {
+        expect(gateway.sentMessages).toEqual([{ sessionId: existingSessionId, content: "test" }]);
+      });
+      expect(gateway.createdTitles).toEqual([]);
+    } finally {
+      await bridge.stop();
+    }
+  });
+
+  it("continues queued chat frames after a gateway stream disconnect", async () => {
+    const stateDir = await mkdtemp(join(tmpdir(), "claw-53aihub-"));
+    cleanupPaths.push(stateDir);
+    const server = await createFakeHubServer();
+    cleanupServers.push(server.close);
+    const gateway = new FakeGateway();
+    const existingSessionId = "agent:main:dashboard:disconnect-test";
+    gateway.disconnectOnNextSend = true;
+    gateway.disconnectCompletionDelayMs = 600;
+    gateway.upsertSession({
+      id: existingSessionId,
+      title: "Disconnect test",
+      status: "idle",
+      hostKind: "openclaw",
+      runnerCommand: "gateway",
+      createdAt: new Date().toISOString(),
+      updatedAt: new Date().toISOString(),
+      lastEventSeq: 0
+    });
+
+    const bridge = createHub53AIBridge({
+      stateDir,
+      config: {
+        enabled: true,
+        botId: "bot-123",
+        secret: "sk-secret",
+        wsUrl: server.url,
+        accessPolicy: "open",
+        allowFrom: [],
+        sendThinkingMessage: false,
+        reconnectBaseMs: 20,
+        maxReconnectAttempts: 2
+      },
+      gateway,
+      callbacks: {
+        onSessionUpsert: async (session) => {
+          gateway.upsertSession(session);
+        },
+        onUserMessage: async () => undefined,
+        onSessionStatus: async () => undefined,
+        onEnsureSessionStream: async () => undefined,
+        getLastEventSeq: () => 0,
+        onStatusChange: () => undefined
+      }
+    });
+
+    await bridge.start();
+    try {
+      const connection = await server.connected;
+      connection.socket.send(
+        JSON.stringify({
+          req_id: "req-disconnect-1",
+          action: "chat",
+          data: {
+            user: "user-1",
+            conversation_id: existingSessionId,
+            messages: [{ role: "user", content: "first" }]
+          }
+        })
+      );
+
+      await waitFor(() => {
+        expect(frameByReq(server.frames, "req-disconnect-1")).toMatchObject({
+          action: "chat",
+          status: "error",
+          data: {
+            error: {
+              code: "WEBSOCKET_ERROR"
+            }
+          }
+        });
+      });
+
+      connection.socket.send(
+        JSON.stringify({
+          req_id: "req-disconnect-2",
+          action: "chat",
+          data: {
+            user: "user-1",
+            conversation_id: existingSessionId,
+            messages: [{ role: "user", content: "second" }]
+          }
+        })
+      );
+
+      await waitFor(() => {
+        expect(gateway.sentMessages).toEqual([
+          { sessionId: existingSessionId, content: "first" },
+          { sessionId: existingSessionId, content: "second" }
+        ]);
+      }, 250);
     } finally {
       await bridge.stop();
     }
@@ -668,8 +887,11 @@ describe("53AIHub client", () => {
 class FakeGateway {
   private sessions = new Map<string, GatewaySession>();
   private listeners = new Map<string, Set<(event: GatewayEvent) => void>>();
+  private disconnectHandlers = new Map<string, Set<(error?: Error) => void>>();
   sentMessages: Array<{ sessionId: string; content: string }> = [];
   eventsToEmit?: GatewayEvent[];
+  disconnectOnNextSend = false;
+  disconnectCompletionDelayMs = 0;
   createdTitles: string[] = [];
   renames: Array<{ sessionId: string; title: string }> = [];
   sessionPage?: { sessions: GatewaySession[]; pagination: { limit: number; offset: number; total?: number; hasMore: boolean } };
@@ -741,6 +963,23 @@ class FakeGateway {
   async sendMessage(sessionId: string, content: string): Promise<void> {
     this.sentMessages.push({ sessionId, content });
     setTimeout(() => {
+      if (this.disconnectOnNextSend) {
+        this.disconnectOnNextSend = false;
+        this.emitDisconnect(sessionId, new Error("gateway stream disconnected"));
+        if (this.disconnectCompletionDelayMs > 0) {
+          setTimeout(() => {
+            this.emit(sessionId, {
+              id: "evt-disconnect-complete",
+              sessionId,
+              seq: 99,
+              kind: "run.completed",
+              payload: { ok: true },
+              createdAt: new Date().toISOString()
+            });
+          }, this.disconnectCompletionDelayMs);
+        }
+        return;
+      }
       const events =
         this.eventsToEmit ?? [
           {
@@ -796,8 +1035,12 @@ class FakeGateway {
     const listeners = this.listeners.get(sessionId) ?? new Set<(event: GatewayEvent) => void>();
     listeners.add(handlers.onEvent);
     this.listeners.set(sessionId, listeners);
+    const disconnectHandlers = this.disconnectHandlers.get(sessionId) ?? new Set<(error?: Error) => void>();
+    disconnectHandlers.add(handlers.onDisconnect);
+    this.disconnectHandlers.set(sessionId, disconnectHandlers);
     return () => {
       listeners.delete(handlers.onEvent);
+      disconnectHandlers.delete(handlers.onDisconnect);
     };
   }
 
@@ -808,6 +1051,12 @@ class FakeGateway {
   private emit(sessionId: string, event: GatewayEvent) {
     for (const listener of this.listeners.get(sessionId) ?? []) {
       listener(event);
+    }
+  }
+
+  private emitDisconnect(sessionId: string, error?: Error) {
+    for (const handler of this.disconnectHandlers.get(sessionId) ?? []) {
+      handler(error);
     }
   }
 }

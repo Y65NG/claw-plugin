@@ -450,45 +450,48 @@ export function createHub53AIBridge(input: HubBridgeInput) {
       return;
     }
 
-    const session = await resolveSession(message);
-    await input.callbacks.onEnsureSessionStream(session.id);
-    await input.callbacks.onUserMessage({
-      id: `hub53ai-user-${message.msgId}`,
-      sessionId: session.id,
-      role: "user",
-      content: buildPrompt(message),
-      createdAt: new Date().toISOString()
-    });
-    await input.callbacks.onSessionStatus(session.id, "running");
-
-    if (input.config.sendThinkingMessage) {
-      await sendReply({
-        reqId: message.reqId,
-        text: DEFAULT_THINKING_MESSAGE,
-        status: "thinking"
+    let close: (() => void) | undefined;
+    try {
+      const session = await resolveSession(message);
+      await input.callbacks.onEnsureSessionStream(session.id);
+      await input.callbacks.onUserMessage({
+        id: `hub53ai-user-${message.msgId}`,
+        sessionId: session.id,
+        role: "user",
+        content: buildPrompt(message),
+        createdAt: new Date().toISOString()
       });
-    }
+      await input.callbacks.onSessionStatus(session.id, "running");
 
-    const close = input.gateway.subscribe(session.id, input.callbacks.getLastEventSeq(session.id), {
-      onEvent: (event) => {
-        void handleGatewayEvent(message, event);
-      },
-      onDisconnect: (error) => {
-        const messageText = error instanceof Error ? error.message : "gateway stream disconnected";
-        void sendReply({
+      if (input.config.sendThinkingMessage) {
+        await sendReply({
           reqId: message.reqId,
-          text: `⚠️ ${messageText}`,
-          status: "error",
-          error: {
-            code: "WEBSOCKET_ERROR",
-            message: messageText
-          }
+          text: DEFAULT_THINKING_MESSAGE,
+          status: "thinking"
         });
       }
-    });
 
-    const terminalPromise = waitForTerminalEvent(message.reqId);
-    try {
+      const terminalPromise = waitForTerminalEvent(message.reqId);
+      close = input.gateway.subscribe(session.id, input.callbacks.getLastEventSeq(session.id), {
+        onEvent: (event) => {
+          void handleGatewayEvent(message, event);
+        },
+        onDisconnect: (error) => {
+          const messageText = error instanceof Error ? error.message : "gateway stream disconnected";
+          void sendReply({
+            reqId: message.reqId,
+            text: `⚠️ ${messageText}`,
+            status: "error",
+            error: {
+              code: "WEBSOCKET_ERROR",
+              message: messageText
+            }
+          }).finally(() => {
+            resolveTerminalEvent(message.reqId);
+          });
+        }
+      });
+
       await input.gateway.sendMessage(session.id, buildPrompt(message));
       await terminalPromise;
     } catch (error) {
@@ -503,8 +506,9 @@ export function createHub53AIBridge(input: HubBridgeInput) {
         }
       });
     } finally {
-      close();
+      close?.();
       clearTerminalResolver(message.reqId);
+      lastReplyByReq.delete(message.reqId);
     }
   }
 
@@ -559,7 +563,23 @@ export function createHub53AIBridge(input: HubBridgeInput) {
       return;
     }
 
-    if (event.kind === "tool.call" || event.kind === "tool.result" || event.kind === "status.update") {
+    if (event.kind === "assistant.thinking") {
+      const content = String(event.payload?.content ?? "");
+      if (content.trim() && input.config.sendThinkingMessage) {
+        await sendReply({
+          reqId: message.reqId,
+          text: content,
+          status: "thinking"
+        });
+      }
+      return;
+    }
+
+    if (event.kind === "status.update") {
+      return;
+    }
+
+    if (event.kind === "tool.call" || event.kind === "tool.result") {
       const summary = summarizeVisibleActivity(event);
       if (summary && input.config.sendThinkingMessage) {
         await sendReply({
@@ -639,6 +659,14 @@ export function createHub53AIBridge(input: HubBridgeInput) {
       const nextSession = await renamePlaceholderSessionIfNeeded(session, message, desiredTitle);
       await input.callbacks.onSessionUpsert(nextSession);
       return nextSession;
+    }
+
+    if (isOpenClawSessionId(message.chatId)) {
+      const session = await input.gateway.getSession(message.chatId);
+      state.mappings[message.chatId] = session.id;
+      await persistState();
+      await input.callbacks.onSessionUpsert(session);
+      return session;
     }
 
     const session = await input.gateway.createSession(desiredTitle);
@@ -1009,6 +1037,10 @@ function truncateVisibleText(value: string, maxLength: number): string {
 function isOldHubPlaceholderTitle(title: string, chatId: string): boolean {
   const normalized = title.trim();
   return [`53AIHub ${chatId}`, `53AIHub:${chatId}`, `53AIHub-${chatId}`, chatId].includes(normalized);
+}
+
+function isOpenClawSessionId(value: string): boolean {
+  return value.startsWith("agent:");
 }
 
 function buildPrompt(message: Hub53AIIncomingMessage): string {
