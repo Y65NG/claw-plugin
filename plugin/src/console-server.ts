@@ -122,6 +122,11 @@ export function createConsoleServer(input: CreateConsoleServerInput) {
             await store.setSessionStatus(sessionId, status);
             broadcastStatus();
           },
+          onBridgeThinkingEvent: async (event) => {
+            await appendEvent(event);
+            broadcastSessionEvent(event.sessionId, event);
+          },
+          listSessionEvents: (sessionId) => store.getSession(sessionId)?.events ?? [],
           onEnsureSessionStream: ensureSessionStream,
           getLastEventSeq: (sessionId) => store.getLastEventSeq(sessionId),
           onStatusChange: broadcastStatus

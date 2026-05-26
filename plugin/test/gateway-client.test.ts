@@ -726,9 +726,9 @@ describe("gateway client", () => {
           }
           if (frame.method === "chat.history") {
             capturedHistoryParams.push(frame.params ?? {});
-            const offset = Number(frame.params?.offset ?? 0);
             const limit = Number(frame.params?.limit ?? 200);
-            const page = history.slice(offset, offset + limit);
+            const offset = Math.max(0, history.length - limit);
+            const page = history.slice(offset);
             client.send(
               JSON.stringify({
                 type: "res",
@@ -738,7 +738,7 @@ describe("gateway client", () => {
                   messages: page,
                   total: history.length,
                   offset,
-                  hasMore: offset + page.length < history.length,
+                  hasMore: limit < history.length,
                   nextOffset: offset + page.length
                 }
               })

@@ -1823,7 +1823,7 @@ async function readChatHistoryPages(
       limit: fetchLimit
     });
     const fetchedMessages = readHistoryMessageArray(payload);
-    const pageMessages = fetchedMessages.slice(offset, offset + pageLimit);
+    const pageMessages = sliceLatestWindowPage(fetchedMessages, pageLimit, offset);
     const before = messages.length;
     for (const message of pageMessages) {
       const key = messageIdentity(message);
@@ -1841,10 +1841,6 @@ async function readChatHistoryPages(
     if (!pagination.hasMore || messages.length >= target) {
       break;
     }
-    if (pagination.nextOffset !== undefined && pagination.nextOffset > offset) {
-      offset = pagination.nextOffset;
-      continue;
-    }
     if (pageMessages.length > 0) {
       offset += pageMessages.length;
       continue;
@@ -1855,6 +1851,12 @@ async function readChatHistoryPages(
   }
 
   return messages;
+}
+
+function sliceLatestWindowPage<T>(items: T[], limit: number, offset: number): T[] {
+  const end = Math.max(0, items.length - offset);
+  const start = Math.max(0, end - limit);
+  return items.slice(start, end);
 }
 
 function readHistoryMessageArray(payload: unknown): unknown[] {

@@ -60,6 +60,12 @@ export type Hub53AIOutgoingChunk = {
     object: "chat.completion.chunk";
     created: number;
     model: "openclaw-agent";
+    status?: "streaming" | "thinking" | "done" | "error";
+    mode?: string;
+    replace?: boolean;
+    event_kind?: string;
+    session_id?: string;
+    conversation_id?: string;
     choices: Array<{
       index: number;
       delta: {
@@ -94,6 +100,8 @@ type HubBridgeCallbacks = {
   onSessionUpsert(session: GatewaySession): Promise<void>;
   onUserMessage(message: SessionMessage): Promise<void>;
   onSessionStatus(sessionId: string, status: SessionStatus): Promise<void>;
+  onBridgeThinkingEvent?(event: TimelineEvent): Promise<void>;
+  listSessionEvents?(sessionId: string): TimelineEvent[] | Promise<TimelineEvent[]>;
   onEnsureSessionStream(sessionId: string): Promise<void>;
   getLastEventSeq(sessionId: string): number;
   onStatusChange(): void;
@@ -121,7 +129,14 @@ const MAX_OUTBOX_FRAMES = 200;
 const RUN_WAIT_TIMEOUT_MS = 30 * 60 * 1000;
 const HUB_SESSION_TITLE_PREFIX = "53AI Hub-";
 const HUB_TITLE_SUMMARY_LENGTH = 40;
-const HUB_RPC_ACTIONS = new Set(["sessions.list", "sessions.messages", "runtime.get", "cron.tasks"]);
+const HUB_RPC_ACTIONS = new Set([
+  "sessions.list",
+  "sessions.messages",
+  "sessions.events",
+  "sessions.control",
+  "runtime.get",
+  "cron.tasks"
+]);
 
 type Hub53AIRPCRequest = {
   reqId: string;
@@ -161,6 +176,7 @@ export function createHub53AIBridge(input: HubBridgeInput) {
   let sentMessageCount = 0;
   const chatQueues = new Map<string, Promise<void>>();
   const lastReplyByReq = new Map<string, string>();
+  let bridgeEventCounter = 0;
 
   async function start() {
     await loadState();
@@ -361,17 +377,46 @@ export function createHub53AIBridge(input: HubBridgeInput) {
 
     if (request.action === "sessions.messages") {
       const payload = toRecord(request.data);
-      const sessionId = stringOr(payload.session_id, payload.sessionId, payload.conversation_id, payload.conversationId);
-      if (!sessionId) {
-        throw new HubRPCError("PARAM_ERROR", "session_id or conversation_id is required");
-      }
+      const sessionId = readRPCSessionId(payload);
       const pagination = readRPCPagination(payload, 100);
       const fetchLimit = pagination.offset + pagination.limit;
       const messages = await input.gateway.getSessionMessages(sessionId, fetchLimit);
-      const pageMessages = messages.slice(pagination.offset, pagination.offset + pagination.limit);
+      const pageMessages = sliceLatestWindowPage(messages, pagination.limit, pagination.offset);
+      const events = await listSessionEvents(sessionId);
+      const total = messages.length >= fetchLimit ? fetchLimit + 1 : messages.length;
       return {
         messages: pageMessages,
-        pagination: buildPagination(pagination.limit, pagination.offset, messages.length, pageMessages.length)
+        events,
+        pagination: buildPagination(pagination.limit, pagination.offset, total, pageMessages.length)
+      };
+    }
+
+    if (request.action === "sessions.events") {
+      const payload = toRecord(request.data);
+      const sessionId = readRPCSessionId(payload);
+      const pagination = readRPCPagination(payload, 100);
+      const afterSeq = readRPCAfterSeq(payload);
+      const events = (await listSessionEvents(sessionId)).filter((event) => event.seq > afterSeq);
+      const pageEvents = events.slice(pagination.offset, pagination.offset + pagination.limit);
+      return {
+        events: pageEvents,
+        pagination: buildPagination(pagination.limit, pagination.offset, events.length, pageEvents.length)
+      };
+    }
+
+    if (request.action === "sessions.control") {
+      const payload = toRecord(request.data);
+      const sessionId = readRPCSessionId(payload);
+      const action = stringOr(payload.action);
+      if (action !== "stop") {
+        throw new HubRPCError("PARAM_ERROR", "unsupported sessions.control action");
+      }
+      await input.gateway.controlSession(sessionId, "stop");
+      return {
+        ok: true,
+        action,
+        session_id: sessionId,
+        conversation_id: sessionId
       };
     }
 
@@ -393,6 +438,22 @@ export function createHub53AIBridge(input: HubBridgeInput) {
     }
 
     throw new HubRPCError("FEATURE_NOT_AVAILABLE", `Unsupported RPC action: ${request.action}`);
+  }
+
+  async function listSessionEvents(sessionId: string): Promise<TimelineEvent[]> {
+    const [gatewayEvents, storedEvents] = await Promise.all([
+      input.gateway.listEvents(sessionId, 0),
+      input.callbacks.listSessionEvents?.(sessionId) ?? []
+    ]);
+    return dedupeTimelineEvents([...gatewayEvents, ...storedEvents]);
+  }
+
+  function dedupeTimelineEvents(events: TimelineEvent[]): TimelineEvent[] {
+    const byKey = new Map<string, TimelineEvent>();
+    for (const event of events) {
+      byKey.set(event.id || `${event.sessionId}:${event.seq}:${event.kind}`, event);
+    }
+    return [...byKey.values()].sort((left, right) => left.seq - right.seq);
   }
 
   async function resolveRuntimeRPC(payload: unknown): Promise<unknown> {
@@ -451,8 +512,10 @@ export function createHub53AIBridge(input: HubBridgeInput) {
     }
 
     let close: (() => void) | undefined;
+    let sessionId = "";
     try {
       const session = await resolveSession(message);
+      sessionId = session.id;
       await input.callbacks.onEnsureSessionStream(session.id);
       await input.callbacks.onUserMessage({
         id: `hub53ai-user-${message.msgId}`,
@@ -464,17 +527,19 @@ export function createHub53AIBridge(input: HubBridgeInput) {
       await input.callbacks.onSessionStatus(session.id, "running");
 
       if (input.config.sendThinkingMessage) {
+        await recordBridgeThinkingEvent(session.id, DEFAULT_THINKING_MESSAGE);
         await sendReply({
           reqId: message.reqId,
           text: DEFAULT_THINKING_MESSAGE,
-          status: "thinking"
+          status: "thinking",
+          sessionId
         });
       }
 
       const terminalPromise = waitForTerminalEvent(message.reqId);
       close = input.gateway.subscribe(session.id, input.callbacks.getLastEventSeq(session.id), {
         onEvent: (event) => {
-          void handleGatewayEvent(message, event);
+          void handleGatewayEvent(message, event, sessionId);
         },
         onDisconnect: (error) => {
           const messageText = error instanceof Error ? error.message : "gateway stream disconnected";
@@ -482,6 +547,7 @@ export function createHub53AIBridge(input: HubBridgeInput) {
             reqId: message.reqId,
             text: `⚠️ ${messageText}`,
             status: "error",
+            sessionId,
             error: {
               code: "WEBSOCKET_ERROR",
               message: messageText
@@ -500,6 +566,7 @@ export function createHub53AIBridge(input: HubBridgeInput) {
         reqId: message.reqId,
         text: `⚠️ ${messageText}`,
         status: "error",
+        sessionId,
         error: {
           code: inferErrorCode(messageText),
           message: messageText
@@ -549,7 +616,7 @@ export function createHub53AIBridge(input: HubBridgeInput) {
     terminalResolvers.delete(reqId);
   }
 
-  async function handleGatewayEvent(message: Hub53AIIncomingMessage, event: GatewayEvent) {
+  async function handleGatewayEvent(message: Hub53AIIncomingMessage, event: GatewayEvent, sessionId: string) {
     if (event.kind === "assistant.delta" || event.kind === "assistant.message") {
       const content = String(event.payload?.content ?? "");
       const delta = extractReplyDelta(message.reqId, content);
@@ -557,7 +624,11 @@ export function createHub53AIBridge(input: HubBridgeInput) {
         await sendReply({
           reqId: message.reqId,
           text: delta,
-          status: "streaming"
+          status: "streaming",
+          sessionId,
+          mode: readStringMetadata(event.payload, "mode"),
+          replace: readBooleanMetadata(event.payload, "replace"),
+          eventKind: event.kind
         });
       }
       return;
@@ -569,7 +640,11 @@ export function createHub53AIBridge(input: HubBridgeInput) {
         await sendReply({
           reqId: message.reqId,
           text: content,
-          status: "thinking"
+          status: "thinking",
+          sessionId,
+          mode: readStringMetadata(event.payload, "mode"),
+          replace: readBooleanMetadata(event.payload, "replace"),
+          eventKind: event.kind
         });
       }
       return;
@@ -582,10 +657,15 @@ export function createHub53AIBridge(input: HubBridgeInput) {
     if (event.kind === "tool.call" || event.kind === "tool.result") {
       const summary = summarizeVisibleActivity(event);
       if (summary && input.config.sendThinkingMessage) {
+        await recordBridgeThinkingEvent(resolveMappedSessionId(message), summary);
         await sendReply({
           reqId: message.reqId,
           text: summary,
-          status: "thinking"
+          status: "thinking",
+          sessionId,
+          mode: "append",
+          replace: false,
+          eventKind: event.kind
         });
       }
       return;
@@ -597,13 +677,18 @@ export function createHub53AIBridge(input: HubBridgeInput) {
         await sendReply({
           reqId: message.reqId,
           text: finalDelta,
-          status: "streaming"
+          status: "streaming",
+          sessionId,
+          mode: readStringMetadata(event.payload, "mode"),
+          replace: readBooleanMetadata(event.payload, "replace"),
+          eventKind: event.kind
         });
       }
       await sendReply({
         reqId: message.reqId,
         text: "",
-        status: "done"
+        status: "done",
+        sessionId
       });
       lastReplyByReq.delete(message.reqId);
       resolveTerminalEvent(message.reqId);
@@ -616,6 +701,7 @@ export function createHub53AIBridge(input: HubBridgeInput) {
         reqId: message.reqId,
         text: `⚠️ ${errorText}`,
         status: "error",
+        sessionId,
         error: {
           code: inferErrorCode(errorText),
           message: errorText
@@ -624,6 +710,32 @@ export function createHub53AIBridge(input: HubBridgeInput) {
       lastReplyByReq.delete(message.reqId);
       resolveTerminalEvent(message.reqId);
     }
+  }
+
+  function resolveMappedSessionId(message: Hub53AIIncomingMessage): string {
+    return state.mappings[message.chatId] ?? message.chatId;
+  }
+
+  async function recordBridgeThinkingEvent(sessionId: string, content: string) {
+    const normalized = content.trim();
+    if (!normalized || !input.callbacks.onBridgeThinkingEvent) {
+      return;
+    }
+
+    bridgeEventCounter = (bridgeEventCounter + 1) % 1000;
+    const createdAt = new Date().toISOString();
+    const seq = -8_000_000_000_000_000 + Date.now() * 1000 + bridgeEventCounter;
+    await input.callbacks.onBridgeThinkingEvent({
+      id: `${sessionId}:hub-thinking:${Math.abs(seq)}`,
+      sessionId,
+      seq,
+      kind: "assistant.thinking",
+      payload: {
+        content: normalized,
+        source: "hub53ai"
+      },
+      createdAt
+    });
   }
 
   function extractReplyDelta(reqId: string, content: string): string {
@@ -669,11 +781,37 @@ export function createHub53AIBridge(input: HubBridgeInput) {
       return session;
     }
 
-    const session = await input.gateway.createSession(desiredTitle);
+    const session = await createSessionWithUniqueTitle(desiredTitle);
     state.mappings[message.chatId] = session.id;
     await persistState();
     await input.callbacks.onSessionUpsert(session);
     return session;
+  }
+
+  async function createSessionWithUniqueTitle(baseTitle: string): Promise<GatewaySession> {
+    let lastDuplicateError: unknown;
+
+    for (let attempt = 0; attempt < 6; attempt += 1) {
+      const title = buildUniqueHubSessionTitle(baseTitle, attempt);
+      try {
+        return await input.gateway.createSession(title);
+      } catch (error) {
+        if (!isDuplicateSessionTitleError(error)) {
+          throw error;
+        }
+        lastDuplicateError = error;
+      }
+    }
+
+    const fallbackTitle = `${baseTitle} ${Date.now().toString(36)}`;
+    try {
+      return await input.gateway.createSession(fallbackTitle);
+    } catch (error) {
+      if (isDuplicateSessionTitleError(error) && lastDuplicateError) {
+        throw lastDuplicateError;
+      }
+      throw error;
+    }
   }
 
   async function renamePlaceholderSessionIfNeeded(
@@ -697,13 +835,28 @@ export function createHub53AIBridge(input: HubBridgeInput) {
     reqId: string;
     text: string;
     status: "streaming" | "thinking" | "done" | "error";
+    sessionId?: string;
     error?: {
       code: string;
       message: string;
       details?: string;
     };
+    mode?: string;
+    replace?: boolean;
+    eventKind?: string;
   }) {
-    const frame = buildOutgoingChunk(inputReply.reqId, inputReply.text, inputReply.status, inputReply.error);
+    const frame = buildOutgoingChunk(
+      inputReply.reqId,
+      inputReply.text,
+      inputReply.status,
+      inputReply.error,
+      inputReply.sessionId,
+      {
+        mode: inputReply.mode,
+        replace: inputReply.replace,
+        eventKind: inputReply.eventKind
+      }
+    );
     if (!sendRaw(JSON.stringify(frame), true)) {
       state.outbox.push(frame);
       state.outbox = state.outbox.slice(-MAX_OUTBOX_FRAMES);
@@ -901,6 +1054,18 @@ function readRPCPagination(payload: unknown, defaultLimit: number): RPCPaginatio
   };
 }
 
+function readRPCSessionId(payload: Record<string, unknown>): string {
+  const sessionId = stringOr(payload.session_id, payload.sessionId, payload.conversation_id, payload.conversationId);
+  if (!sessionId) {
+    throw new HubRPCError("PARAM_ERROR", "session_id or conversation_id is required");
+  }
+  return sessionId;
+}
+
+function readRPCAfterSeq(payload: Record<string, unknown>): number {
+  return clampNonNegativeInteger(payload.after_seq ?? payload.afterSeq, 0);
+}
+
 function clampPositiveInteger(value: unknown, fallback: number, max: number): number {
   const numberValue = typeof value === "number" ? value : typeof value === "string" ? Number(value) : NaN;
   if (!Number.isInteger(numberValue) || numberValue <= 0) {
@@ -927,6 +1092,12 @@ function buildPagination(limit: number, offset: number, total: number, pageSize:
     hasMore,
     ...(hasMore ? { nextOffset } : {})
   };
+}
+
+export function sliceLatestWindowPage<T>(items: T[], limit: number, offset: number): T[] {
+  const end = Math.max(0, items.length - offset);
+  const start = Math.max(0, end - limit);
+  return items.slice(start, end);
 }
 
 function buildSkillsPayload(runtimeInfo: GatewayRuntimeInfo) {
@@ -1004,6 +1175,18 @@ function buildHubSessionTitle(message: Hub53AIIncomingMessage): string {
   return `${HUB_SESSION_TITLE_PREFIX}${userName}：${summary}`;
 }
 
+function buildUniqueHubSessionTitle(baseTitle: string, attempt: number): string {
+  if (attempt === 0) {
+    return baseTitle;
+  }
+  return `${baseTitle} (${attempt + 1})`;
+}
+
+function isDuplicateSessionTitleError(error: unknown): boolean {
+  const message = error instanceof Error ? error.message : String(error);
+  return /label.*already.*in use|already.*in use|duplicate|title.*exists/i.test(message);
+}
+
 function summarizeHubMessageForTitle(message: Hub53AIIncomingMessage): string {
   const text = normalizeTitleText(message.text || message.quoteContent || "");
   if (text) {
@@ -1058,7 +1241,13 @@ function buildOutgoingChunk(
   reqId: string,
   text: string,
   status: Hub53AIOutgoingChunk["status"],
-  error?: Hub53AIOutgoingChunk["data"]["error"]
+  error?: Hub53AIOutgoingChunk["data"]["error"],
+  sessionId?: string,
+  metadata?: {
+    mode?: string;
+    replace?: boolean;
+    eventKind?: string;
+  }
 ): Hub53AIOutgoingChunk {
   return {
     req_id: reqId,
@@ -1069,6 +1258,11 @@ function buildOutgoingChunk(
       object: "chat.completion.chunk",
       created: Math.floor(Date.now() / 1000),
       model: "openclaw-agent",
+      status,
+      ...(metadata?.mode ? { mode: metadata.mode } : {}),
+      ...(typeof metadata?.replace === "boolean" ? { replace: metadata.replace } : {}),
+      ...(metadata?.eventKind ? { event_kind: metadata.eventKind } : {}),
+      ...(sessionId ? { session_id: sessionId, conversation_id: sessionId } : {}),
       choices: [
         {
           index: 0,
@@ -1082,6 +1276,22 @@ function buildOutgoingChunk(
       ...(error ? { error } : {})
     }
   };
+}
+
+function readStringMetadata(payload: unknown, key: string): string | undefined {
+  if (!payload || typeof payload !== "object") {
+    return undefined;
+  }
+  const value = (payload as Record<string, unknown>)[key];
+  return typeof value === "string" && value.trim() ? value : undefined;
+}
+
+function readBooleanMetadata(payload: unknown, key: string): boolean | undefined {
+  if (!payload || typeof payload !== "object") {
+    return undefined;
+  }
+  const value = (payload as Record<string, unknown>)[key];
+  return typeof value === "boolean" ? value : undefined;
 }
 
 function parseHeartbeat(rawPayload: string): "ping" | "pong" | null {

@@ -6,7 +6,12 @@ import { join } from "node:path";
 import { afterEach, describe, expect, it } from "vitest";
 import WebSocket, { WebSocketServer } from "ws";
 
-import { createHub53AIBridge, parseIncomingMessage, type Hub53AIOutgoingFrame } from "../src/53aihub-client";
+import {
+  createHub53AIBridge,
+  parseIncomingMessage,
+  sliceLatestWindowPage,
+  type Hub53AIOutgoingFrame
+} from "../src/53aihub-client";
 import type { GatewayEvent, GatewaySession } from "../src/gateway-client";
 import type { SessionMessage, SessionStatus } from "../src/models";
 
@@ -19,6 +24,13 @@ afterEach(async () => {
 });
 
 describe("53AIHub client", () => {
+  it("slices older pages from the fetched latest message window", () => {
+    const messages = ["m3", "m4", "m5", "m6"];
+
+    expect(sliceLatestWindowPage(messages, 2, 0)).toEqual(["m5", "m6"]);
+    expect(sliceLatestWindowPage(messages, 2, 2)).toEqual(["m3", "m4"]);
+  });
+
   it("parses OpenAI-compatible chat messages and direct message payloads", () => {
     const chat = parseIncomingMessage(
       JSON.stringify({
@@ -168,6 +180,126 @@ describe("53AIHub client", () => {
     }
   });
 
+  it("preserves OpenClaw stream metadata when sending Hub chat chunks", async () => {
+    const stateDir = await mkdtemp(join(tmpdir(), "claw-53aihub-"));
+    cleanupPaths.push(stateDir);
+    const server = await createFakeHubServer();
+    cleanupServers.push(server.close);
+    const gateway = new FakeGateway();
+    gateway.eventsToEmit = [
+      {
+        id: "evt-delta",
+        sessionId: "session-1",
+        seq: 1,
+        kind: "assistant.delta",
+        payload: {
+          content: "临时回复",
+          state: "delta",
+          mode: "replace",
+          replace: true
+        },
+        createdAt: new Date().toISOString()
+      },
+      {
+        id: "evt-thinking",
+        sessionId: "session-1",
+        seq: 2,
+        kind: "assistant.thinking",
+        payload: {
+          content: "正在思考",
+          state: "final",
+          mode: "replace",
+          replace: true
+        },
+        createdAt: new Date().toISOString()
+      },
+      {
+        id: "evt-done",
+        sessionId: "session-1",
+        seq: 3,
+        kind: "run.completed",
+        payload: { ok: true },
+        createdAt: new Date().toISOString()
+      }
+    ];
+
+    const bridge = createHub53AIBridge({
+      stateDir,
+      config: {
+        enabled: true,
+        botId: "bot-123",
+        secret: "sk-secret",
+        wsUrl: server.url,
+        accessPolicy: "open",
+        allowFrom: [],
+        sendThinkingMessage: true,
+        reconnectBaseMs: 20,
+        maxReconnectAttempts: 2
+      },
+      gateway,
+      callbacks: {
+        onSessionUpsert: async (session) => {
+          gateway.upsertSession(session);
+        },
+        onUserMessage: async () => undefined,
+        onSessionStatus: async () => undefined,
+        onEnsureSessionStream: async () => undefined,
+        getLastEventSeq: () => 0,
+        onStatusChange: () => undefined
+      }
+    });
+
+    await bridge.start();
+    try {
+      const connection = await server.connected;
+      connection.socket.send(
+        JSON.stringify({
+          req_id: "req-meta",
+          action: "chat",
+          data: {
+            user: "user-123",
+            conversation_id: "chat-meta",
+            messages: [{ role: "user", content: "测试" }]
+          }
+        })
+      );
+
+      await waitFor(() => {
+        const streaming = server.frames.find(
+          (frame) =>
+            frame.action === "chat" &&
+            frame.status === "streaming" &&
+            frame.data.choices[0]?.delta.content === "临时回复"
+        );
+        const thinking = server.frames.find(
+          (frame) =>
+            frame.action === "chat" &&
+            frame.status === "thinking" &&
+            frame.data.choices[0]?.delta.content === "正在思考"
+        );
+
+        expect(streaming).toMatchObject({
+          data: {
+            status: "streaming",
+            mode: "replace",
+            replace: true,
+            event_kind: "assistant.delta"
+          }
+        });
+        expect(thinking).toMatchObject({
+          data: {
+            status: "thinking",
+            mode: "replace",
+            replace: true,
+            event_kind: "assistant.thinking"
+          }
+        });
+      });
+    } finally {
+      await bridge.stop();
+    }
+  });
+
   it("renames only old 53AIHub placeholder session titles for existing mappings", async () => {
     const stateDir = await mkdtemp(join(tmpdir(), "claw-53aihub-"));
     cleanupPaths.push(stateDir);
@@ -249,6 +381,90 @@ describe("53AIHub client", () => {
             title: "53AI Hub-杨芳贤：每日CRM与企微资讯简报查看53ai.com官网的更新"
           }
         ]);
+      });
+    } finally {
+      await bridge.stop();
+    }
+  });
+
+  it("creates a uniquely titled session when the first 53AIHub title is already used", async () => {
+    const stateDir = await mkdtemp(join(tmpdir(), "claw-53aihub-"));
+    cleanupPaths.push(stateDir);
+
+    const server = await createFakeHubServer();
+    cleanupServers.push(server.close);
+
+    const gateway = new FakeGateway();
+    gateway.failCreateTitleOnce("53AI Hub-杨芳贤：重复问题", "label already in use");
+    gateway.eventsToEmit = [
+      {
+        id: "evt-1",
+        sessionId: "session-1",
+        seq: 1,
+        kind: "assistant.delta",
+        payload: { content: "created" },
+        createdAt: new Date().toISOString()
+      },
+      {
+        id: "evt-2",
+        sessionId: "session-1",
+        seq: 2,
+        kind: "run.completed",
+        payload: { ok: true },
+        createdAt: new Date().toISOString()
+      }
+    ];
+
+    const bridge = createHub53AIBridge({
+      stateDir,
+      config: {
+        enabled: true,
+        botId: "bot-123",
+        secret: "sk-secret",
+        wsUrl: server.url,
+        accessPolicy: "open",
+        allowFrom: [],
+        sendThinkingMessage: false,
+        reconnectBaseMs: 20,
+        maxReconnectAttempts: 2
+      },
+      gateway,
+      callbacks: {
+        onSessionUpsert: async (session) => {
+          gateway.upsertSession(session);
+        },
+        onUserMessage: async () => undefined,
+        onSessionStatus: async () => undefined,
+        onEnsureSessionStream: async () => undefined,
+        getLastEventSeq: () => 0,
+        onStatusChange: () => undefined
+      }
+    });
+
+    await bridge.start();
+    try {
+      const connection = await server.connected;
+      connection.socket.send(
+        JSON.stringify({
+          req_id: "req-duplicate-title",
+          action: "chat",
+          data: {
+            user: "user-a",
+            conversation_id: "new-chat-a",
+            metadata: { userName: "杨芳贤" },
+            messages: [{ role: "user", content: "重复问题" }]
+          }
+        })
+      );
+
+      await waitFor(() => {
+        expect(gateway.createdTitles).toEqual([
+          "53AI Hub-杨芳贤：重复问题",
+          "53AI Hub-杨芳贤：重复问题 (2)"
+        ]);
+        const streaming = server.frames.find((frame) => frame.action === "chat" && frame.status === "streaming");
+        expect(streaming?.data.session_id).toBe("session-1");
+        expect(streaming?.data.choices[0]?.delta.content).toBe("created");
       });
     } finally {
       await bridge.stop();
@@ -384,8 +600,12 @@ describe("53AIHub client", () => {
         expect(thinkingText).not.toContain("done");
         expect(chatFrames.some((frame) => frame.status === "streaming")).toBe(true);
         const streaming = chatFrames.find((frame) => frame.status === "streaming");
+        expect(streaming?.data.session_id).toBe("session-1");
+        expect(streaming?.data.conversation_id).toBe("session-1");
         expect(streaming?.data.choices[0]?.delta.content).toBe("Hello from local Claw");
         const done = chatFrames.find((frame) => frame.status === "done");
+        expect(done?.data.session_id).toBe("session-1");
+        expect(done?.data.conversation_id).toBe("session-1");
         expect(done?.data.choices[0]?.delta.content).toBe("");
       });
 
@@ -710,6 +930,24 @@ describe("53AIHub client", () => {
         createdAt: "2026-05-20T10:00:01.000Z"
       }
     ]);
+    gateway.eventsBySession.set("session-1", [
+      {
+        id: "event-1",
+        sessionId: "session-1",
+        seq: 1,
+        kind: "assistant.thinking",
+        payload: { content: "checking gateway" },
+        createdAt: "2026-05-20T10:00:00.500Z"
+      },
+      {
+        id: "event-2",
+        sessionId: "session-1",
+        seq: 2,
+        kind: "run.interrupted",
+        payload: { reason: "user stop" },
+        createdAt: "2026-05-20T10:00:02.000Z"
+      }
+    ]);
     gateway.runtimeInfo = {
       modelPrimary: "openai/gpt-5.5",
       enabledSkills: ["browser", "weather"],
@@ -787,6 +1025,30 @@ describe("53AIHub client", () => {
       );
       connection.socket.send(
         JSON.stringify({
+          req_id: "rpc-events",
+          action: "sessions.events",
+          status: "request",
+          data: { session_id: "session-1", limit: 1, offset: 1 }
+        })
+      );
+      connection.socket.send(
+        JSON.stringify({
+          req_id: "rpc-control",
+          action: "sessions.control",
+          status: "request",
+          data: { session_id: "session-1", action: "stop" }
+        })
+      );
+      connection.socket.send(
+        JSON.stringify({
+          req_id: "rpc-control-invalid",
+          action: "sessions.control",
+          status: "request",
+          data: { session_id: "session-1", action: "pause" }
+        })
+      );
+      connection.socket.send(
+        JSON.stringify({
           req_id: "rpc-skills",
           action: "runtime.get",
           status: "request",
@@ -839,8 +1101,32 @@ describe("53AIHub client", () => {
           action: "sessions.messages",
           status: "done",
           data: {
-            messages: [{ id: "message-2", content: "hi" }],
+            messages: [{ id: "message-1", content: "hello" }],
+            pagination: { limit: 1, offset: 1, total: 3, hasMore: true, nextOffset: 2 }
+          }
+        });
+        expect(frameByReq(server.frames, "rpc-events")).toMatchObject({
+          action: "sessions.events",
+          status: "done",
+          data: {
+            events: [{ id: "event-2", kind: "run.interrupted" }],
             pagination: { limit: 1, offset: 1, total: 2, hasMore: false }
+          }
+        });
+        expect(frameByReq(server.frames, "rpc-control")).toMatchObject({
+          action: "sessions.control",
+          status: "done",
+          data: {
+            ok: true,
+            action: "stop",
+            session_id: "session-1"
+          }
+        });
+        expect(frameByReq(server.frames, "rpc-control-invalid")).toMatchObject({
+          action: "sessions.control",
+          status: "error",
+          data: {
+            code: "PARAM_ERROR"
           }
         });
         expect(frameByReq(server.frames, "rpc-skills")).toMatchObject({
@@ -878,6 +1164,7 @@ describe("53AIHub client", () => {
       });
       expect(frameByReq(server.frames, "rpc-server-response")).toBeUndefined();
       expect(gateway.sentMessages).toEqual([]);
+      expect(gateway.controls).toEqual([{ sessionId: "session-1", action: "stop" }]);
     } finally {
       await bridge.stop();
     }
@@ -894,8 +1181,11 @@ class FakeGateway {
   disconnectCompletionDelayMs = 0;
   createdTitles: string[] = [];
   renames: Array<{ sessionId: string; title: string }> = [];
+  controls: Array<{ sessionId: string; action: string }> = [];
+  private createTitleFailures = new Map<string, string>();
   sessionPage?: { sessions: GatewaySession[]; pagination: { limit: number; offset: number; total?: number; hasMore: boolean } };
   messagesBySession = new Map<string, SessionMessage[]>();
+  eventsBySession = new Map<string, GatewayEvent[]>();
   runtimeInfo?: {
     modelPrimary?: string;
     enabledSkills: string[];
@@ -929,6 +1219,11 @@ class FakeGateway {
 
   async createSession(title: string): Promise<GatewaySession> {
     this.createdTitles.push(title);
+    const failure = this.createTitleFailures.get(title);
+    if (failure) {
+      this.createTitleFailures.delete(title);
+      throw new Error(failure);
+    }
     const now = new Date().toISOString();
     const session: GatewaySession = {
       id: `session-${this.sessions.size + 1}`,
@@ -942,6 +1237,10 @@ class FakeGateway {
     };
     this.sessions.set(session.id, session);
     return session;
+  }
+
+  failCreateTitleOnce(title: string, message: string) {
+    this.createTitleFailures.set(title, message);
   }
 
   upsertSession(session: GatewaySession) {
@@ -1006,6 +1305,9 @@ class FakeGateway {
   }
 
   async controlSession(sessionId: string, action?: string, title?: string): Promise<void> {
+    if (action) {
+      this.controls.push({ sessionId, action });
+    }
     if (action === "rename" && title) {
       this.renames.push({ sessionId, title });
       const session = this.sessions.get(sessionId);
@@ -1020,8 +1322,8 @@ class FakeGateway {
     return;
   }
 
-  async listEvents(): Promise<GatewayEvent[]> {
-    return [];
+  async listEvents(sessionId: string, afterSeq = 0): Promise<GatewayEvent[]> {
+    return (this.eventsBySession.get(sessionId) ?? []).filter((event) => event.seq > afterSeq);
   }
 
   subscribe(
