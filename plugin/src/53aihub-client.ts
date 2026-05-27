@@ -64,6 +64,7 @@ export type Hub53AIOutgoingChunk = {
     mode?: string;
     replace?: boolean;
     event_kind?: string;
+    payload?: Record<string, unknown>;
     session_id?: string;
     conversation_id?: string;
     choices: Array<{
@@ -131,6 +132,7 @@ const HUB_SESSION_TITLE_PREFIX = "53AI Hub-";
 const HUB_TITLE_SUMMARY_LENGTH = 40;
 const HUB_RPC_ACTIONS = new Set([
   "sessions.list",
+  "sessions.current",
   "sessions.messages",
   "sessions.events",
   "sessions.control",
@@ -375,6 +377,10 @@ export function createHub53AIBridge(input: HubBridgeInput) {
       });
     }
 
+    if (request.action === "sessions.current") {
+      return resolveCurrentSessionRPC(request.data);
+    }
+
     if (request.action === "sessions.messages") {
       const payload = toRecord(request.data);
       const sessionId = readRPCSessionId(payload);
@@ -451,9 +457,45 @@ export function createHub53AIBridge(input: HubBridgeInput) {
   function dedupeTimelineEvents(events: TimelineEvent[]): TimelineEvent[] {
     const byKey = new Map<string, TimelineEvent>();
     for (const event of events) {
-      byKey.set(event.id || `${event.sessionId}:${event.seq}:${event.kind}`, event);
+      const key = timelineEventDedupeKey(event);
+      const previous = byKey.get(key);
+      byKey.set(key, previous ? mergeTimelineEvent(previous, event) : event);
     }
     return [...byKey.values()].sort((left, right) => left.seq - right.seq);
+  }
+
+  function timelineEventDedupeKey(event: TimelineEvent): string {
+    const payload = toRecord(event.payload);
+    const data = toRecord(payload.data);
+    const toolCallId = stringOr(data.toolCallId, data.callId, payload.toolCallId, payload.callId);
+    if ((event.kind === "tool.call" || event.kind === "tool.result") && toolCallId) {
+      return `${event.sessionId}:${event.kind}:${toolCallId}`;
+    }
+    return event.id || `${event.sessionId}:${event.seq}:${event.kind}`;
+  }
+
+  function mergeTimelineEvent(previous: TimelineEvent, incoming: TimelineEvent): TimelineEvent {
+    return {
+      ...previous,
+      payload: mergeTimelinePayload(previous.payload, incoming.payload)
+    };
+  }
+
+  function mergeTimelinePayload(previous: Record<string, unknown>, incoming: Record<string, unknown>): Record<string, unknown> {
+    const previousData = toRecord(previous.data);
+    const incomingData = toRecord(incoming.data);
+    return {
+      ...previous,
+      ...incoming,
+      ...(Object.keys(previousData).length > 0 || Object.keys(incomingData).length > 0
+        ? {
+            data: {
+              ...previousData,
+              ...incomingData
+            }
+          }
+        : {})
+    };
   }
 
   async function resolveRuntimeRPC(payload: unknown): Promise<unknown> {
@@ -475,6 +517,44 @@ export function createHub53AIBridge(input: HubBridgeInput) {
       skills: buildSkillsPayload(runtimeInfo),
       cronTasks: runtimeInfo.cronTasks ?? []
     };
+  }
+
+  async function resolveCurrentSessionRPC(payload: unknown): Promise<GatewaySession | null> {
+    const record = toRecord(payload);
+    const userObject = toRecord(record.user);
+    const chatId = stringOr(
+      record.chat_id,
+      record.chatId,
+      record.user,
+      userObject.id,
+      userObject.userId,
+      record.user_id,
+      record.userId
+    );
+    if (!chatId) {
+      throw new HubRPCError("PARAM_ERROR", "chat_id or user is required");
+    }
+
+    const mappedSession = await getMappedSession(chatId);
+    if (mappedSession) {
+      return mappedSession;
+    }
+
+    return null;
+  }
+
+  async function getMappedSession(chatId: string): Promise<GatewaySession | null> {
+    const mappedId = state.mappings[chatId];
+    if (!mappedId) {
+      return null;
+    }
+    try {
+      return await input.gateway.getSession(mappedId);
+    } catch {
+      delete state.mappings[chatId];
+      await persistState();
+      return null;
+    }
   }
 
   async function buildFallbackStatus() {
@@ -536,10 +616,14 @@ export function createHub53AIBridge(input: HubBridgeInput) {
         });
       }
 
+      const eventScope: GatewayEventScope = {
+        eventBoundaryMs: Date.now(),
+        currentActivitySeen: false
+      };
       const terminalPromise = waitForTerminalEvent(message.reqId);
       close = input.gateway.subscribe(session.id, input.callbacks.getLastEventSeq(session.id), {
         onEvent: (event) => {
-          void handleGatewayEvent(message, event, sessionId);
+          void handleGatewayEvent(message, event, sessionId, eventScope);
         },
         onDisconnect: (error) => {
           const messageText = error instanceof Error ? error.message : "gateway stream disconnected";
@@ -616,7 +700,24 @@ export function createHub53AIBridge(input: HubBridgeInput) {
     terminalResolvers.delete(reqId);
   }
 
-  async function handleGatewayEvent(message: Hub53AIIncomingMessage, event: GatewayEvent, sessionId: string) {
+  type GatewayEventScope = {
+    eventBoundaryMs: number;
+    currentActivitySeen: boolean;
+  };
+
+  async function handleGatewayEvent(
+    message: Hub53AIIncomingMessage,
+    event: GatewayEvent,
+    sessionId: string,
+    eventScope: GatewayEventScope
+  ) {
+    if (isReplayFromPreviousRun(event, eventScope)) {
+      return;
+    }
+    if (isCurrentRunActivityEvent(event)) {
+      eventScope.currentActivitySeen = true;
+    }
+
     if (event.kind === "assistant.delta" || event.kind === "assistant.message") {
       const content = String(event.payload?.content ?? "");
       const delta = extractReplyDelta(message.reqId, content);
@@ -628,7 +729,8 @@ export function createHub53AIBridge(input: HubBridgeInput) {
           sessionId,
           mode: readStringMetadata(event.payload, "mode"),
           replace: readBooleanMetadata(event.payload, "replace"),
-          eventKind: event.kind
+          eventKind: event.kind,
+          payload: event.payload
         });
       }
       return;
@@ -644,7 +746,8 @@ export function createHub53AIBridge(input: HubBridgeInput) {
           sessionId,
           mode: readStringMetadata(event.payload, "mode"),
           replace: readBooleanMetadata(event.payload, "replace"),
-          eventKind: event.kind
+          eventKind: event.kind,
+          payload: event.payload
         });
       }
       return;
@@ -665,7 +768,8 @@ export function createHub53AIBridge(input: HubBridgeInput) {
           sessionId,
           mode: "append",
           replace: false,
-          eventKind: event.kind
+          eventKind: event.kind,
+          payload: event.payload
         });
       }
       return;
@@ -710,6 +814,35 @@ export function createHub53AIBridge(input: HubBridgeInput) {
       lastReplyByReq.delete(message.reqId);
       resolveTerminalEvent(message.reqId);
     }
+  }
+
+  function isReplayFromPreviousRun(event: GatewayEvent, eventScope: GatewayEventScope): boolean {
+    if (eventScope.currentActivitySeen || !isTerminalRunEvent(event)) {
+      return false;
+    }
+    const eventMs = Date.parse(event.createdAt);
+    return Number.isFinite(eventMs) && eventMs < eventScope.eventBoundaryMs;
+  }
+
+  function isTerminalRunEvent(event: GatewayEvent): boolean {
+    return event.kind === "run.completed" || event.kind === "run.failed" || event.kind === "run.interrupted";
+  }
+
+  function isCurrentRunActivityEvent(event: GatewayEvent): boolean {
+    if (event.kind === "run.started") {
+      return true;
+    }
+    if (
+      event.kind === "assistant.delta" ||
+      event.kind === "assistant.message" ||
+      event.kind === "assistant.thinking" ||
+      event.kind === "tool.call" ||
+      event.kind === "tool.result"
+    ) {
+      return true;
+    }
+    const payload = toRecord(event.payload);
+    return event.kind === "status.update" && String(payload.phase ?? payload.status ?? "") === "running";
   }
 
   function resolveMappedSessionId(message: Hub53AIIncomingMessage): string {
@@ -844,6 +977,7 @@ export function createHub53AIBridge(input: HubBridgeInput) {
     mode?: string;
     replace?: boolean;
     eventKind?: string;
+    payload?: Record<string, unknown>;
   }) {
     const frame = buildOutgoingChunk(
       inputReply.reqId,
@@ -854,7 +988,8 @@ export function createHub53AIBridge(input: HubBridgeInput) {
       {
         mode: inputReply.mode,
         replace: inputReply.replace,
-        eventKind: inputReply.eventKind
+        eventKind: inputReply.eventKind,
+        payload: inputReply.payload
       }
     );
     if (!sendRaw(JSON.stringify(frame), true)) {
@@ -1247,6 +1382,7 @@ function buildOutgoingChunk(
     mode?: string;
     replace?: boolean;
     eventKind?: string;
+    payload?: Record<string, unknown>;
   }
 ): Hub53AIOutgoingChunk {
   return {
@@ -1262,6 +1398,7 @@ function buildOutgoingChunk(
       ...(metadata?.mode ? { mode: metadata.mode } : {}),
       ...(typeof metadata?.replace === "boolean" ? { replace: metadata.replace } : {}),
       ...(metadata?.eventKind ? { event_kind: metadata.eventKind } : {}),
+      ...(metadata?.payload ? { payload: metadata.payload } : {}),
       ...(sessionId ? { session_id: sessionId, conversation_id: sessionId } : {}),
       choices: [
         {

@@ -110,6 +110,8 @@ type GatewayRequestOptions = {
   timeoutMs?: number | null;
 };
 
+const OPENCLAW_ABORT_ACK_TIMEOUT_MS = 1_000;
+
 type PendingRequest = {
   resolve: (value: unknown) => void;
   reject: (error: Error) => void;
@@ -137,6 +139,7 @@ const CHAT_HISTORY_PAGE_LIMIT = 200;
 const CHAT_HISTORY_MAX_PAGES = 100;
 const CRON_LIST_PAGE_LIMIT = 50;
 const CRON_LIST_MAX_PAGES = 100;
+const OPENCLAW_STOP_SETTLE_TIMEOUT_MS = 3_000;
 
 type RpcTransport = {
   request(method: string, params: Record<string, unknown>, options?: GatewayRequestOptions): Promise<any>;
@@ -172,6 +175,83 @@ export function createGatewayClient(config: Partial<GatewayConfig>): GatewayClie
         handler.onEvent(event);
       }
     }
+  };
+
+  const subscribeToSession = (
+    sessionId: string,
+    afterSeq: number,
+    handlers: {
+      onEvent: (event: GatewayEvent) => void;
+      onDisconnect: (error?: Error) => void;
+    }
+  ) => {
+    const subscription = subscriptions.get(sessionId) ?? {
+      handlers: new Set(),
+      lastSeq: afterSeq,
+      openedAtMs: Date.now(),
+      activeRunIds: new Set<string>(),
+      renderedAssistantTextByRun: new Map<string, string>(),
+      renderedThinkingTextByRun: new Map<string, string>()
+    };
+    subscription.lastSeq = Math.max(subscription.lastSeq, afterSeq);
+    subscription.handlers.add(handlers);
+    subscriptions.set(sessionId, subscription);
+
+    void ensureSubscribed(sessionId).catch((error) => {
+      handlers.onDisconnect(error instanceof Error ? error : new Error(String(error)));
+    });
+
+    return () => {
+      const existing = subscriptions.get(sessionId);
+      if (!existing) {
+        return;
+      }
+      existing.handlers.delete(handlers);
+      if (existing.handlers.size === 0) {
+        subscriptions.delete(sessionId);
+        void transport
+          .request("sessions.messages.unsubscribe", { key: sessionId }, { timeoutMs: 2_000 })
+          .catch(() => {});
+      }
+    };
+  };
+
+  const createOpenClawStopSettledWait = (sessionId: string, startedAtMs: number) => {
+    let done = false;
+    let close: (() => void) | undefined;
+    let timer: NodeJS.Timeout;
+    let resolvePromise: () => void = () => {};
+    const timeoutMs = Math.min(resolved.requestTimeoutMs, OPENCLAW_STOP_SETTLE_TIMEOUT_MS);
+
+    const finish = () => {
+      if (done) {
+        return;
+      }
+      done = true;
+      clearTimeout(timer);
+      close?.();
+      resolvePromise();
+    };
+
+    const promise = new Promise<void>((resolve) => {
+      resolvePromise = resolve;
+      timer = setTimeout(finish, timeoutMs);
+      close = subscribeToSession(sessionId, subscriptions.get(sessionId)?.lastSeq ?? 0, {
+        onEvent: (event) => {
+          if (isOpenClawStopSettledEvent(event, startedAtMs)) {
+            finish();
+          }
+        },
+        onDisconnect: () => {
+          finish();
+        }
+      });
+    });
+
+    return {
+      promise,
+      cancel: finish
+    };
   };
 
   transport.onEvent((frame) => {
@@ -269,7 +349,7 @@ export function createGatewayClient(config: Partial<GatewayConfig>): GatewayClie
       await transport.request("chat.send", {
         sessionKey: sessionId,
         message: content,
-        deliver: false,
+        deliver: true,
         idempotencyKey: randomUUID()
       });
     },
@@ -292,9 +372,32 @@ export function createGatewayClient(config: Partial<GatewayConfig>): GatewayClie
           return;
         }
 
-        await transport.request("chat.abort", {
-          sessionKey: sessionId
-        });
+        const stopSettled = createOpenClawStopSettledWait(sessionId, Date.now());
+        try {
+          await transport.request(
+            "chat.abort",
+            {
+              sessionKey: sessionId
+            },
+            { timeoutMs: Math.min(resolved.requestTimeoutMs, OPENCLAW_ABORT_ACK_TIMEOUT_MS) }
+          );
+        } catch (error) {
+          if (!isGatewayRequestTimeoutFor(error, "chat.abort")) {
+            stopSettled.cancel();
+            throw error;
+          }
+          emitEvents(sessionId, [
+            {
+              id: `${sessionId}:abort-timeout:interrupted:${Date.now()}`,
+              sessionId,
+              seq: (subscriptions.get(sessionId)?.lastSeq ?? 0) + 1,
+              kind: "run.interrupted",
+              payload: { transport: "gateway-ws", reason: "chat.abort submitted but ack timed out" },
+              createdAt: new Date().toISOString()
+            }
+          ]);
+        }
+        await stopSettled.promise;
         return;
       }
       if (action === "rename") {
@@ -321,35 +424,7 @@ export function createGatewayClient(config: Partial<GatewayConfig>): GatewayClie
       return synthesizeEventsFromHistoryMessages(sessionId, rawMessages, afterSeq);
     },
     subscribe(sessionId, afterSeq, handlers) {
-      const subscription = subscriptions.get(sessionId) ?? {
-        handlers: new Set(),
-        lastSeq: afterSeq,
-        openedAtMs: Date.now(),
-        activeRunIds: new Set<string>(),
-        renderedAssistantTextByRun: new Map<string, string>(),
-        renderedThinkingTextByRun: new Map<string, string>()
-      };
-      subscription.lastSeq = Math.max(subscription.lastSeq, afterSeq);
-      subscription.handlers.add(handlers);
-      subscriptions.set(sessionId, subscription);
-
-      void ensureSubscribed(sessionId).catch((error) => {
-        handlers.onDisconnect(error instanceof Error ? error : new Error(String(error)));
-      });
-
-      return () => {
-        const existing = subscriptions.get(sessionId);
-        if (!existing) {
-          return;
-        }
-        existing.handlers.delete(handlers);
-        if (existing.handlers.size === 0) {
-          subscriptions.delete(sessionId);
-          void transport
-            .request("sessions.messages.unsubscribe", { key: sessionId }, { timeoutMs: 2_000 })
-            .catch(() => {});
-        }
-      };
+      return subscribeToSession(sessionId, afterSeq, handlers);
     },
     async stop() {
       subscriptions.clear();
@@ -941,6 +1016,10 @@ function mapResponsesToolEvent(
 function readStringFromUnknown(value: unknown, path: string[]): string | undefined {
   const current = readUnknownPath(value, path);
   return typeof current === "string" && current.trim() ? current : undefined;
+}
+
+function isGatewayRequestTimeoutFor(error: unknown, method: string): boolean {
+  return error instanceof Error && error.message === `gateway request timeout for ${method}`;
 }
 
 function readUnknownPath(value: unknown, path: string[]): unknown {
@@ -1951,6 +2030,7 @@ function synthesizeEventsFromHistoryMessages(
   rawMessages: unknown[],
   afterSeq: number
 ): GatewayEvent[] {
+  const expandsCompoundHistory = rawMessages.some(shouldExpandHistoryMessage);
   return rawMessages
     .flatMap((message) => {
       if (!message || typeof message !== "object") {
@@ -1959,33 +2039,246 @@ function synthesizeEventsFromHistoryMessages(
 
       const entry = message as Record<string, unknown>;
       const role = typeof entry.role === "string" ? entry.role : "";
-      if (role !== "assistant") {
-        return [];
+      const rawSeq = readHistoryMessageSeq(entry);
+      const createdAt = toIsoString(entry.timestamp ?? Date.now());
+
+      if (role === "assistant") {
+        const events: GatewayEvent[] = [];
+        let localIndex = 0;
+        const thinking = extractThinkingContent(entry.content);
+        if (thinking?.trim()) {
+          events.push({
+            id: `${sessionId}:history:${rawSeq}:thinking`,
+            sessionId,
+            seq: historyEventSeq(rawSeq, localIndex, expandsCompoundHistory),
+            kind: "assistant.thinking",
+            payload: buildThinkingPayload(thinking, true, {
+              state: "final",
+              mode: "replace",
+              replace: true,
+              rawSeq
+            }),
+            createdAt
+          });
+          localIndex += 1;
+        }
+
+        for (const toolCall of extractToolCalls(entry.content)) {
+          events.push({
+            id: `${sessionId}:history:${rawSeq}:tool-call:${toolCall.id}`,
+            sessionId,
+            seq: historyEventSeq(rawSeq, localIndex, expandsCompoundHistory),
+            kind: "tool.call",
+            payload: {
+              data: {
+                phase: "call",
+                name: toolCall.name,
+                toolCallId: toolCall.id,
+                ...(toolCall.args !== undefined ? { args: toolCall.args } : {}),
+                ...(toolCall.meta ? { meta: toolCall.meta } : {})
+              },
+              rawSeq
+            },
+            createdAt
+          });
+          localIndex += 1;
+        }
+
+        const content = extractTextContent(entry.content) ?? "";
+        if (content.trim()) {
+          events.push({
+            id: `${sessionId}:history:${rawSeq}:assistant`,
+            sessionId,
+            seq: historyEventSeq(rawSeq, localIndex, expandsCompoundHistory),
+            kind: "assistant.message",
+            payload: {
+              content
+            },
+            createdAt
+          });
+        }
+
+        return events;
       }
 
-      const rawMeta =
-        entry.__openclaw && typeof entry.__openclaw === "object"
-          ? (entry.__openclaw as Record<string, unknown>)
-          : {};
-      const seq = typeof rawMeta.seq === "number" ? rawMeta.seq : 0;
-      if (seq <= afterSeq) {
-        return [];
+      if (isToolResultRole(role)) {
+        return [
+          {
+            id: `${sessionId}:history:${rawSeq}:tool-result:${readHistoryToolResultId(entry)}`,
+            sessionId,
+            seq: historyEventSeq(rawSeq, 0, expandsCompoundHistory),
+            kind: "tool.result",
+            payload: buildHistoryToolResultPayload(entry, rawSeq),
+            createdAt
+          } satisfies GatewayEvent
+        ];
       }
 
-      return [
-        {
-          id: `${sessionId}:history:${seq}`,
-          sessionId,
-          seq,
-          kind: "assistant.message",
-          payload: {
-            content: extractTextContent(entry.content) ?? ""
-          },
-          createdAt: toIsoString(entry.timestamp ?? Date.now())
-        } satisfies GatewayEvent
-      ];
+      return [];
     })
+    .filter((event) => event.seq > afterSeq)
     .sort((left, right) => left.seq - right.seq);
+}
+
+function shouldExpandHistoryMessage(message: unknown): boolean {
+  if (!message || typeof message !== "object") {
+    return false;
+  }
+  const entry = message as Record<string, unknown>;
+  const role = typeof entry.role === "string" ? entry.role : "";
+  if (isToolResultRole(role)) {
+    return true;
+  }
+  if (role !== "assistant") {
+    return false;
+  }
+  return Boolean(extractThinkingContent(entry.content)?.trim() || extractToolCalls(entry.content).length > 0);
+}
+
+function readHistoryMessageSeq(entry: Record<string, unknown>): number {
+  const rawMeta =
+    entry.__openclaw && typeof entry.__openclaw === "object" ? (entry.__openclaw as Record<string, unknown>) : {};
+  const seq = typeof rawMeta.seq === "number" ? rawMeta.seq : Number(rawMeta.seq);
+  return Number.isFinite(seq) ? seq : 0;
+}
+
+function historyEventSeq(rawSeq: number, localIndex: number, expanded: boolean): number {
+  if (!expanded) {
+    return rawSeq;
+  }
+  if (rawSeq > 0) {
+    return rawSeq * 10 + localIndex;
+  }
+  return localIndex;
+}
+
+function isToolResultRole(role: string): boolean {
+  return ["toolresult", "tool_result", "tool"].includes(role.toLowerCase());
+}
+
+type HistoryToolCall = {
+  id: string;
+  name: string;
+  args?: unknown;
+  meta?: string;
+};
+
+function extractToolCalls(content: unknown): HistoryToolCall[] {
+  if (!Array.isArray(content)) {
+    return [];
+  }
+
+  return content.flatMap((item, index) => {
+    if (!item || typeof item !== "object") {
+      return [];
+    }
+    const record = item as Record<string, unknown>;
+    const type = typeof record.type === "string" ? record.type.toLowerCase().replace(/[_-]/g, "") : "";
+    if (type !== "toolcall" && type !== "functioncall") {
+      return [];
+    }
+
+    const name =
+      stringProperty(record, ["name", "toolName", "functionName"]) ??
+      readStringFromUnknown(record, ["function", "name"]) ??
+      "tool";
+    const args = normalizeToolArguments(
+      record.arguments ?? record.args ?? record.input ?? record.parameters ?? readUnknownPath(record, ["function", "arguments"])
+    );
+    const id =
+      stringProperty(record, ["id", "toolCallId", "callId"]) ??
+      readStringFromUnknown(record, ["function", "id"]) ??
+      `${name}:${index}`;
+
+    return [
+      {
+        id,
+        name,
+        ...(args !== undefined ? { args } : {}),
+        ...(summarizeToolCallMeta(name, args) ? { meta: summarizeToolCallMeta(name, args) } : {})
+      }
+    ];
+  });
+}
+
+function normalizeToolArguments(value: unknown): unknown {
+  if (typeof value !== "string") {
+    return value;
+  }
+  const trimmed = value.trim();
+  if (!trimmed) {
+    return undefined;
+  }
+  try {
+    return JSON.parse(trimmed);
+  } catch {
+    return trimmed;
+  }
+}
+
+function summarizeToolCallMeta(name: string, args: unknown): string | undefined {
+  const normalizedName = name.toLowerCase();
+  const record = toRecord(args);
+  const query = stringProperty(record, ["query", "q"]);
+  const url = stringProperty(record, ["url", "href"]);
+  const count = numberProperty(record, ["count", "limit", "topK", "top_k"]);
+  const maxChars = numberProperty(record, ["maxChars", "max_chars"]);
+
+  if (normalizedName.includes("search") && query) {
+    return count ? `for "${query}" (top ${count})` : `for "${query}"`;
+  }
+  if (normalizedName.includes("fetch") && url) {
+    return maxChars ? `from ${url} (max ${maxChars} chars)` : `from ${url}`;
+  }
+  if (query) {
+    return query;
+  }
+  return url;
+}
+
+function readHistoryToolResultId(entry: Record<string, unknown>): string {
+  return stringProperty(entry, ["toolCallId", "callId", "id"]) ?? "unknown";
+}
+
+function buildHistoryToolResultPayload(entry: Record<string, unknown>, rawSeq: number): Record<string, unknown> {
+  const content = extractTextContent(entry.content) ?? (typeof entry.content === "string" ? entry.content : "");
+  const details = parseJsonObject(content) ?? content;
+  const detailsRecord = toRecord(details);
+  const name =
+    stringProperty(entry, ["toolName", "name", "tool"]) ??
+    stringProperty(detailsRecord, ["tool", "name"]) ??
+    "tool";
+  const toolCallId = readHistoryToolResultId(entry);
+  const isError =
+    entry.isError === true ||
+    String(detailsRecord.status ?? "").toLowerCase() === "error" ||
+    Boolean(detailsRecord.error);
+
+  return {
+    data: {
+      phase: "result",
+      name,
+      toolCallId,
+      isError,
+      result: {
+        content,
+        details
+      }
+    },
+    rawSeq
+  };
+}
+
+function parseJsonObject(value: string): unknown | undefined {
+  const trimmed = value.trim();
+  if (!trimmed) {
+    return undefined;
+  }
+  try {
+    return JSON.parse(trimmed);
+  } catch {
+    return undefined;
+  }
 }
 
 function mapGatewayFrameToEvents(
@@ -2174,9 +2467,15 @@ function mapGatewayFrameToEvents(
       ];
     }
     if (phase === "end") {
-      const status = String(payload.status ?? session.status ?? "");
+      const status = normalizeRunEndStatus(payload.status ?? session.status);
       const eventKind =
-        status === "done" ? "run.completed" : status === "aborted" ? "run.interrupted" : "status.update";
+        status === "completed"
+          ? "run.completed"
+          : status === "failed"
+            ? "run.failed"
+            : status === "interrupted"
+              ? "run.interrupted"
+              : "status.update";
       return [
         {
           id: `${sessionId}:status:${seq}`,
@@ -2201,6 +2500,34 @@ function mapGatewayFrameToEvents(
   }
 
   return [];
+}
+
+function normalizeRunEndStatus(value: unknown): "completed" | "failed" | "interrupted" | "unknown" {
+  const status = String(value ?? "").trim().toLowerCase();
+  if (["done", "success", "succeeded", "completed", "complete"].includes(status)) {
+    return "completed";
+  }
+  if (["failed", "failure", "error", "errored", "timeout", "timed_out", "timedout"].includes(status)) {
+    return "failed";
+  }
+  if (["aborted", "abort", "cancelled", "canceled", "interrupted"].includes(status)) {
+    return "interrupted";
+  }
+  return "unknown";
+}
+
+function isOpenClawStopSettledEvent(event: GatewayEvent, startedAtMs: number): boolean {
+  if (event.kind !== "run.completed" && event.kind !== "run.failed" && event.kind !== "run.interrupted") {
+    return false;
+  }
+
+  const eventMs = Date.parse(event.createdAt);
+  if (Number.isFinite(eventMs) && eventMs < startedAtMs - 100) {
+    return false;
+  }
+
+  const payload = toRecord(event.payload);
+  return String(payload.phase ?? "") === "end";
 }
 
 function extractSessionKey(payload: unknown): string | null {

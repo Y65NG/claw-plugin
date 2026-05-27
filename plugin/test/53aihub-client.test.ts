@@ -214,9 +214,24 @@ describe("53AIHub client", () => {
         createdAt: new Date().toISOString()
       },
       {
-        id: "evt-done",
+        id: "evt-tool-call",
         sessionId: "session-1",
         seq: 3,
+        kind: "tool.call",
+        payload: {
+          data: {
+            name: "web_search",
+            args: {
+              query: "OpenClaw 53AI"
+            }
+          }
+        },
+        createdAt: new Date().toISOString()
+      },
+      {
+        id: "evt-done",
+        sessionId: "session-1",
+        seq: 4,
         kind: "run.completed",
         payload: { ok: true },
         createdAt: new Date().toISOString()
@@ -277,6 +292,12 @@ describe("53AIHub client", () => {
             frame.status === "thinking" &&
             frame.data.choices[0]?.delta.content === "正在思考"
         );
+        const toolCall = server.frames.find(
+          (frame) =>
+            frame.action === "chat" &&
+            frame.status === "thinking" &&
+            frame.data.event_kind === "tool.call"
+        );
 
         expect(streaming).toMatchObject({
           data: {
@@ -291,7 +312,29 @@ describe("53AIHub client", () => {
             status: "thinking",
             mode: "replace",
             replace: true,
-            event_kind: "assistant.thinking"
+            event_kind: "assistant.thinking",
+            payload: {
+              content: "正在思考",
+              state: "final",
+              mode: "replace",
+              replace: true
+            }
+          }
+        });
+        expect(toolCall).toMatchObject({
+          data: {
+            status: "thinking",
+            mode: "append",
+            replace: false,
+            event_kind: "tool.call",
+            payload: {
+              data: {
+                name: "web_search",
+                args: {
+                  query: "OpenClaw 53AI"
+                }
+              }
+            }
           }
         });
       });
@@ -621,6 +664,100 @@ describe("53AIHub client", () => {
     }
   });
 
+  it("ignores stale terminal events replayed before the current OpenClaw send", async () => {
+    const stateDir = await mkdtemp(join(tmpdir(), "claw-53aihub-"));
+    cleanupPaths.push(stateDir);
+
+    const server = await createFakeHubServer();
+    cleanupServers.push(server.close);
+
+    const gateway = new FakeGateway();
+    gateway.eventsToEmit = [
+      {
+        id: "evt-stale-interrupted",
+        sessionId: "session-1",
+        seq: 8,
+        kind: "run.interrupted",
+        payload: { reason: "previous stop" },
+        createdAt: "2026-05-27T09:55:28.000Z"
+      },
+      {
+        id: "evt-current-delta",
+        sessionId: "session-1",
+        seq: 9,
+        kind: "assistant.delta",
+        payload: { content: "fresh reply" },
+        createdAt: new Date(Date.now() + 20).toISOString()
+      },
+      {
+        id: "evt-current-complete",
+        sessionId: "session-1",
+        seq: 10,
+        kind: "run.completed",
+        payload: { ok: true },
+        createdAt: new Date(Date.now() + 30).toISOString()
+      }
+    ];
+
+    const bridge = createHub53AIBridge({
+      stateDir,
+      config: {
+        enabled: true,
+        botId: "bot-123",
+        secret: "sk-secret",
+        wsUrl: server.url,
+        accessPolicy: "open",
+        allowFrom: [],
+        sendThinkingMessage: false,
+        reconnectBaseMs: 20,
+        maxReconnectAttempts: 2
+      },
+      gateway,
+      callbacks: {
+        onSessionUpsert: async (session) => {
+          gateway.upsertSession(session);
+        },
+        onUserMessage: async () => undefined,
+        onSessionStatus: async () => undefined,
+        onEnsureSessionStream: async () => undefined,
+        getLastEventSeq: () => 0,
+        onStatusChange: () => undefined
+      }
+    });
+
+    await bridge.start();
+    try {
+      const connection = await server.connected;
+      connection.socket.send(
+        JSON.stringify({
+          req_id: "req-after-stop",
+          action: "chat",
+          data: {
+            user: "user-a",
+            conversation_id: "chat-a",
+            messages: [{ role: "user", content: "message after stop" }]
+          }
+        })
+      );
+
+      await waitFor(() => {
+        expect(gateway.sentMessages).toEqual([{ sessionId: "session-1", content: "message after stop" }]);
+        const streamingFrame = server.frames.find(
+          (frame) => frame.req_id === "req-after-stop" && frame.status === "streaming"
+        );
+        expect(streamingFrame?.data.choices[0]?.delta.content).toBe("fresh reply");
+        expect(server.frames.find((frame) => frame.req_id === "req-after-stop" && frame.status === "done")).toMatchObject({
+          status: "done"
+        });
+      });
+
+      const errorFrame = server.frames.find((frame) => frame.req_id === "req-after-stop" && frame.status === "error");
+      expect(errorFrame).toBeUndefined();
+    } finally {
+      await bridge.stop();
+    }
+  });
+
   it("sends chat frames directly to existing OpenClaw session ids", async () => {
     const stateDir = await mkdtemp(join(tmpdir(), "claw-53aihub-"));
     cleanupPaths.push(stateDir);
@@ -898,7 +1035,7 @@ describe("53AIHub client", () => {
       sessions: [
         {
           id: "session-1",
-          title: "First session",
+          title: "53AI Hub-openclaw-local@example.com：旧会话",
           status: "completed",
           hostKind: "qclaw",
           runnerCommand: "gateway",
@@ -914,6 +1051,11 @@ describe("53AIHub client", () => {
         hasMore: false
       }
     };
+    gateway.upsertSession(gateway.sessionPage.sessions[0]);
+    await writeFile(
+      join(stateDir, "claw-control-center-53aihub.json"),
+      `${JSON.stringify({ mappings: { agenthub_u2001: "session-1" }, outbox: [] }, null, 2)}\n`
+    );
     gateway.messagesBySession.set("session-1", [
       {
         id: "message-1",
@@ -1017,6 +1159,28 @@ describe("53AIHub client", () => {
       );
       connection.socket.send(
         JSON.stringify({
+          req_id: "rpc-current",
+          action: "sessions.current",
+          status: "request",
+          data: {
+            chat_id: "agenthub_u2001",
+            userName: "openclaw-local@example.com"
+          }
+        })
+      );
+      connection.socket.send(
+        JSON.stringify({
+          req_id: "rpc-current-missing",
+          action: "sessions.current",
+          status: "request",
+          data: {
+            chat_id: "agenthub_u404",
+            userName: "missing@example.com"
+          }
+        })
+      );
+      connection.socket.send(
+        JSON.stringify({
           req_id: "rpc-messages",
           action: "sessions.messages",
           status: "request",
@@ -1097,6 +1261,19 @@ describe("53AIHub client", () => {
             pagination: { limit: 1, offset: 0, hasMore: false }
           }
         });
+        expect(frameByReq(server.frames, "rpc-current")).toMatchObject({
+          action: "sessions.current",
+          status: "done",
+          data: {
+            id: "session-1",
+            title: "53AI Hub-openclaw-local@example.com：旧会话"
+          }
+        });
+        expect(frameByReq(server.frames, "rpc-current-missing")).toMatchObject({
+          action: "sessions.current",
+          status: "done",
+          data: null
+        });
         expect(frameByReq(server.frames, "rpc-messages")).toMatchObject({
           action: "sessions.messages",
           status: "done",
@@ -1165,6 +1342,223 @@ describe("53AIHub client", () => {
       expect(frameByReq(server.frames, "rpc-server-response")).toBeUndefined();
       expect(gateway.sentMessages).toEqual([]);
       expect(gateway.controls).toEqual([{ sessionId: "session-1", action: "stop" }]);
+    } finally {
+      await bridge.stop();
+    }
+  });
+
+  it("does not restore sessions.current by display name when the stable mapping is missing or stale", async () => {
+    const stateDir = await mkdtemp(join(tmpdir(), "claw-53aihub-current-"));
+    cleanupPaths.push(stateDir);
+    await writeFile(
+      join(stateDir, "claw-control-center-53aihub.json"),
+      `${JSON.stringify({ mappings: { agenthub_u2001: "deleted-session" }, outbox: [] }, null, 2)}\n`
+    );
+
+    const server = await createFakeHubServer();
+    cleanupServers.push(server.close);
+
+    const gateway = new FakeGateway();
+    gateway.sessionPage = {
+      sessions: [
+        {
+          id: "session-a",
+          title: "53AI Hub-Alex：旧会话",
+          status: "completed",
+          hostKind: "qclaw",
+          runnerCommand: "gateway",
+          createdAt: "2026-05-20T10:00:00.000Z",
+          updatedAt: "2026-05-20T10:04:00.000Z",
+          lastEventSeq: 1
+        },
+        {
+          id: "session-b",
+          title: "53AI Hub-Alex：另一个用户的会话",
+          status: "completed",
+          hostKind: "qclaw",
+          runnerCommand: "gateway",
+          createdAt: "2026-05-20T11:00:00.000Z",
+          updatedAt: "2026-05-20T11:04:00.000Z",
+          lastEventSeq: 2
+        }
+      ],
+      pagination: {
+        limit: 100,
+        offset: 0,
+        total: 2,
+        hasMore: false
+      }
+    };
+
+    const bridge = createHub53AIBridge({
+      stateDir,
+      config: {
+        enabled: true,
+        botId: "bot-123",
+        secret: "sk-secret",
+        wsUrl: server.url,
+        accessPolicy: "open",
+        allowFrom: [],
+        sendThinkingMessage: false,
+        reconnectBaseMs: 20,
+        maxReconnectAttempts: 2
+      },
+      gateway,
+      callbacks: {
+        onSessionUpsert: async (session) => {
+          gateway.upsertSession(session);
+        },
+        onUserMessage: async () => undefined,
+        onSessionStatus: async () => undefined,
+        onEnsureSessionStream: async () => undefined,
+        getLastEventSeq: () => 0,
+        onStatusChange: () => undefined
+      }
+    });
+
+    await bridge.start();
+    try {
+      const connection = await server.connected;
+      connection.socket.send(
+        JSON.stringify({
+          req_id: "rpc-current-stale",
+          action: "sessions.current",
+          status: "request",
+          data: {
+            chat_id: "agenthub_u2001",
+            userName: "Alex"
+          }
+        })
+      );
+
+      await waitFor(() => {
+        expect(frameByReq(server.frames, "rpc-current-stale")).toMatchObject({
+          action: "sessions.current",
+          status: "done",
+          data: null
+        });
+      });
+    } finally {
+      await bridge.stop();
+    }
+  });
+
+  it("deduplicates tool timeline events by tool call id while preserving history order", async () => {
+    const stateDir = await mkdtemp(join(tmpdir(), "claw-53aihub-rpc-events-"));
+    cleanupPaths.push(stateDir);
+
+    const server = await createFakeHubServer();
+    cleanupServers.push(server.close);
+
+    const gateway = new FakeGateway();
+    gateway.eventsBySession.set("session-1", [
+      {
+        id: "history-tool-result",
+        sessionId: "session-1",
+        seq: 30,
+        kind: "tool.result",
+        payload: {
+          data: {
+            phase: "result",
+            name: "web_fetch",
+            toolCallId: "call-1"
+          }
+        },
+        createdAt: "2026-05-27T10:23:31.000Z"
+      }
+    ]);
+    const storedEvents: GatewayEvent[] = [
+      {
+        id: "stored-tool-result",
+        sessionId: "session-1",
+        seq: 9,
+        kind: "tool.result",
+        payload: {
+          data: {
+            phase: "result",
+            name: "web_fetch",
+            toolCallId: "call-1",
+            meta: "from https://example.com (max 8000 chars)",
+            result: {
+              details: {
+                status: "error",
+                error: "timeout"
+              }
+            }
+          }
+        },
+        createdAt: "2026-05-27T10:23:32.000Z"
+      }
+    ];
+
+    const bridge = createHub53AIBridge({
+      stateDir,
+      config: {
+        enabled: true,
+        botId: "bot-123",
+        secret: "sk-secret",
+        wsUrl: server.url,
+        accessPolicy: "open",
+        allowFrom: [],
+        sendThinkingMessage: false,
+        reconnectBaseMs: 20,
+        maxReconnectAttempts: 2
+      },
+      gateway,
+      callbacks: {
+        onSessionUpsert: async (session) => {
+          gateway.upsertSession(session);
+        },
+        onUserMessage: async () => undefined,
+        onSessionStatus: async () => undefined,
+        onEnsureSessionStream: async () => undefined,
+        listSessionEvents: () => storedEvents,
+        getLastEventSeq: () => 0,
+        onStatusChange: () => undefined
+      }
+    });
+
+    await bridge.start();
+    try {
+      const connection = await server.connected;
+      connection.socket.send(
+        JSON.stringify({
+          req_id: "rpc-events-dedupe",
+          action: "sessions.events",
+          status: "request",
+          data: { session_id: "session-1", limit: 10, offset: 0 }
+        })
+      );
+
+      await waitFor(() => {
+        expect(frameByReq(server.frames, "rpc-events-dedupe")).toMatchObject({
+          action: "sessions.events",
+          status: "done",
+          data: {
+            events: [
+              {
+                id: "history-tool-result",
+                seq: 30,
+                kind: "tool.result",
+                payload: {
+                  data: {
+                    name: "web_fetch",
+                    toolCallId: "call-1",
+                    meta: "from https://example.com (max 8000 chars)",
+                    result: {
+                      details: {
+                        status: "error",
+                        error: "timeout"
+                      }
+                    }
+                  }
+                }
+              }
+            ],
+            pagination: { limit: 10, offset: 0, total: 1, hasMore: false }
+          }
+        });
+      });
     } finally {
       await bridge.stop();
     }

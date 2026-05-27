@@ -100,7 +100,7 @@ describe("gateway client", () => {
     await new Promise<void>((resolve) => wss.close(() => resolve()));
   });
 
-  it("sends OpenClaw messages through chat.send without external delivery", async () => {
+  it("sends OpenClaw messages through chat.send with delivery enabled", async () => {
     let capturedMethod = "";
     let capturedParams: Record<string, unknown> = {};
 
@@ -149,9 +149,351 @@ describe("gateway client", () => {
     expect(capturedParams).toMatchObject({
       sessionKey: "agent:main:telegram:direct:123",
       message: "hello",
-      deliver: false
+      deliver: true
     });
     expect(capturedParams).toHaveProperty("idempotencyKey");
+    await client.stop();
+    await new Promise<void>((resolve) => wss.close(() => resolve()));
+  });
+
+  it("treats chat.abort ACK timeout as a submitted OpenClaw stop", async () => {
+    let abortRequested = false;
+    const received: string[] = [];
+
+    const httpServer = createServer();
+    servers.add(httpServer);
+    const wss = new WebSocketServer({ noServer: true });
+
+    httpServer.on("upgrade", (request, socket, head) => {
+      wss.handleUpgrade(request, socket, head, (client) => {
+        client.send(
+          JSON.stringify({
+            type: "event",
+            event: "connect.challenge",
+            payload: { nonce: "nonce-1" }
+          })
+        );
+
+        client.on("message", (data) => {
+          const frame = JSON.parse(data.toString()) as {
+            id: string;
+            method: string;
+          };
+
+          if (frame.method === "connect") {
+            client.send(JSON.stringify({ type: "res", id: frame.id, ok: true, payload: { protocol: 4 } }));
+            return;
+          }
+
+          if (frame.method === "sessions.messages.subscribe") {
+            client.send(JSON.stringify({ type: "res", id: frame.id, ok: true, payload: { ok: true } }));
+            return;
+          }
+
+          if (frame.method === "chat.abort") {
+            abortRequested = true;
+            return;
+          }
+
+          client.send(JSON.stringify({ type: "res", id: frame.id, ok: true, payload: { ok: true } }));
+        });
+      });
+    });
+
+    const address = await listen(httpServer);
+    const client = createGatewayClient({
+      baseUrl: address.replace("http://", "ws://"),
+      secret: "shared-token",
+      requestTimeoutMs: 20
+    });
+
+    const close = client.subscribe("agent:main:test-session", 0, {
+      onEvent: (event) => received.push(event.kind),
+      onDisconnect: () => {}
+    });
+
+    await client.controlSession("agent:main:test-session", "stop");
+
+    expect(abortRequested).toBe(true);
+    expect(received).toContain("run.interrupted");
+
+    close();
+    await client.stop();
+    await new Promise<void>((resolve) => wss.close(() => resolve()));
+  });
+
+  it("rejects OpenClaw stop when chat.abort fails because the gateway disconnects", async () => {
+    const httpServer = createServer();
+    servers.add(httpServer);
+    const wss = new WebSocketServer({ noServer: true });
+
+    httpServer.on("upgrade", (request, socket, head) => {
+      wss.handleUpgrade(request, socket, head, (client) => {
+        client.send(
+          JSON.stringify({
+            type: "event",
+            event: "connect.challenge",
+            payload: { nonce: "nonce-1" }
+          })
+        );
+
+        client.on("message", (data) => {
+          const frame = JSON.parse(data.toString()) as {
+            id: string;
+            method: string;
+          };
+
+          if (frame.method === "connect") {
+            client.send(JSON.stringify({ type: "res", id: frame.id, ok: true, payload: { protocol: 4 } }));
+            return;
+          }
+
+          if (frame.method === "chat.abort") {
+            client.close();
+          }
+        });
+      });
+    });
+
+    const address = await listen(httpServer);
+    const client = createGatewayClient({
+      baseUrl: address.replace("http://", "ws://"),
+      secret: "shared-token",
+      requestTimeoutMs: 200
+    });
+
+    await expect(client.controlSession("agent:main:test-session", "stop")).rejects.toThrow();
+
+    await client.stop();
+    await new Promise<void>((resolve) => wss.close(() => resolve()));
+  });
+
+  it("treats OpenClaw success end events as run completion", async () => {
+    const received: string[] = [];
+
+    const httpServer = createServer();
+    servers.add(httpServer);
+    const wss = new WebSocketServer({ noServer: true });
+
+    httpServer.on("upgrade", (request, socket, head) => {
+      wss.handleUpgrade(request, socket, head, (client) => {
+        client.send(
+          JSON.stringify({
+            type: "event",
+            event: "connect.challenge",
+            payload: { nonce: "nonce-1" }
+          })
+        );
+
+        client.on("message", (data) => {
+          const frame = JSON.parse(data.toString()) as {
+            id: string;
+            method: string;
+          };
+
+          if (frame.method === "connect") {
+            client.send(JSON.stringify({ type: "res", id: frame.id, ok: true, payload: { protocol: 4 } }));
+            return;
+          }
+
+          client.send(JSON.stringify({ type: "res", id: frame.id, ok: true, payload: { ok: true } }));
+
+          if (frame.method === "sessions.messages.subscribe") {
+            client.send(
+              JSON.stringify({
+                type: "event",
+                event: "sessions.changed",
+                payload: {
+                  sessionKey: "agent:main:test-session",
+                  phase: "end",
+                  status: "success",
+                  runId: "run-1",
+                  endedAt: 1779871345389
+                }
+              })
+            );
+          }
+        });
+      });
+    });
+
+    const address = await listen(httpServer);
+    const client = createGatewayClient({
+      baseUrl: address.replace("http://", "ws://"),
+      secret: "shared-token"
+    });
+
+    const close = client.subscribe("agent:main:test-session", 0, {
+      onEvent: (event) => received.push(event.kind),
+      onDisconnect: () => {}
+    });
+
+    await eventually(() => {
+      expect(received).toContain("run.completed");
+    });
+
+    close();
+    await client.stop();
+    await new Promise<void>((resolve) => wss.close(() => resolve()));
+  });
+
+  it("maps OpenClaw failed and interrupted end events to terminal run events", async () => {
+    const cases = [
+      { status: "failed", expected: "run.failed" },
+      { status: "timeout", expected: "run.failed" },
+      { status: "interrupted", expected: "run.interrupted" }
+    ];
+
+    for (const testCase of cases) {
+      const received: string[] = [];
+      const httpServer = createServer();
+      servers.add(httpServer);
+      const wss = new WebSocketServer({ noServer: true });
+
+      httpServer.on("upgrade", (request, socket, head) => {
+        wss.handleUpgrade(request, socket, head, (client) => {
+          client.send(
+            JSON.stringify({
+              type: "event",
+              event: "connect.challenge",
+              payload: { nonce: "nonce-1" }
+            })
+          );
+
+          client.on("message", (data) => {
+            const frame = JSON.parse(data.toString()) as {
+              id: string;
+              method: string;
+            };
+
+            if (frame.method === "connect") {
+              client.send(JSON.stringify({ type: "res", id: frame.id, ok: true, payload: { protocol: 4 } }));
+              return;
+            }
+
+            client.send(JSON.stringify({ type: "res", id: frame.id, ok: true, payload: { ok: true } }));
+
+            if (frame.method === "sessions.messages.subscribe") {
+              client.send(
+                JSON.stringify({
+                  type: "event",
+                  event: "sessions.changed",
+                  payload: {
+                    sessionKey: `agent:main:test-${testCase.status}`,
+                    phase: "end",
+                    status: testCase.status,
+                    runId: `run-${testCase.status}`,
+                    endedAt: 1779871345389
+                  }
+                })
+              );
+            }
+          });
+        });
+      });
+
+      const address = await listen(httpServer);
+      const client = createGatewayClient({
+        baseUrl: address.replace("http://", "ws://"),
+        secret: "shared-token"
+      });
+
+      const close = client.subscribe(`agent:main:test-${testCase.status}`, 0, {
+        onEvent: (event) => received.push(event.kind),
+        onDisconnect: () => {}
+      });
+
+      await eventually(() => {
+        expect(received).toContain(testCase.expected);
+      });
+
+      close();
+      await client.stop();
+      await new Promise<void>((resolve) => wss.close(() => resolve()));
+    }
+  });
+
+  it("waits for the OpenClaw terminal end event before resolving stop", async () => {
+    const received: string[] = [];
+    let abortAcked = false;
+    let stopResolved = false;
+
+    const httpServer = createServer();
+    servers.add(httpServer);
+    const wss = new WebSocketServer({ noServer: true });
+
+    httpServer.on("upgrade", (request, socket, head) => {
+      wss.handleUpgrade(request, socket, head, (client) => {
+        client.send(
+          JSON.stringify({
+            type: "event",
+            event: "connect.challenge",
+            payload: { nonce: "nonce-1" }
+          })
+        );
+
+        client.on("message", (data) => {
+          const frame = JSON.parse(data.toString()) as {
+            id: string;
+            method: string;
+          };
+
+          if (frame.method === "connect") {
+            client.send(JSON.stringify({ type: "res", id: frame.id, ok: true, payload: { protocol: 4 } }));
+            return;
+          }
+
+          client.send(JSON.stringify({ type: "res", id: frame.id, ok: true, payload: { ok: true } }));
+
+          if (frame.method === "chat.abort") {
+            abortAcked = true;
+            setTimeout(() => {
+              client.send(
+                JSON.stringify({
+                  type: "event",
+                  event: "sessions.changed",
+                  payload: {
+                    sessionKey: "agent:main:test-session",
+                    phase: "end",
+                    status: "timeout",
+                    runId: "run-timeout",
+                    endedAt: Date.now()
+                  }
+                })
+              );
+            }, 30);
+          }
+        });
+      });
+    });
+
+    const address = await listen(httpServer);
+    const client = createGatewayClient({
+      baseUrl: address.replace("http://", "ws://"),
+      secret: "shared-token",
+      requestTimeoutMs: 100
+    });
+
+    const close = client.subscribe("agent:main:test-session", 0, {
+      onEvent: (event) => received.push(event.kind),
+      onDisconnect: () => {}
+    });
+
+    const stopPromise = client.controlSession("agent:main:test-session", "stop").then(() => {
+      stopResolved = true;
+    });
+
+    await eventually(() => {
+      expect(abortAcked).toBe(true);
+    });
+    await new Promise((resolve) => setTimeout(resolve, 10));
+
+    expect(stopResolved).toBe(false);
+
+    await stopPromise;
+    expect(received).toContain("run.failed");
+
+    close();
     await client.stop();
     await new Promise<void>((resolve) => wss.close(() => resolve()));
   });
@@ -264,6 +606,7 @@ describe("gateway client", () => {
 
   it("falls back to websocket chat.send when Gateway HTTP responses is unavailable", async () => {
     let capturedMethod = "";
+    let capturedParams: Record<string, unknown> = {};
     const httpServer = createServer((request, response) => {
       if (request.url === "/v1/responses") {
         response.writeHead(404);
@@ -296,6 +639,7 @@ describe("gateway client", () => {
             return;
           }
           capturedMethod = frame.method;
+          capturedParams = frame.params ?? {};
           client.send(JSON.stringify({ type: "res", id: frame.id, ok: true, payload: { ok: true } }));
         });
       });
@@ -311,6 +655,11 @@ describe("gateway client", () => {
     await client.sendMessage("agent:main:test-session", "hello");
 
     expect(capturedMethod).toBe("chat.send");
+    expect(capturedParams).toMatchObject({
+      sessionKey: "agent:main:test-session",
+      message: "hello",
+      deliver: true
+    });
     await client.stop();
     await new Promise<void>((resolve) => wss.close(() => resolve()));
   });
@@ -1218,6 +1567,147 @@ describe("gateway client", () => {
     close();
     await client.stop();
     await new Promise<void>((resolve) => wss.close(() => resolve()));
+  });
+
+  it("synthesizes ordered thinking, tool call, tool result, and final answer events from chat history", async () => {
+    const now = Date.now();
+    const history = [
+      {
+        role: "user",
+        content: [{ type: "text", text: "find movies" }],
+        timestamp: now,
+        __openclaw: { seq: 1 }
+      },
+      {
+        role: "assistant",
+        content: [
+          { type: "thinking", thinking: "Need to search first." },
+          {
+            type: "toolCall",
+            id: "call-1",
+            name: "web_search",
+            arguments: { query: "movies", count: 5 }
+          }
+        ],
+        timestamp: now + 1,
+        __openclaw: { seq: 2 }
+      },
+      {
+        role: "toolResult",
+        toolCallId: "call-1",
+        toolName: "web_search",
+        content: [{ type: "text", text: '{"status":"error","tool":"web_search","error":"fetch failed"}' }],
+        timestamp: now + 2,
+        __openclaw: { seq: 3 }
+      },
+      {
+        role: "assistant",
+        content: [{ type: "text", text: "Final answer" }],
+        timestamp: now + 3,
+        __openclaw: { seq: 4 }
+      }
+    ];
+    const httpServer = createServer();
+    servers.add(httpServer);
+    const wss = new WebSocketServer({ noServer: true });
+
+    httpServer.on("upgrade", (request, socket, head) => {
+      wss.handleUpgrade(request, socket, head, (client) => {
+        client.send(
+          JSON.stringify({
+            type: "event",
+            event: "connect.challenge",
+            payload: { nonce: "nonce-1" }
+          })
+        );
+
+        client.on("message", (data) => {
+          const frame = JSON.parse(data.toString()) as {
+            id: string;
+            method: string;
+          };
+
+          if (frame.method === "connect") {
+            client.send(JSON.stringify({ type: "res", id: frame.id, ok: true, payload: { protocol: 4 } }));
+            return;
+          }
+
+          if (frame.method === "chat.history") {
+            client.send(
+              JSON.stringify({
+                type: "res",
+                id: frame.id,
+                ok: true,
+                payload: {
+                  messages: history,
+                  total: history.length,
+                  hasMore: false
+                }
+              })
+            );
+            return;
+          }
+
+          client.send(JSON.stringify({ type: "res", id: frame.id, ok: true, payload: { ok: true } }));
+        });
+      });
+    });
+
+    const address = await listen(httpServer);
+    const client = createGatewayClient({
+      baseUrl: address.replace("http://", "ws://"),
+      secret: "shared-token"
+    });
+
+    try {
+      const events = await client.listEvents("session-1", 0);
+
+      expect(events.map((event) => event.kind)).toEqual([
+        "assistant.thinking",
+        "tool.call",
+        "tool.result",
+        "assistant.message"
+      ]);
+      expect(events.map((event) => event.seq)).toEqual([20, 21, 30, 40]);
+      expect(events.map((event) => event.payload)).toEqual([
+        expect.objectContaining({
+          content: "Need to search first.",
+          mode: "replace",
+          replace: true,
+          rawSeq: 2
+        }),
+        expect.objectContaining({
+          data: expect.objectContaining({
+            phase: "call",
+            name: "web_search",
+            toolCallId: "call-1",
+            args: { query: "movies", count: 5 },
+            meta: 'for "movies" (top 5)'
+          })
+        }),
+        expect.objectContaining({
+          data: expect.objectContaining({
+            phase: "result",
+            name: "web_search",
+            toolCallId: "call-1",
+            isError: true,
+            result: expect.objectContaining({
+              details: {
+                status: "error",
+                tool: "web_search",
+                error: "fetch failed"
+              }
+            })
+          })
+        }),
+        {
+          content: "Final answer"
+        }
+      ]);
+    } finally {
+      await client.stop();
+      await new Promise<void>((resolve) => wss.close(() => resolve()));
+    }
   });
 
   it("collapses duplicated leading words in exposed reasoning text", async () => {
