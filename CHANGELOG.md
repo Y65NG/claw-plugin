@@ -1,9 +1,14 @@
-# Legacy Changelog
+# Changelog
 
-This file preserves the changelog from the legacy `53AI-OpenClaw` codebase.
+All notable changes to this project will be documented in this file.
 
-The current branch is a new implementation and does not share the legacy source
-layout. The entries below are retained only for historical release context.
+The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/).
+
+## [Unreleased] - 2026-05-28
+
+### Changed
+- 新版分支切换为 `claw-control-center` 实现，提供 QClaw / OpenClaw 本地控制台、Gateway RPC 适配和 53AIHub bridge。
+- README 继续沿用 `53AI-OpenClaw` 的公司项目叙事，并按新版仓库结构、安装脚本和配置路径做必要更新。
 
 ## [1.1.0] - 2026-03-27
 
