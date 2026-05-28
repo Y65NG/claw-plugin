@@ -91,3 +91,4 @@ http://127.0.0.1:4318/
 ## 文档索引
 
 - API 文档与使用说明：[API.md](./API.md)
+- 旧版 `53AI-OpenClaw` 变更记录：[LEGACY_CHANGELOG.md](./LEGACY_CHANGELOG.md)
