@@ -664,6 +664,69 @@ describe("53AIHub client", () => {
     }
   });
 
+  it("keeps reconnecting after max reconnect attempts until 53AIHub is available again", async () => {
+    const stateDir = await mkdtemp(join(tmpdir(), "claw-53aihub-reconnect-"));
+    cleanupPaths.push(stateDir);
+    const port = await getFreePort();
+    const gateway = new FakeGateway();
+    const statusErrors: string[] = [];
+
+    const bridge = createHub53AIBridge({
+      stateDir,
+      config: {
+        enabled: true,
+        botId: "bot-123",
+        secret: "sk-secret",
+        wsUrl: `ws://127.0.0.1:${port}`,
+        accessPolicy: "open",
+        allowFrom: [],
+        sendThinkingMessage: false,
+        reconnectBaseMs: 20,
+        maxReconnectAttempts: 2
+      },
+      gateway,
+      callbacks: {
+        onSessionUpsert: async (session) => {
+          gateway.upsertSession(session);
+        },
+        onUserMessage: async () => undefined,
+        onSessionStatus: async () => undefined,
+        onEnsureSessionStream: async () => undefined,
+        getLastEventSeq: () => 0,
+        onStatusChange: () => {
+          const status = bridge.getStatus();
+          if (status.lastError) {
+            statusErrors.push(status.lastError);
+          }
+        }
+      }
+    });
+
+    await bridge.start();
+    try {
+      await waitFor(() => {
+        expect(bridge.getStatus()).toMatchObject({
+          connectionStatus: "error",
+          lastError: "Max reconnect attempts (2) reached; continuing background reconnects"
+        });
+      });
+
+      const recoveredServer = await createFakeHubServer(port);
+      cleanupServers.push(recoveredServer.close);
+      await recoveredServer.connected;
+
+      await waitFor(() => {
+        expect(bridge.getStatus()).toMatchObject({
+          connectionStatus: "connected",
+          lastError: undefined
+        });
+      });
+      expect(statusErrors.some((lastError) => lastError.includes("continuing background reconnects"))).toBe(true);
+    } finally {
+      await bridge.stop();
+    }
+  });
+
   it("ignores stale terminal events replayed before the current OpenClaw send", async () => {
     const stateDir = await mkdtemp(join(tmpdir(), "claw-53aihub-"));
     cleanupPaths.push(stateDir);
@@ -1757,8 +1820,9 @@ class FakeGateway {
   }
 }
 
-async function createFakeHubServer(): Promise<{
+async function createFakeHubServer(port?: number): Promise<{
   url: string;
+  port: number;
   frames: Hub53AIOutgoingFrame[];
   connected: Promise<{ socket: WebSocket; headers: Record<string, string | undefined> }>;
   close: () => Promise<void>;
@@ -1790,8 +1854,12 @@ async function createFakeHubServer(): Promise<{
     });
   });
 
-  await new Promise<void>((resolve) => {
-    httpServer.listen(0, "127.0.0.1", resolve);
+  await new Promise<void>((resolve, reject) => {
+    httpServer.once("error", reject);
+    httpServer.listen(port ?? 0, "127.0.0.1", () => {
+      httpServer.off("error", reject);
+      resolve();
+    });
   });
   const address = httpServer.address();
   if (!address || typeof address === "string") {
@@ -1800,6 +1868,7 @@ async function createFakeHubServer(): Promise<{
 
   return {
     url: `ws://127.0.0.1:${address.port}`,
+    port: address.port,
     frames,
     connected,
     close: async () => {
@@ -1810,6 +1879,20 @@ async function createFakeHubServer(): Promise<{
       await new Promise<void>((resolve) => httpServer.close(() => resolve()));
     }
   };
+}
+
+async function getFreePort(): Promise<number> {
+  const httpServer = createServer();
+  await new Promise<void>((resolve) => {
+    httpServer.listen(0, "127.0.0.1", resolve);
+  });
+  const address = httpServer.address();
+  if (!address || typeof address === "string") {
+    throw new Error("failed to reserve test port");
+  }
+  const port = address.port;
+  await new Promise<void>((resolve) => httpServer.close(() => resolve()));
+  return port;
 }
 
 function frameByReq(frames: Hub53AIOutgoingFrame[], reqId: string): Hub53AIOutgoingFrame | undefined {

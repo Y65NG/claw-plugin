@@ -298,15 +298,25 @@ export function createHub53AIBridge(input: HubBridgeInput) {
     if (stopped) {
       return;
     }
-    if (reconnectAttempts >= input.config.maxReconnectAttempts) {
-      connectionStatus = "error";
-      lastError = `Max reconnect attempts (${input.config.maxReconnectAttempts}) reached`;
-      notifyStatus();
+    if (reconnectTimer) {
       return;
     }
+
+    const maxReconnectAttempts = Math.max(1, input.config.maxReconnectAttempts);
+    const exceededConfiguredAttempts = reconnectAttempts >= maxReconnectAttempts;
+    if (exceededConfiguredAttempts) {
+      connectionStatus = "error";
+      lastError = `Max reconnect attempts (${input.config.maxReconnectAttempts}) reached; continuing background reconnects`;
+      notifyStatus();
+    }
+
+    const backoffExponent = Math.min(reconnectAttempts, maxReconnectAttempts - 1);
+    const backoff = Math.min(input.config.reconnectBaseMs * 2 ** backoffExponent, 30_000);
     reconnectAttempts += 1;
-    const backoff = Math.min(input.config.reconnectBaseMs * 2 ** (reconnectAttempts - 1), 30_000);
-    reconnectTimer = setTimeout(connect, backoff);
+    reconnectTimer = setTimeout(() => {
+      reconnectTimer = null;
+      connect();
+    }, backoff);
   }
 
   async function handleRawMessage(rawPayload: string) {
