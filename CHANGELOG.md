@@ -4,7 +4,13 @@ All notable changes to this project will be documented in this file.
 
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/).
 
-## [Unreleased] - 2026-05-28
+## [0.1.2] - 2026-05-28
+
+### Fixed
+- 修复 53AIHub 会话映射过期后可能错误复用本地控制台会话的问题。
+- 安装新版插件时自动从允许列表移除旧 `53ai-openclaw` 插件 ID，并禁用旧插件 entry。
+
+## [0.1.1] - 2026-05-28
 
 ### Changed
 - 新版分支切换为 `claw-control-center` 实现，提供 QClaw / OpenClaw 本地控制台、Gateway RPC 适配和 53AIHub bridge。

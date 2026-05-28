@@ -1,3 +1,4 @@
+import { createHash } from "node:crypto";
 import { cp, mkdir, readFile, rm, writeFile } from "node:fs/promises";
 import { existsSync } from "node:fs";
 import { homedir } from "node:os";
@@ -76,6 +77,7 @@ type OpenClawConfig = {
 };
 
 const PLUGIN_ID = "claw-control-center";
+const LEGACY_PLUGIN_ID = "53ai-openclaw";
 const DEFAULT_QCLAW_HOME = resolve(homedir(), ".qclaw");
 const DEFAULT_OPENCLAW_HOME = resolve(homedir(), ".openclaw");
 const DEFAULT_EXTENSIONS_DIR = resolve(
@@ -111,6 +113,7 @@ export async function installIntoQClaw(input: InstallInput): Promise<{
   destination: string;
   gatewayBaseUrl: string;
   hub53aiConfigured: boolean;
+  pluginBuild: string;
 }> {
   return installIntoHost(input, "QClaw");
 }
@@ -121,6 +124,7 @@ export async function installIntoOpenClaw(input: InstallInput): Promise<{
   destination: string;
   gatewayBaseUrl: string;
   hub53aiConfigured: boolean;
+  pluginBuild: string;
 }> {
   return installIntoHost(input, "OpenClaw");
 }
@@ -134,6 +138,7 @@ async function installIntoHost(
   destination: string;
   gatewayBaseUrl: string;
   hub53aiConfigured: boolean;
+  pluginBuild: string;
 }> {
   await mkdir(input.extensionsDir, { recursive: true });
   const destination = join(input.extensionsDir, PLUGIN_ID);
@@ -173,12 +178,23 @@ async function installIntoHost(
 
   const plugins = ensureObject(config, "plugins");
   plugins.enabled = true;
-  plugins.allow = dedupeStrings([...(Array.isArray(plugins.allow) ? plugins.allow : []), PLUGIN_ID]);
+  plugins.allow = dedupeStrings([
+    ...(Array.isArray(plugins.allow) ? plugins.allow.filter((entry) => entry !== LEGACY_PLUGIN_ID) : []),
+    PLUGIN_ID
+  ]);
 
   const load = ensureObject(plugins, "load");
   load.paths = dedupeStrings([...(Array.isArray(load.paths) ? load.paths : []), input.extensionsDir]);
 
   const entries = ensureObject(plugins, "entries");
+  const legacyEntry =
+    entries[LEGACY_PLUGIN_ID] && typeof entries[LEGACY_PLUGIN_ID] === "object" && !Array.isArray(entries[LEGACY_PLUGIN_ID])
+      ? (entries[LEGACY_PLUGIN_ID] as Record<string, unknown>)
+      : undefined;
+  if (legacyEntry) {
+    legacyEntry.enabled = false;
+    entries[LEGACY_PLUGIN_ID] = legacyEntry;
+  }
   const previousEntry = ensureObject(entries, PLUGIN_ID);
   const previousConfig = ensureObject(previousEntry, "config");
   const previousGateway = ensureObject(previousConfig, "gateway");
@@ -236,7 +252,8 @@ async function installIntoHost(
     extensionsDir: input.extensionsDir,
     destination,
     gatewayBaseUrl,
-    hub53aiConfigured: hubConfigured
+    hub53aiConfigured: hubConfigured,
+    pluginBuild: await readPluginBuildInfo(destination)
   };
 }
 
@@ -284,6 +301,7 @@ export async function runInstallCommand(input: {
       `Config: ${result.configPath}`,
       `Gateway: ${result.gatewayBaseUrl}`,
       `53AIHub: ${result.hub53aiConfigured ? "configured" : "not configured"}`,
+      `Plugin build: ${result.pluginBuild}`,
       `Restart ${targetInfo.label} to load the plugin.`
     ].join("\n") + "\n"
   );
@@ -327,6 +345,28 @@ async function copyPublishablePackage(packageRoot: string, destination: string) 
     const target = join(destination, relativePath);
     await rm(target, { recursive: true, force: true });
     await cp(source, target, { recursive: true, force: true });
+  }
+}
+
+async function readPluginBuildInfo(destination: string): Promise<string> {
+  const packagePath = join(destination, "package.json");
+  const entryPath = join(destination, "dist", "index.cjs");
+  let version = "unknown";
+  try {
+    const packageJson = JSON.parse(await readFile(packagePath, "utf8")) as { version?: unknown };
+    if (typeof packageJson.version === "string" && packageJson.version.trim()) {
+      version = packageJson.version.trim();
+    }
+  } catch {
+    version = "unknown";
+  }
+
+  try {
+    const entry = await readFile(entryPath);
+    const digest = createHash("sha256").update(entry).digest("hex").slice(0, 12);
+    return `${PLUGIN_ID}@${version} sha256:${digest}`;
+  } catch {
+    return `${PLUGIN_ID}@${version} sha256:missing`;
   }
 }
 

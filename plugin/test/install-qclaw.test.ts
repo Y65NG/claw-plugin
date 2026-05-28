@@ -3,7 +3,7 @@ import { access, mkdtemp, mkdir, readFile, rm, writeFile } from "node:fs/promise
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 
-import { installIntoQClaw, runInstallCommand } from "../src/install-qclaw";
+import { installIntoOpenClaw, installIntoQClaw, runInstallCommand } from "../src/install-qclaw";
 
 const cleanupPaths: string[] = [];
 
@@ -321,6 +321,84 @@ describe("QClaw installer", () => {
     expect((updated as any).gateway.http?.endpoints?.responses).toBeUndefined();
   });
 
+  it("keeps the legacy 53ai-openclaw plugin disabled when installing into OpenClaw", async () => {
+    const tempRoot = await mkdtemp(join(tmpdir(), "openclaw-install-"));
+    cleanupPaths.push(tempRoot);
+
+    const configPath = join(tempRoot, ".openclaw", "openclaw.json");
+    const extensionsDir = join(tempRoot, ".openclaw", "extensions");
+    const packageRoot = join(tempRoot, "package");
+    await mkdir(join(tempRoot, ".openclaw"), { recursive: true });
+    await mkdir(join(packageRoot, "dist"), { recursive: true });
+    await writeFile(join(packageRoot, "package.json"), JSON.stringify({ name: "claw-control-center" }));
+    await writeFile(join(packageRoot, "openclaw.plugin.json"), JSON.stringify({ id: "claw-control-center" }));
+    await writeFile(join(packageRoot, "dist", "index.cjs"), "module.exports = { build: 'fresh' };\n");
+    await writeFile(
+      configPath,
+      JSON.stringify(
+        {
+          gateway: {
+            host: "127.0.0.1",
+            port: 18789,
+            auth: {
+              mode: "token",
+              token: "local-token"
+            }
+          },
+          channels: {
+            "53aihub": {
+              enabled: true,
+              botId: "legacy-bot",
+              secret: "legacy-secret",
+              WSUrl: "wss://legacy.example.com/api/v1/openclaw/ws/connect"
+            }
+          },
+          plugins: {
+            allow: ["53ai-openclaw"],
+            entries: {
+              "53ai-openclaw": {
+                enabled: false,
+                config: {
+                  botId: "legacy-bot",
+                  secret: "legacy-secret",
+                  WSUrl: "wss://legacy.example.com/api/v1/openclaw/ws/connect"
+                }
+              }
+            }
+          }
+        },
+        null,
+        2
+      )
+    );
+
+    const result = await installIntoOpenClaw({
+      packageRoot,
+      extensionsDir,
+      configPath
+    });
+
+    const updated = JSON.parse(await readFile(configPath, "utf8")) as {
+      plugins: {
+        allow: string[];
+        entries: Record<string, { enabled: boolean; config?: Record<string, any> }>;
+      };
+    };
+
+    expect(result.destination).toBe(join(extensionsDir, "claw-control-center"));
+    expect(updated.plugins.allow).toEqual(["claw-control-center"]);
+    expect(updated.plugins.entries["53ai-openclaw"].enabled).toBe(false);
+    expect(updated.plugins.entries["claw-control-center"].config?.hub53ai).toMatchObject({
+      enabled: true,
+      botId: "legacy-bot",
+      secret: "legacy-secret",
+      wsUrl: "wss://legacy.example.com/api/v1/openclaw/ws/connect"
+    });
+    expect(await readFile(join(extensionsDir, "claw-control-center", "dist", "index.cjs"), "utf8")).toContain(
+      "fresh"
+    );
+  });
+
   it("installs into OpenClaw paths when the openclaw target is selected", async () => {
     const tempRoot = await mkdtemp(join(tmpdir(), "openclaw-install-"));
     cleanupPaths.push(tempRoot);
@@ -397,6 +475,7 @@ describe("QClaw installer", () => {
     });
     await access(join(extensionsDir, "claw-control-center", "dist", "index.cjs"));
     expect(chunks.join("")).toContain("Installed claw-control-center into OpenClaw.");
+    expect(chunks.join("")).toContain("Plugin build:");
     expect(chunks.join("")).toContain("Restart OpenClaw to load the plugin.");
   });
 });

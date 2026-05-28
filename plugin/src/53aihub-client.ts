@@ -532,6 +532,7 @@ export function createHub53AIBridge(input: HubBridgeInput) {
   async function resolveCurrentSessionRPC(payload: unknown): Promise<GatewaySession | null> {
     const record = toRecord(payload);
     const userObject = toRecord(record.user);
+    const userName = stringOr(record.userName, record.user_name, userObject.name, userObject.userName, userObject.username);
     const chatId = stringOr(
       record.chat_id,
       record.chatId,
@@ -545,12 +546,16 @@ export function createHub53AIBridge(input: HubBridgeInput) {
       throw new HubRPCError("PARAM_ERROR", "chat_id or user is required");
     }
 
+    if (isOpenClawSessionId(chatId)) {
+      return input.gateway.getSession(chatId);
+    }
+
     const mappedSession = await getMappedSession(chatId);
     if (mappedSession) {
       return mappedSession;
     }
 
-    return null;
+    return restoreLatestHubSession(chatId, userName);
   }
 
   async function getMappedSession(chatId: string): Promise<GatewaySession | null> {
@@ -559,12 +564,39 @@ export function createHub53AIBridge(input: HubBridgeInput) {
       return null;
     }
     try {
-      return await input.gateway.getSession(mappedId);
+      const session = await input.gateway.getSession(mappedId);
+      if (!isHubManagedSessionTitle(session.title, chatId)) {
+        delete state.mappings[chatId];
+        await persistState();
+        input.logger?.warn?.(
+          `Ignored stale 53AIHub session mapping for ${chatId}: mapped session ${mappedId} is "${session.title}"`
+        );
+        return null;
+      }
+      return session;
     } catch {
       delete state.mappings[chatId];
       await persistState();
       return null;
     }
+  }
+
+  async function restoreLatestHubSession(chatId: string, userName?: string): Promise<GatewaySession | null> {
+    const page = await input.gateway.listSessionPage({
+      limit: 100,
+      offset: 0
+    });
+    const sessions = page.sessions
+      .filter((session) => isRestorableHubSession(session, chatId, userName))
+      .sort((left, right) => toTime(right.updatedAt || right.createdAt) - toTime(left.updatedAt || left.createdAt));
+    const session = sessions[0];
+    if (!session) {
+      return null;
+    }
+
+    state.mappings[chatId] = session.id;
+    await persistState();
+    return session;
   }
 
   async function buildFallbackStatus() {
@@ -770,7 +802,7 @@ export function createHub53AIBridge(input: HubBridgeInput) {
     if (event.kind === "tool.call" || event.kind === "tool.result") {
       const summary = summarizeVisibleActivity(event);
       if (summary && input.config.sendThinkingMessage) {
-        await recordBridgeThinkingEvent(resolveMappedSessionId(message), summary);
+        await recordBridgeThinkingEvent(sessionId, summary);
         await sendReply({
           reqId: message.reqId,
           text: summary,
@@ -855,10 +887,6 @@ export function createHub53AIBridge(input: HubBridgeInput) {
     return event.kind === "status.update" && String(payload.phase ?? payload.status ?? "") === "running";
   }
 
-  function resolveMappedSessionId(message: Hub53AIIncomingMessage): string {
-    return state.mappings[message.chatId] ?? message.chatId;
-  }
-
   async function recordBridgeThinkingEvent(sessionId: string, content: string) {
     const normalized = content.trim();
     if (!normalized || !input.callbacks.onBridgeThinkingEvent) {
@@ -908,20 +936,26 @@ export function createHub53AIBridge(input: HubBridgeInput) {
 
   async function resolveSession(message: Hub53AIIncomingMessage): Promise<GatewaySession> {
     const desiredTitle = buildHubSessionTitle(message);
-    const mappedId = state.mappings[message.chatId];
-    if (mappedId) {
-      const session = await input.gateway.getSession(mappedId);
-      const nextSession = await renamePlaceholderSessionIfNeeded(session, message, desiredTitle);
-      await input.callbacks.onSessionUpsert(nextSession);
-      return nextSession;
-    }
-
     if (isOpenClawSessionId(message.chatId)) {
       const session = await input.gateway.getSession(message.chatId);
       state.mappings[message.chatId] = session.id;
       await persistState();
       await input.callbacks.onSessionUpsert(session);
       return session;
+    }
+
+    const mappedSession = await getMappedSession(message.chatId);
+    if (mappedSession) {
+      const nextSession = await renamePlaceholderSessionIfNeeded(mappedSession, message, desiredTitle);
+      await input.callbacks.onSessionUpsert(nextSession);
+      return nextSession;
+    }
+
+    const restoredSession = await restoreLatestHubSession(message.chatId, message.userName || message.userId);
+    if (restoredSession) {
+      const nextSession = await renamePlaceholderSessionIfNeeded(restoredSession, message, desiredTitle);
+      await input.callbacks.onSessionUpsert(nextSession);
+      return nextSession;
     }
 
     const session = await createSessionWithUniqueTitle(desiredTitle);
@@ -1367,6 +1401,28 @@ function isOldHubPlaceholderTitle(title: string, chatId: string): boolean {
   return [`53AIHub ${chatId}`, `53AIHub:${chatId}`, `53AIHub-${chatId}`, chatId].includes(normalized);
 }
 
+function isHubManagedSessionTitle(title: string, chatId: string): boolean {
+  const normalized = title.trim();
+  return normalized.startsWith(HUB_SESSION_TITLE_PREFIX) || isOldHubPlaceholderTitle(normalized, chatId);
+}
+
+function isRestorableHubSession(session: GatewaySession, chatId: string, userName?: string): boolean {
+  const normalized = session.title.trim();
+  if (isOldHubPlaceholderTitle(normalized, chatId)) {
+    return true;
+  }
+  if (!normalized.startsWith(HUB_SESSION_TITLE_PREFIX) || !userName) {
+    return false;
+  }
+  return normalized.startsWith(`${HUB_SESSION_TITLE_PREFIX}${sanitizeTitlePart(userName)}：`);
+}
+
+function toTime(value?: string): number {
+  if (!value) return 0;
+  const time = Date.parse(value);
+  return Number.isFinite(time) ? time : 0;
+}
+
 function isOpenClawSessionId(value: string): boolean {
   return value.startsWith("agent:");
 }
@@ -1525,7 +1581,16 @@ function normalizeUrlList(primary: unknown, fallback: unknown): string[] {
 }
 
 function summarizeVisibleActivity(event: TimelineEvent): string | null {
-  const name = String(event.payload?.name ?? event.payload?.toolName ?? event.payload?.skillName ?? "").trim();
+  const data = toRecord(event.payload?.data);
+  const name = String(
+    event.payload?.name ??
+      event.payload?.toolName ??
+      event.payload?.skillName ??
+      data.name ??
+      data.toolName ??
+      data.skillName ??
+      ""
+  ).trim();
   if (event.kind === "tool.call") {
     return name ? `Used tool ${name}` : "Used a tool";
   }
