@@ -4,6 +4,12 @@ All notable changes to this project will be documented in this file.
 
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/).
 
+## [0.1.3] - 2026-05-29
+
+### Added
+- 增强 53AIHub 会话管理，支持已知标题恢复和本地控制台会话处理。
+- 新增 file store 测试覆盖，验证会话状态持久化行为。
+
 ## [0.1.2] - 2026-05-28
 
 ### Fixed
