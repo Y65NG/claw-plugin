@@ -1,17 +1,27 @@
 import { afterEach, describe, expect, it } from "vitest";
 import { createServer } from "node:http";
+import { mkdirSync, mkdtempSync, rmSync, writeFileSync } from "node:fs";
+import { tmpdir } from "node:os";
+import { join } from "node:path";
 
 import { WebSocketServer } from "ws";
 
 import { createGatewayClient } from "../src/gateway-client";
 
 const servers = new Set<ReturnType<typeof createServer>>();
+const tempDirs = new Set<string>();
 
 afterEach(async () => {
   await Promise.all(
     Array.from(servers, (server) => new Promise<void>((resolve) => server.close(() => resolve())))
   );
   servers.clear();
+  for (const dir of tempDirs) {
+    rmSync(dir, { recursive: true, force: true });
+  }
+  tempDirs.clear();
+  delete (globalThis as Record<string, unknown>).__officialGatewayClientRequests;
+  delete (globalThis as Record<string, unknown>).__officialGatewayClientOptions;
 });
 
 describe("gateway client", () => {
@@ -92,12 +102,202 @@ describe("gateway client", () => {
 
     expect(capturedMethod).toBe("sessions.create");
     expect(capturedToken).toBe("shared-token");
-    expect(capturedMinProtocol).toBe(4);
+    expect(capturedMinProtocol).toBe(3);
     expect(capturedMaxProtocol).toBe(4);
     expect(session.id).toBe("agent:main:test-session");
     expect(session.title).toBe("Gateway session");
     await client.stop();
     await new Promise<void>((resolve) => wss.close(() => resolve()));
+  });
+
+  it("retries the websocket handshake with the expected Gateway protocol when the peer requires protocol 3", async () => {
+    const capturedProtocols: Array<{ minProtocol: number; maxProtocol: number }> = [];
+    let capturedMethod = "";
+
+    const httpServer = createServer();
+    servers.add(httpServer);
+    const wss = new WebSocketServer({ noServer: true });
+
+    httpServer.on("upgrade", (request, socket, head) => {
+      wss.handleUpgrade(request, socket, head, (client) => {
+        client.send(
+          JSON.stringify({
+            type: "event",
+            event: "connect.challenge",
+            payload: { nonce: "nonce-1" }
+          })
+        );
+
+        client.on("message", (data) => {
+          const frame = JSON.parse(data.toString()) as {
+            id: string;
+            method: string;
+            params?: Record<string, unknown>;
+          };
+
+          if (frame.method === "connect") {
+            capturedProtocols.push({
+              minProtocol: Number(frame.params?.minProtocol ?? 0),
+              maxProtocol: Number(frame.params?.maxProtocol ?? 0)
+            });
+            if (capturedProtocols.length === 1) {
+              client.send(
+                JSON.stringify({
+                  type: "res",
+                  id: frame.id,
+                  ok: false,
+                  error: {
+                    message: 'network error: protocol mismatch: {"expectedProtocol":3}'
+                  }
+                })
+              );
+              return;
+            }
+            client.send(JSON.stringify({ type: "res", id: frame.id, ok: true, payload: { protocol: 3 } }));
+            return;
+          }
+
+          capturedMethod = frame.method;
+          client.send(
+            JSON.stringify({
+              type: "res",
+              id: frame.id,
+              ok: true,
+              payload: {
+                sessions: [],
+                total: 0,
+                hasMore: false
+              }
+            })
+          );
+        });
+      });
+    });
+
+    const address = await listen(httpServer);
+    const client = createGatewayClient({
+      baseUrl: address.replace("http://", "ws://"),
+      secret: "shared-token"
+    });
+
+    await expect(client.listSessions()).resolves.toEqual([]);
+
+    expect(capturedProtocols).toEqual([
+      { minProtocol: 3, maxProtocol: 4 },
+      { minProtocol: 3, maxProtocol: 3 }
+    ]);
+    expect(capturedMethod).toBe("sessions.list");
+    await client.stop();
+    await new Promise<void>((resolve) => wss.close(() => resolve()));
+  });
+
+  it("rejects an unsupported expected Gateway protocol without retrying outside the supported range", async () => {
+    let handshakeAttempts = 0;
+
+    const httpServer = createServer();
+    servers.add(httpServer);
+    const wss = new WebSocketServer({ noServer: true });
+
+    httpServer.on("upgrade", (request, socket, head) => {
+      wss.handleUpgrade(request, socket, head, (client) => {
+        client.send(
+          JSON.stringify({
+            type: "event",
+            event: "connect.challenge",
+            payload: { nonce: "nonce-1" }
+          })
+        );
+
+        client.on("message", (data) => {
+          const frame = JSON.parse(data.toString()) as {
+            id: string;
+            method: string;
+          };
+
+          if (frame.method === "connect") {
+            handshakeAttempts += 1;
+            client.send(
+              JSON.stringify({
+                type: "res",
+                id: frame.id,
+                ok: false,
+                error: {
+                  message: "protocol mismatch",
+                  details: {
+                    expectedProtocol: 5
+                  }
+                }
+              })
+            );
+          }
+        });
+      });
+    });
+
+    const address = await listen(httpServer);
+    const client = createGatewayClient({
+      baseUrl: address.replace("http://", "ws://"),
+      secret: "shared-token",
+      requestTimeoutMs: 200
+    });
+
+    await expect(client.listSessions()).rejects.toThrow("Gateway protocol 5 is not supported");
+    expect(handshakeAttempts).toBe(1);
+    await client.stop();
+    await new Promise<void>((resolve) => wss.close(() => resolve()));
+  });
+
+  it("keeps using the official GatewayClient transport for QClaw's default 28789 gateway when available", async () => {
+    const runtimeRoot = mkdtempSync(join(tmpdir(), "claw-official-gateway-"));
+    tempDirs.add(runtimeRoot);
+    const distDir = join(runtimeRoot, "node_modules", "openclaw", "dist");
+    mkdirSync(distDir, { recursive: true });
+    writeFileSync(
+      join(distDir, "client-mock.js"),
+      `
+        export class GatewayClient {
+          constructor(options) {
+            this.options = options;
+            globalThis.__officialGatewayClientOptions = options;
+          }
+          start() {
+            this.options.onHelloOk();
+          }
+          async request(method, params) {
+            globalThis.__officialGatewayClientRequests = [
+              ...(globalThis.__officialGatewayClientRequests || []),
+              { method, params }
+            ];
+            return { ok: true, key: "official-session", sessionId: "official-session", label: "Official session" };
+          }
+          stop() {}
+        }
+      `
+    );
+
+    const client = createGatewayClient({
+      baseUrl: "ws://127.0.0.1:28789",
+      secret: "shared-token",
+      runtimeRoot
+    });
+
+    const session = await client.createSession("Official session");
+
+    expect(session.id).toBe("official-session");
+    expect((globalThis as Record<string, unknown>).__officialGatewayClientOptions).toMatchObject({
+      url: "ws://127.0.0.1:28789",
+      token: "shared-token"
+    });
+    expect((globalThis as Record<string, unknown>).__officialGatewayClientRequests).toMatchObject([
+      {
+        method: "sessions.create",
+        params: {
+          label: "Official session",
+          agentId: "main"
+        }
+      }
+    ]);
+    await client.stop();
   });
 
   it("sends OpenClaw messages through chat.send with delivery enabled", async () => {

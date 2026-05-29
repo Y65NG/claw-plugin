@@ -140,6 +140,9 @@ const CHAT_HISTORY_MAX_PAGES = 100;
 const CRON_LIST_PAGE_LIMIT = 50;
 const CRON_LIST_MAX_PAGES = 100;
 const OPENCLAW_STOP_SETTLE_TIMEOUT_MS = 3_000;
+const GATEWAY_PROTOCOL_MIN = 3;
+const GATEWAY_PROTOCOL_MAX = 4;
+const WEBSOCKET_CONNECTING = 0;
 
 type RpcTransport = {
   request(method: string, params: Record<string, unknown>, options?: GatewayRequestOptions): Promise<any>;
@@ -1033,6 +1036,100 @@ function readUnknownPath(value: unknown, path: string[]): unknown {
   return current;
 }
 
+function createGatewayFrameError(error: Extract<GatewayFrame, { type: "res" }>["error"]): Error {
+  const message = error?.message ?? "gateway request failed";
+  const details = error?.details !== undefined ? `: ${JSON.stringify(error.details)}` : "";
+  return new Error(`${message}${details}`);
+}
+
+function createGatewayHandshakeError(error: Error): Error {
+  if (!/protocol mismatch/i.test(error.message)) {
+    return error;
+  }
+  return new Error(`Gateway protocol negotiation failed: ${error.message}`);
+}
+
+function createUnsupportedGatewayProtocolError(expectedProtocol: number, originalError: Error): Error {
+  return new Error(
+    `Gateway protocol ${expectedProtocol} is not supported by this client; supported range is ` +
+      `${GATEWAY_PROTOCOL_MIN}-${GATEWAY_PROTOCOL_MAX}. Original error: ${originalError.message}`
+  );
+}
+
+function extractExpectedGatewayProtocol(
+  error: Extract<GatewayFrame, { type: "res" }>["error"],
+  fallbackMessage?: string
+): number | null {
+  const fromDetails = readExpectedProtocolValue(error?.details);
+  if (fromDetails !== null) {
+    return fromDetails;
+  }
+
+  return readExpectedProtocolFromText([error?.message, fallbackMessage].filter(Boolean).join(" "));
+}
+
+function readExpectedProtocolValue(value: unknown, depth = 0): number | null {
+  if (value === null || value === undefined || depth > 4) {
+    return null;
+  }
+
+  if (typeof value === "string") {
+    const fromText = readExpectedProtocolFromText(value);
+    if (fromText !== null) {
+      return fromText;
+    }
+    try {
+      return readExpectedProtocolValue(JSON.parse(value), depth + 1);
+    } catch {
+      return null;
+    }
+  }
+
+  if (Array.isArray(value)) {
+    for (const item of value) {
+      const match = readExpectedProtocolValue(item, depth + 1);
+      if (match !== null) {
+        return match;
+      }
+    }
+    return null;
+  }
+
+  if (typeof value !== "object") {
+    return null;
+  }
+
+  const record = value as Record<string, unknown>;
+  for (const key of ["expectedProtocol", "expected_protocol"]) {
+    const match = coerceGatewayProtocol(record[key]);
+    if (match !== null) {
+      return match;
+    }
+  }
+
+  for (const item of Object.values(record)) {
+    const match = readExpectedProtocolValue(item, depth + 1);
+    if (match !== null) {
+      return match;
+    }
+  }
+  return null;
+}
+
+function readExpectedProtocolFromText(value: string): number | null {
+  const match = value.match(/["']?expectedProtocol["']?\s*[:=]\s*["']?(\d+)["']?/i);
+  return match ? coerceGatewayProtocol(match[1]) : null;
+}
+
+function coerceGatewayProtocol(value: unknown): number | null {
+  const protocol = typeof value === "number" ? value : typeof value === "string" ? Number(value) : Number.NaN;
+  return Number.isInteger(protocol) ? protocol : null;
+}
+
+function isSupportedGatewayProtocol(protocol: number): boolean {
+  return protocol >= GATEWAY_PROTOCOL_MIN && protocol <= GATEWAY_PROTOCOL_MAX;
+}
+
 class RpcSocketClient {
   private readonly listeners = new Set<(frame: Extract<GatewayFrame, { type: "event" }>) => void>();
   private readonly disconnectListeners = new Set<(error?: Error) => void>();
@@ -1041,6 +1138,8 @@ class RpcSocketClient {
   private connectPromise: Promise<void> | null = null;
   private ready = false;
   private challengeNonce: string | null = null;
+  private connectProtocolOverride: number | null = null;
+  private connectProtocolRetryUsed = false;
   private stopped = false;
 
   constructor(private readonly config: GatewayConfig) {}
@@ -1128,6 +1227,7 @@ class RpcSocketClient {
       this.socket = socket;
       this.ready = false;
       this.challengeNonce = null;
+      this.connectProtocolRetryUsed = false;
       let settled = false;
 
       const finishError = (error: Error) => {
@@ -1137,6 +1237,9 @@ class RpcSocketClient {
         settled = true;
         if (this.socket === socket) {
           this.socket = null;
+        }
+        if (socket.readyState === WEBSOCKET_CONNECTING || socket.readyState === WebSocket.OPEN) {
+          socket.close();
         }
         this.ready = false;
         this.challengeNonce = null;
@@ -1215,11 +1318,22 @@ class RpcSocketClient {
     }
 
     if (!frame.ok) {
-      const message = frame.error?.message ?? "gateway request failed";
-      const details = frame.error?.details ? `: ${JSON.stringify(frame.error.details)}` : "";
-      const error = new Error(`${message}${details}`);
+      const error = createGatewayFrameError(frame.error);
       if (frame.id === "connect-handshake") {
-        rejectConnect(error);
+        const expectedProtocol = extractExpectedGatewayProtocol(frame.error, error.message);
+        if (expectedProtocol !== null && !isSupportedGatewayProtocol(expectedProtocol)) {
+          rejectConnect(createUnsupportedGatewayProtocolError(expectedProtocol, error));
+          return;
+        }
+
+        if (expectedProtocol !== null && !this.connectProtocolRetryUsed) {
+          this.connectProtocolOverride = expectedProtocol;
+          this.connectProtocolRetryUsed = true;
+          this.sendConnect();
+          return;
+        }
+
+        rejectConnect(createGatewayHandshakeError(error));
         return;
       }
       pending.reject(error);
@@ -1241,13 +1355,15 @@ class RpcSocketClient {
       return;
     }
 
+    const minProtocol = this.connectProtocolOverride ?? GATEWAY_PROTOCOL_MIN;
+    const maxProtocol = this.connectProtocolOverride ?? GATEWAY_PROTOCOL_MAX;
     const frame = {
       type: "req",
       id: "connect-handshake",
       method: "connect",
       params: {
-        minProtocol: 4,
-        maxProtocol: 4,
+        minProtocol,
+        maxProtocol,
         client: {
           id: "gateway-client",
           displayName: "Claw Control Center",

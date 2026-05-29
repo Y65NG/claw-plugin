@@ -1025,6 +1025,11 @@ Error response example:
 
 此表是当前插件实际使用或明确映射的 OpenClaw Gateway API。
 
+自写 WebSocket Gateway client 默认在 `connect` 握手中声明支持 Gateway protocol `3-4`。如果远端返回
+`protocol mismatch` 并带有 `expectedProtocol`，插件会在 `3` 或 `4` 范围内按该精确版本重试一次；
+超出范围时会保留原始错误并返回明确的不兼容提示。可用官方 `GatewayClient` 的本地 QClaw/OpenClaw
+路径仍优先使用官方 transport，不走这段自写协商逻辑。
+
 | OpenClaw Gateway API | Used by plugin feature | Local implementation | Official doc position |
 | --- | --- | --- | --- |
 | `connect` | Gateway handshake | `RpcSocketClient.sendConnect()` in [plugin/src/gateway-client.ts](./plugin/src/gateway-client.ts) | [Handshake (connect)](https://docs.openclaw.ai/gateway/protocol#handshake-connect) |
