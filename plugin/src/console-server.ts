@@ -127,6 +127,7 @@ export function createConsoleServer(input: CreateConsoleServerInput) {
             broadcastSessionEvent(event.sessionId, event);
           },
           listSessionEvents: (sessionId) => store.getSession(sessionId)?.events ?? [],
+          listKnownSessions: () => store.listSessions(),
           onEnsureSessionStream: ensureSessionStream,
           getLastEventSeq: (sessionId) => store.getLastEventSeq(sessionId),
           onStatusChange: broadcastStatus
@@ -501,9 +502,7 @@ export function createConsoleServer(input: CreateConsoleServerInput) {
       const before = sessionListSignature(store.listSessions());
       const remoteSessions = await input.gateway.listSessions(input.persistence.maxSessions);
       lastGatewayError = null;
-      for (const session of remoteSessions) {
-        await store.upsertSession(session);
-      }
+      await store.replaceSessions(remoteSessions);
       return before !== sessionListSignature(store.listSessions());
     } catch (error) {
       lastGatewayError = error instanceof Error ? error : new Error(String(error));

@@ -3,6 +3,9 @@ import { dirname } from "node:path";
 
 import type { SessionDetail, SessionMessage, SessionStatus, SessionSummary, TimelineEvent } from "./models";
 
+const HUB_SESSION_TITLE_PREFIX = "53AI Hub-";
+const CONTROL_CENTER_SESSION_TITLE = "Claw Control Center";
+
 type StoredSession = SessionDetail & {
   events: TimelineEvent[];
   hydrated: boolean;
@@ -51,9 +54,31 @@ export class FileSessionStore {
   }
 
   async upsertSession(session: SessionSummary): Promise<void> {
+    this.mergeSession(session);
+    this.trimSessions();
+    await this.persist();
+  }
+
+  async replaceSessions(sessions: SessionSummary[]): Promise<void> {
+    const remoteIds = new Set(sessions.map((session) => session.id));
+    for (const session of sessions) {
+      this.mergeSession(session);
+    }
+    for (const sessionId of Object.keys(this.state.sessions)) {
+      if (!remoteIds.has(sessionId)) {
+        delete this.state.sessions[sessionId];
+      }
+    }
+    this.trimSessions();
+    await this.persist();
+  }
+
+  private mergeSession(session: SessionSummary): void {
     const existing = this.state.sessions[session.id];
+    const title = preserveExistingHubTitle(existing?.session.title, session.title);
     const mergedSession = {
       ...session,
+      title,
       lastEventSeq: Math.max(session.lastEventSeq, existing?.session.lastEventSeq ?? 0)
     };
     this.state.sessions[session.id] = {
@@ -62,8 +87,6 @@ export class FileSessionStore {
       events: existing?.events ?? [],
       hydrated: existing?.hydrated ?? false
     };
-    this.trimSessions();
-    await this.persist();
   }
 
   async renameSession(sessionId: string, title: string): Promise<void> {
@@ -147,6 +170,21 @@ export class FileSessionStore {
     this.persistChain = this.persistChain.then(() => writeFile(this.filePath, snapshot));
     await this.persistChain;
   }
+}
+
+function preserveExistingHubTitle(existingTitle: string | undefined, incomingTitle: string): string {
+  if (isHubTitle(existingTitle) && isControlCenterTitle(incomingTitle)) {
+    return existingTitle;
+  }
+  return incomingTitle;
+}
+
+function isHubTitle(title: string | undefined): title is string {
+  return typeof title === "string" && title.trim().startsWith(HUB_SESSION_TITLE_PREFIX);
+}
+
+function isControlCenterTitle(title: string): boolean {
+  return title.trim() === CONTROL_CENTER_SESSION_TITLE;
 }
 
 function dedupeMessages(messages: SessionMessage[]): SessionMessage[] {

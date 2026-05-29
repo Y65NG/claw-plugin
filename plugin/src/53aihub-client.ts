@@ -49,6 +49,7 @@ export type Hub53AIIncomingMessage = {
   imageUrls?: string[];
   fileUrls?: string[];
   quoteContent?: string;
+  conversationTitle?: string;
 };
 
 export type Hub53AIOutgoingChunk = {
@@ -103,6 +104,7 @@ type HubBridgeCallbacks = {
   onSessionStatus(sessionId: string, status: SessionStatus): Promise<void>;
   onBridgeThinkingEvent?(event: TimelineEvent): Promise<void>;
   listSessionEvents?(sessionId: string): TimelineEvent[] | Promise<TimelineEvent[]>;
+  listKnownSessions?(): GatewaySession[] | Promise<GatewaySession[]>;
   onEnsureSessionStream(sessionId: string): Promise<void>;
   getLastEventSeq(sessionId: string): number;
   onStatusChange(): void;
@@ -129,6 +131,7 @@ const DEFAULT_THINKING_MESSAGE = "正在处理您的请求...";
 const MAX_OUTBOX_FRAMES = 200;
 const RUN_WAIT_TIMEOUT_MS = 30 * 60 * 1000;
 const HUB_SESSION_TITLE_PREFIX = "53AI Hub-";
+const CONTROL_CENTER_SESSION_TITLE = "Claw Control Center";
 const HUB_TITLE_SUMMARY_LENGTH = 40;
 const HUB_RPC_ACTIONS = new Set([
   "sessions.list",
@@ -381,10 +384,11 @@ export function createHub53AIBridge(input: HubBridgeInput) {
   async function resolveRPCRequest(request: Hub53AIRPCRequest): Promise<unknown> {
     if (request.action === "sessions.list") {
       const pagination = readRPCPagination(request.data, 50);
-      return input.gateway.listSessionPage({
+      const page = await input.gateway.listSessionPage({
         limit: pagination.limit,
         offset: pagination.offset
       });
+      return mergeKnownHubSessionTitles(page);
     }
 
     if (request.action === "sessions.current") {
@@ -546,15 +550,6 @@ export function createHub53AIBridge(input: HubBridgeInput) {
       throw new HubRPCError("PARAM_ERROR", "chat_id or user is required");
     }
 
-    if (isOpenClawSessionId(chatId)) {
-      return input.gateway.getSession(chatId);
-    }
-
-    const mappedSession = await getMappedSession(chatId);
-    if (mappedSession) {
-      return mappedSession;
-    }
-
     return restoreLatestHubSession(chatId, userName);
   }
 
@@ -586,7 +581,8 @@ export function createHub53AIBridge(input: HubBridgeInput) {
       limit: 100,
       offset: 0
     });
-    const sessions = page.sessions
+    const knownSessions = await listKnownSessions();
+    const sessions = mergeKnownHubSessions(page.sessions, knownSessions)
       .filter((session) => isRestorableHubSession(session, chatId, userName))
       .sort((left, right) => toTime(right.updatedAt || right.createdAt) - toTime(left.updatedAt || left.createdAt));
     const session = sessions[0];
@@ -594,9 +590,29 @@ export function createHub53AIBridge(input: HubBridgeInput) {
       return null;
     }
 
-    state.mappings[chatId] = session.id;
-    await persistState();
     return session;
+  }
+
+  async function mergeKnownHubSessionTitles<T extends { sessions: GatewaySession[] }>(page: T): Promise<T> {
+    const knownSessions = await listKnownSessions();
+    if (!knownSessions.length) {
+      return page;
+    }
+    return {
+      ...page,
+      sessions: mergeKnownHubSessions(page.sessions, knownSessions)
+    };
+  }
+
+  async function listKnownSessions(): Promise<GatewaySession[]> {
+    try {
+      return (await input.callbacks.listKnownSessions?.()) ?? [];
+    } catch (error) {
+      input.logger?.warn?.(
+        `Failed to read known 53AIHub sessions: ${error instanceof Error ? error.message : String(error)}`
+      );
+      return [];
+    }
   }
 
   async function buildFallbackStatus() {
@@ -937,18 +953,9 @@ export function createHub53AIBridge(input: HubBridgeInput) {
   async function resolveSession(message: Hub53AIIncomingMessage): Promise<GatewaySession> {
     const desiredTitle = buildHubSessionTitle(message);
     if (isOpenClawSessionId(message.chatId)) {
-      const session = await input.gateway.getSession(message.chatId);
-      state.mappings[message.chatId] = session.id;
-      await persistState();
+      const session = await getSessionWithKnownHubTitle(message.chatId, message.conversationTitle);
       await input.callbacks.onSessionUpsert(session);
       return session;
-    }
-
-    const mappedSession = await getMappedSession(message.chatId);
-    if (mappedSession) {
-      const nextSession = await renamePlaceholderSessionIfNeeded(mappedSession, message, desiredTitle);
-      await input.callbacks.onSessionUpsert(nextSession);
-      return nextSession;
     }
 
     const restoredSession = await restoreLatestHubSession(message.chatId, message.userName || message.userId);
@@ -959,10 +966,15 @@ export function createHub53AIBridge(input: HubBridgeInput) {
     }
 
     const session = await createSessionWithUniqueTitle(desiredTitle);
-    state.mappings[message.chatId] = session.id;
-    await persistState();
     await input.callbacks.onSessionUpsert(session);
     return session;
+  }
+
+  async function getSessionWithKnownHubTitle(sessionId: string, titleHint?: string): Promise<GatewaySession> {
+    const session = await input.gateway.getSession(sessionId);
+    const knownSessions = await listKnownSessions();
+    const titleHintSession = applyHubTitleHint(session, titleHint);
+    return mergeKnownHubSessions([titleHintSession], knownSessions)[0] ?? titleHintSession;
   }
 
   async function createSessionWithUniqueTitle(baseTitle: string): Promise<GatewaySession> {
@@ -1162,6 +1174,7 @@ export function parseIncomingMessage(rawJson: string): Hub53AIIncomingMessage | 
         chatId,
         userId,
         userName: extractUserName(openAIReq, metadata, userObject, userMessage),
+        conversationTitle: extractConversationTitle(openAIReq, metadata),
         text: extractTextFromContent(content),
         imageUrls: extractImagesFromContent(content),
         fileUrls: extractFilesFromContent(content)
@@ -1183,6 +1196,7 @@ export function parseIncomingMessage(rawJson: string): Hub53AIIncomingMessage | 
       chatId,
       userId,
       userName: extractUserName(data, userObject),
+      conversationTitle: extractConversationTitle(data),
       text: stringOr(data.text, data.content, ""),
       imageUrls: normalizeUrlList(data.imageUrls, data.images),
       fileUrls: normalizeUrlList(data.fileUrls, data.files),
@@ -1338,6 +1352,24 @@ function extractUserName(...sources: unknown[]): string | undefined {
   return undefined;
 }
 
+function extractConversationTitle(...sources: unknown[]): string | undefined {
+  const titleKeys = [
+    "openclaw_conversation_title",
+    "openclawConversationTitle",
+    "conversation_title",
+    "conversationTitle",
+    "title"
+  ];
+  for (const source of sources) {
+    const record = toRecord(source);
+    const title = stringFromKeys(record, titleKeys);
+    if (title) {
+      return title;
+    }
+  }
+  return undefined;
+}
+
 function stringFromKeys(record: Record<string, any>, keys: string[]): string | undefined {
   for (const key of keys) {
     const value = record[key];
@@ -1415,6 +1447,50 @@ function isRestorableHubSession(session: GatewaySession, chatId: string, userNam
     return false;
   }
   return normalized.startsWith(`${HUB_SESSION_TITLE_PREFIX}${sanitizeTitlePart(userName)}：`);
+}
+
+function mergeKnownHubSessions(gatewaySessions: GatewaySession[], knownSessions: GatewaySession[]): GatewaySession[] {
+  const knownHubById = new Map(
+    knownSessions.filter((session) => isHubTitle(session.title)).map((session) => [session.id, session])
+  );
+  if (!knownHubById.size) {
+    return gatewaySessions;
+  }
+
+  const merged = gatewaySessions.map((session) => {
+    const knownSession = knownHubById.get(session.id);
+    if (!knownSession || !shouldPreferKnownHubTitle(session.title, knownSession.title)) {
+      return session;
+    }
+    return {
+      ...session,
+      title: knownSession.title
+    };
+  });
+  return merged;
+}
+
+function applyHubTitleHint(session: GatewaySession, titleHint?: string): GatewaySession {
+  const normalizedTitle = titleHint?.trim();
+  if (!normalizedTitle || !isHubTitle(normalizedTitle)) {
+    return session;
+  }
+  return {
+    ...session,
+    title: normalizedTitle
+  };
+}
+
+function shouldPreferKnownHubTitle(gatewayTitle: string, knownTitle: string): boolean {
+  return isHubTitle(knownTitle) && (isControlCenterTitle(gatewayTitle) || !isHubTitle(gatewayTitle));
+}
+
+function isHubTitle(title: string): boolean {
+  return title.trim().startsWith(HUB_SESSION_TITLE_PREFIX);
+}
+
+function isControlCenterTitle(title: string): boolean {
+  return title.trim() === CONTROL_CENTER_SESSION_TITLE;
 }
 
 function toTime(value?: string): number {
