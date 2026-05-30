@@ -12,7 +12,7 @@
 - 支持"思考中"消息，用户发送消息后可立即收到处理反馈。
 - 支持断线缓存、重连补发和消息去重。
 - 支持本地控制台，可查看状态、配置、会话、消息、技能和定时任务。
-- 支持 QClaw 与 OpenClaw 两种宿主安装目标。
+- 支持由目标 Claw 提供安装路径后完成插件安装，无需插件维护宿主分支判断。
 
 ## 当前实现说明
 
@@ -36,8 +36,12 @@
 发布到 npm 后，用户可以使用：
 
 ```bash
-npx claw-control-center install --target qclaw
-npx claw-control-center install --target openclaw
+npx claw-control-center install \
+  --config-path "<claw-openclaw-json-path>" \
+  --extensions-dir "<claw-extensions-dir>" \
+  --hub-ws-url "wss://kmapirc.53ai.com/api/v1/openclaw/ws/connect" \
+  --hub-bot-id "<bot-id>" \
+  --hub-secret "<secret>"
 ```
 
 如发布包名调整为 `@53ai/53ai-openclaw`，对应命令也应同步调整。
@@ -51,23 +55,20 @@ pnpm install
 pnpm build
 ```
 
-安装到 QClaw：
+将插件安装到目标 Claw 提供的配置文件和扩展目录：
 
 ```bash
-node plugin/bin/install-qclaw.mjs install --target qclaw
-```
-
-安装到 OpenClaw：
-
-```bash
-node plugin/bin/install-qclaw.mjs install --target openclaw
+node plugin/bin/install-qclaw.mjs install \
+  --config-path "<claw-openclaw-json-path>" \
+  --extensions-dir "<claw-extensions-dir>"
 ```
 
 如果需要同时写入 53AIHub 鉴权配置：
 
 ```bash
 node plugin/bin/install-qclaw.mjs install \
-  --target qclaw \
+  --config-path "<claw-openclaw-json-path>" \
+  --extensions-dir "<claw-extensions-dir>" \
   --hub-ws-url "wss://kmapirc.53ai.com/api/v1/openclaw/ws/connect" \
   --hub-bot-id "<bot-id>" \
   --hub-secret "<secret>"
@@ -77,7 +78,8 @@ node plugin/bin/install-qclaw.mjs install \
 
 ```bash
 node plugin/bin/install-qclaw.mjs install \
-  --target openclaw \
+  --config-path "<claw-openclaw-json-path>" \
+  --extensions-dir "<claw-extensions-dir>" \
   --gateway ws://127.0.0.1:28789 \
   --secret <gateway-token> \
   --bot-id <local-bot-id>
@@ -156,12 +158,22 @@ pnpm pack
 
 新版实现仍会读取旧版 `channels.53aihub` 配置作为回退，便于从旧插件迁移。
 
-## 默认安装位置
+## 安装路径
 
-| target | 配置文件 | 扩展目录 |
-|---|---|---|
-| `qclaw` | `~/.qclaw/openclaw.json` | `~/Library/Application Support/QClaw/openclaw/config/extensions` |
-| `openclaw` | `~/.openclaw/openclaw.json` | `~/.openclaw/extensions` |
+安装脚本不再接受 `--target`，也不再根据本机 `~/.openclaw`、`~/.qclaw` 等默认目录自动发现宿主。调用方必须显式提供目标 Claw 的配置文件和扩展目录：
+
+```bash
+npx claw-control-center install \
+  --config-path "<claw-openclaw-json-path>" \
+  --extensions-dir "<claw-extensions-dir>" \
+  --hub-bot-id "<bot-id>" \
+  --hub-secret "<secret>" \
+  --hub-ws-url "<hub-ws-url>"
+```
+
+这条命令应由 53AIHub 生成后交给目标 Claw 执行；目标 Claw 负责填入自己的配置路径和插件目录。这样新增 QClaw、OpenClaw 或其他 Claw 变种时，插件安装器不需要新增宿主判断分支。
+
+Gateway 协议版本由插件运行时自动协商，当前自写 Gateway client 支持 protocol 3 到 4。安装目录发现不参与协议版本判断。
 
 ## 启动与访问
 

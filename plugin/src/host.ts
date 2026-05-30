@@ -1,4 +1,4 @@
-export type HostKind = "openclaw" | "qclaw";
+export type HostKind = "openclaw";
 
 import { existsSync, readFileSync } from "node:fs";
 import { homedir } from "node:os";
@@ -100,10 +100,6 @@ export type HostRuntimeInfo = {
 const SENSITIVE_KEY_PATTERN = /(token|secret|password|key|credential)/i;
 
 export function detectHostKind(pathHint?: string): HostKind {
-  const normalized = (pathHint ?? "").replaceAll("\\", "/").toLowerCase();
-  if (normalized.includes("/.qclaw") || normalized.includes("/.qclow")) {
-    return "qclaw";
-  }
   return "openclaw";
 }
 

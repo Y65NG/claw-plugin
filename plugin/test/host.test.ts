@@ -7,9 +7,10 @@ import { describe, expect, it } from "vitest";
 import { detectHostKind, resolvePluginConfigWithHostDefaults, sanitizePluginConfig } from "../src/host";
 
 describe("host helpers", () => {
-  it("detects qclaw state directories", () => {
-    expect(detectHostKind("/Users/demo/.qclaw")).toBe("qclaw");
-    expect(detectHostKind("/Users/demo/.qclow/plugins")).toBe("qclaw");
+  it("treats all Claw host directories as OpenClaw-compatible", () => {
+    expect(detectHostKind("/Users/demo/.qclaw")).toBe("openclaw");
+    expect(detectHostKind("/Users/demo/.qclow/plugins")).toBe("openclaw");
+    expect(detectHostKind("/Users/demo/.openclaw")).toBe("openclaw");
   });
 
   it("sanitizes sensitive gateway values before exposing config", () => {

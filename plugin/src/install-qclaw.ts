@@ -1,7 +1,6 @@
 import { createHash } from "node:crypto";
 import { cp, mkdir, readFile, rm, writeFile } from "node:fs/promises";
 import { existsSync } from "node:fs";
-import { homedir } from "node:os";
 import { dirname, join, resolve } from "node:path";
 
 type InstallInput = {
@@ -20,8 +19,6 @@ type InstallInput = {
   consoleHost?: string;
   consolePort?: number;
 };
-
-type InstallTarget = "qclaw" | "openclaw";
 
 type ParsedArgs = {
   target?: string;
@@ -78,34 +75,7 @@ type OpenClawConfig = {
 
 const PLUGIN_ID = "claw-control-center";
 const LEGACY_PLUGIN_ID = "53ai-openclaw";
-const DEFAULT_QCLAW_HOME = resolve(homedir(), ".qclaw");
-const DEFAULT_OPENCLAW_HOME = resolve(homedir(), ".openclaw");
-const DEFAULT_EXTENSIONS_DIR = resolve(
-  homedir(),
-  "Library/Application Support/QClaw/openclaw/config/extensions"
-);
-const DEFAULT_OPENCLAW_EXTENSIONS_DIR = resolve(DEFAULT_OPENCLAW_HOME, "extensions");
 const COPY_ITEMS = ["dist", "openclaw.plugin.json", "package.json", "bin", "web-dist"] as const;
-
-const INSTALL_TARGETS: Record<
-  InstallTarget,
-  {
-    label: string;
-    defaultConfigPath: string;
-    defaultExtensionsDir: string;
-  }
-> = {
-  qclaw: {
-    label: "QClaw",
-    defaultConfigPath: join(DEFAULT_QCLAW_HOME, "openclaw.json"),
-    defaultExtensionsDir: DEFAULT_EXTENSIONS_DIR
-  },
-  openclaw: {
-    label: "OpenClaw",
-    defaultConfigPath: join(DEFAULT_OPENCLAW_HOME, "openclaw.json"),
-    defaultExtensionsDir: DEFAULT_OPENCLAW_EXTENSIONS_DIR
-  }
-};
 
 export async function installIntoQClaw(input: InstallInput): Promise<{
   configPath: string;
@@ -131,7 +101,7 @@ export async function installIntoOpenClaw(input: InstallInput): Promise<{
 
 async function installIntoHost(
   input: InstallInput,
-  hostLabel: "QClaw" | "OpenClaw"
+  hostLabel: "Claw" | "QClaw" | "OpenClaw"
 ): Promise<{
   configPath: string;
   extensionsDir: string;
@@ -267,44 +237,59 @@ export async function runInstallCommand(input: {
   }
 
   const args = parseArgs(argv.slice(1));
-  const target = parseInstallTarget(args.target);
-  if (!target) {
-    throw new Error("expected --target qclaw or --target openclaw");
-  }
-  const targetInfo = INSTALL_TARGETS[target];
+  const destination = resolveInstallDestination(args);
 
-  const configPath = resolve(args["config-path"] ?? targetInfo.defaultConfigPath);
-  const extensionsDir = resolve(args["extensions-dir"] ?? targetInfo.defaultExtensionsDir);
-
-  const install = target === "openclaw" ? installIntoOpenClaw : installIntoQClaw;
-  const result = await install({
-    packageRoot: input.packageRoot,
-    extensionsDir,
-    configPath,
-    gateway: args.gateway,
-    botId: args["bot-id"],
-    secret: args.secret,
-    preferResponsesApi: parseOptionalBoolean(args["prefer-responses-api"]),
-    gatewayModel: args["gateway-model"],
-    hubWsUrl: args["hub-ws-url"],
-    hubBotId: args["hub-bot-id"],
-    hubSecret: args["hub-secret"],
-    hubEnabled: parseOptionalBoolean(args["hub-enabled"]),
-    consoleHost: args["console-host"],
-    consolePort: args["console-port"] ? Number(args["console-port"]) : undefined
-  });
+  const result = await installIntoHost(
+    {
+      packageRoot: input.packageRoot,
+      extensionsDir: destination.extensionsDir,
+      configPath: destination.configPath,
+      gateway: args.gateway,
+      botId: args["bot-id"],
+      secret: args.secret,
+      preferResponsesApi: parseOptionalBoolean(args["prefer-responses-api"]),
+      gatewayModel: args["gateway-model"],
+      hubWsUrl: args["hub-ws-url"],
+      hubBotId: args["hub-bot-id"],
+      hubSecret: args["hub-secret"],
+      hubEnabled: parseOptionalBoolean(args["hub-enabled"]),
+      consoleHost: args["console-host"],
+      consolePort: args["console-port"] ? Number(args["console-port"]) : undefined
+    },
+    "Claw"
+  );
 
   process.stdout.write(
     [
-      `Installed ${PLUGIN_ID} into ${targetInfo.label}.`,
+      `Installed ${PLUGIN_ID} into Claw.`,
       `Extensions: ${result.extensionsDir}`,
       `Config: ${result.configPath}`,
       `Gateway: ${result.gatewayBaseUrl}`,
       `53AIHub: ${result.hub53aiConfigured ? "configured" : "not configured"}`,
       `Plugin build: ${result.pluginBuild}`,
-      `Restart ${targetInfo.label} to load the plugin.`
+      "Restart your Claw host to load the plugin."
     ].join("\n") + "\n"
   );
+}
+
+function resolveInstallDestination(args: ParsedArgs): {
+  configPath: string;
+  extensionsDir: string;
+} {
+  if (args.target !== undefined) {
+    throw new Error("--target is no longer supported; pass --config-path and --extensions-dir from your Claw host");
+  }
+
+  const explicitConfigPath = args["config-path"] ? resolve(args["config-path"]) : undefined;
+  const explicitExtensionsDir = args["extensions-dir"] ? resolve(args["extensions-dir"]) : undefined;
+  if (!explicitConfigPath || !explicitExtensionsDir) {
+    throw new Error("missing --config-path and --extensions-dir; provide the paths generated by your Claw host");
+  }
+
+  return {
+    configPath: explicitConfigPath,
+    extensionsDir: explicitExtensionsDir
+  };
 }
 
 function parseArgs(argv: string[]): ParsedArgs {
@@ -323,13 +308,6 @@ function parseArgs(argv: string[]): ParsedArgs {
     }
   }
   return parsed;
-}
-
-function parseInstallTarget(target: string | undefined): InstallTarget | undefined {
-  if (target === "qclaw" || target === "openclaw") {
-    return target;
-  }
-  return undefined;
 }
 
 async function copyPublishablePackage(packageRoot: string, destination: string) {
