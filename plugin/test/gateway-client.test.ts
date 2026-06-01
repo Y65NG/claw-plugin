@@ -300,7 +300,7 @@ describe("gateway client", () => {
     await client.stop();
   });
 
-  it("sends OpenClaw messages through chat.send with delivery enabled", async () => {
+  it("sends OpenClaw messages through chat.send without external delivery", async () => {
     let capturedMethod = "";
     let capturedParams: Record<string, unknown> = {};
 
@@ -349,7 +349,7 @@ describe("gateway client", () => {
     expect(capturedParams).toMatchObject({
       sessionKey: "agent:main:telegram:direct:123",
       message: "hello",
-      deliver: true
+      deliver: false
     });
     expect(capturedParams).toHaveProperty("idempotencyKey");
     await client.stop();
@@ -858,7 +858,7 @@ describe("gateway client", () => {
     expect(capturedParams).toMatchObject({
       sessionKey: "agent:main:test-session",
       message: "hello",
-      deliver: true
+      deliver: false
     });
     await client.stop();
     await new Promise<void>((resolve) => wss.close(() => resolve()));

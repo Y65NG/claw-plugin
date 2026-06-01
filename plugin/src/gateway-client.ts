@@ -352,7 +352,7 @@ export function createGatewayClient(config: Partial<GatewayConfig>): GatewayClie
       await transport.request("chat.send", {
         sessionKey: sessionId,
         message: content,
-        deliver: true,
+        deliver: false,
         idempotencyKey: randomUUID()
       });
     },
