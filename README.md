@@ -31,20 +31,22 @@
 
 ## 安装方式
 
-### 方式一：从 npm 安装（发布后）
+### 方式一：复制给 Claw 一键安装（发布后）
 
-发布到 npm 后，用户可以使用：
+发布到 npm 后，53AIHub 推荐生成如下安装内容。用户可以直接复制到当前使用的 Claw 内部，让 Claw 执行安装：
 
 ```bash
-npx claw-control-center install \
-  --config-path "<claw-openclaw-json-path>" \
-  --extensions-dir "<claw-extensions-dir>" \
-  --hub-ws-url "wss://kmapirc.53ai.com/api/v1/openclaw/ws/connect" \
+curl -fsSL https://raw.githubusercontent.com/53AI/53AI-OpenClaw/main/install.sh | bash -s -- \
   --hub-bot-id "<bot-id>" \
-  --hub-secret "<secret>"
+  --hub-secret "<secret>" \
+  --hub-ws-url "wss://kmapirc.53ai.com/api/v1/openclaw/ws/connect"
 ```
 
-如发布包名调整为 `@53ai/53ai-openclaw`，对应命令也应同步调整。
+`install.sh` 内部包含给 Claw 智能体 (agent) 的提示词：优先安装到当前正在运行的 Claw；如果能识别当前 Claw 的 `openclaw.json` 和 extensions 目录，可以自动补充精确路径；否则由安装器自动检测本机 Claw。
+
+如果用户是在普通终端手动执行同一条 curl 命令，安装器会扫描当前用户电脑上的 QClaw / OpenClaw。只发现一个宿主时会直接安装；发现多个宿主时会显示安装位置列表，让用户选择要写入的 Claw。
+
+如发布包名调整为 `@53ai/53ai-openclaw`，`install.sh` 中调用的 npm 包名也应同步调整。
 
 ### 方式二：本地开发调试安装
 
@@ -55,7 +57,13 @@ pnpm install
 pnpm build
 ```
 
-将插件安装到目标 Claw 提供的配置文件和扩展目录：
+本地调试时可以直接运行安装器。若当前电脑只检测到一个 Claw 宿主，可以使用自动发现：
+
+```bash
+node plugin/bin/install-qclaw.mjs install
+```
+
+如果当前电脑有多个 Claw，安装器会显示可选安装位置。若需要跳过选择，显式传入配置文件和扩展目录：
 
 ```bash
 node plugin/bin/install-qclaw.mjs install \
@@ -67,6 +75,15 @@ node plugin/bin/install-qclaw.mjs install \
 
 ```bash
 node plugin/bin/install-qclaw.mjs install \
+  --hub-ws-url "wss://kmapirc.53ai.com/api/v1/openclaw/ws/connect" \
+  --hub-bot-id "<bot-id>" \
+  --hub-secret "<secret>"
+```
+
+如果由 Claw 宿主或 53AIHub 生成精确安装路径，也可以显式传入配置文件和扩展目录：
+
+```bash
+node plugin/bin/install-qclaw.mjs install \
   --config-path "<claw-openclaw-json-path>" \
   --extensions-dir "<claw-extensions-dir>" \
   --hub-ws-url "wss://kmapirc.53ai.com/api/v1/openclaw/ws/connect" \
@@ -74,18 +91,7 @@ node plugin/bin/install-qclaw.mjs install \
   --hub-secret "<secret>"
 ```
 
-如果需要显式指定本地 Gateway：
-
-```bash
-node plugin/bin/install-qclaw.mjs install \
-  --config-path "<claw-openclaw-json-path>" \
-  --extensions-dir "<claw-extensions-dir>" \
-  --gateway ws://127.0.0.1:28789 \
-  --secret <gateway-token> \
-  --bot-id <local-bot-id>
-```
-
-`--gateway` / `--secret` 表示本地 QClaw/OpenClaw Gateway；`--hub-*` 表示公司 53AIHub 服务器。两组配置不要混用。
+通常不需要传 `--gateway` / `--secret`。插件会从目标宿主自己的 `openclaw.json` 自动读取当前本地 Gateway 端口和 token。只有连接自定义 Gateway 时才显式传 `--gateway` / `--secret`；`--hub-*` 表示公司 53AIHub 服务器。两组配置不要混用。
 
 ### 方式三：npm pack 打包安装
 
@@ -101,7 +107,7 @@ pnpm pack
 
 ## 配置
 
-安装脚本会写入 `plugins.entries.claw-control-center.config`。核心配置如下：
+安装脚本会写入 `plugins.entries.claw-control-center.config`。默认情况下，本地 Gateway 地址和 token 不会固化写入插件配置，而是在插件运行时从宿主 `openclaw.json` 读取当前值。核心配置如下：
 
 ```json
 {
@@ -113,8 +119,7 @@ pnpm pack
         "enabled": true,
         "config": {
           "gateway": {
-            "baseUrl": "ws://127.0.0.1:28789",
-            "secret": "<gateway-token>"
+            "preferResponsesApi": false
           },
           "hub53ai": {
             "enabled": true,
@@ -141,8 +146,8 @@ pnpm pack
 
 | 参数 | 必填 | 默认值 | 说明 |
 |------|------|--------|------|
-| `gateway.baseUrl` | 是 | 自动推断 | 本地 OpenClaw / QClaw Gateway 地址 |
-| `gateway.secret` | 是 | 自动推断 | 本地 Gateway token |
+| `gateway.baseUrl` | 否 | 宿主配置 | 自定义 OpenClaw / QClaw Gateway 地址；通常不需要配置 |
+| `gateway.secret` | 否 | 宿主配置 | 自定义 Gateway token；通常不需要配置 |
 | `gateway.preferResponsesApi` | 否 | `false` | 是否优先使用 HTTP responses 路径 |
 | `gateway.modelOverride` | 否 | - | 使用 HTTP responses 路径时指定模型 |
 | `hub53ai.enabled` | 否 | `false` | 是否启用 53AIHub bridge |
@@ -160,7 +165,21 @@ pnpm pack
 
 ## 安装路径
 
-安装脚本不再接受 `--target`，也不再根据本机 `~/.openclaw`、`~/.qclaw` 等默认目录自动发现宿主。调用方必须显式提供目标 Claw 的配置文件和扩展目录：
+安装脚本支持两种路径：
+
+1. 用户一键安装：不传安装目标参数，安装器自动发现当前用户电脑上的 QClaw / OpenClaw。
+2. 宿主集成安装：显式传入 `--config-path` 与 `--extensions-dir`，由宿主决定安装位置。
+
+```bash
+npx claw-control-center install \
+  --hub-bot-id "<bot-id>" \
+  --hub-secret "<secret>" \
+  --hub-ws-url "<hub-ws-url>"
+```
+
+如果只检测到一个宿主，安装器会直接安装并打印实际写入的 `Extensions` 与 `Config`。如果检测到多个宿主，安装器会显示编号列表，让用户选择安装位置。由于 `curl | bash` 会占用标准输入 (stdin)，安装器会通过 `/dev/tty` 读取用户选择，以便普通终端手动安装时仍能交互。
+
+如果宿主提供精确路径，则使用：
 
 ```bash
 npx claw-control-center install \
@@ -171,7 +190,9 @@ npx claw-control-center install \
   --hub-ws-url "<hub-ws-url>"
 ```
 
-这条命令应由 53AIHub 生成后交给目标 Claw 执行；目标 Claw 负责填入自己的配置路径和插件目录。这样新增 QClaw、OpenClaw 或其他 Claw 变种时，插件安装器不需要新增宿主判断分支。
+`--target` 已删除。继续传入 `--target` 会报错，并提示改用自动发现或显式路径参数。
+
+无论哪种方式，未显式传入 `--gateway` / `--secret` 时，插件都会在运行时读取宿主当前 Gateway 配置，避免把某台机器上的临时端口写死到插件配置中。
 
 Gateway 协议版本由插件运行时自动协商，当前自写 Gateway client 支持 protocol 3 到 4。安装目录发现不参与协议版本判断。
 

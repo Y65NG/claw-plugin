@@ -65,6 +65,64 @@ describe("host helpers", () => {
     expect(config.gateway.preferResponsesApi).toBe(false);
   });
 
+  it("prefers the host gateway when plugin config contains a stale loopback gateway", () => {
+    const directory = mkdtempSync(join(tmpdir(), "claw-plugin-host-"));
+    const configPath = join(directory, "openclaw.json");
+
+    writeFileSync(
+      configPath,
+      JSON.stringify({
+        gateway: {
+          host: "127.0.0.1",
+          port: 28789,
+          auth: {
+            mode: "token",
+            token: "local-token"
+          }
+        }
+      })
+    );
+
+    const config = resolvePluginConfigWithHostDefaults(configPath, {
+      gateway: {
+        baseUrl: "ws://127.0.0.1:49711",
+        secret: "stale-token"
+      }
+    });
+
+    expect(config.gateway.baseUrl).toBe("ws://127.0.0.1:28789");
+    expect(config.gateway.secret).toBe("local-token");
+  });
+
+  it("keeps an explicit non-loopback gateway override", () => {
+    const directory = mkdtempSync(join(tmpdir(), "claw-plugin-host-"));
+    const configPath = join(directory, "openclaw.json");
+
+    writeFileSync(
+      configPath,
+      JSON.stringify({
+        gateway: {
+          host: "127.0.0.1",
+          port: 28789,
+          auth: {
+            mode: "token",
+            token: "local-token"
+          }
+        }
+      })
+    );
+
+    const config = resolvePluginConfigWithHostDefaults(configPath, {
+      gateway: {
+        baseUrl: "wss://gateway.example.com/v1",
+        secret: "remote-token"
+      }
+    });
+
+    expect(config.gateway.baseUrl).toBe("wss://gateway.example.com/v1");
+    expect(config.gateway.secret).toBe("remote-token");
+  });
+
   it("reads legacy 53AIHub channel defaults from openclaw.json", () => {
     const directory = mkdtempSync(join(tmpdir(), "claw-plugin-host-"));
     const configPath = join(directory, "openclaw.json");

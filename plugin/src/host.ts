@@ -146,10 +146,13 @@ export function resolvePluginConfigWithHostDefaults(configPath: string, config?:
   const resolved = resolvePluginConfig(config);
   const hostConfig = readHostGatewayConfig(resolveHostConfigPath(configPath));
 
-  if (!resolved.gateway.baseUrl && hostConfig.baseUrl) {
+  if (
+    hostConfig.baseUrl &&
+    (!resolved.gateway.baseUrl || shouldPreferHostGateway(resolved.gateway.baseUrl, hostConfig.baseUrl))
+  ) {
     resolved.gateway.baseUrl = hostConfig.baseUrl;
   }
-  if (!resolved.gateway.secret && hostConfig.secret) {
+  if (hostConfig.secret && (!resolved.gateway.secret || resolved.gateway.baseUrl === hostConfig.baseUrl)) {
     resolved.gateway.secret = hostConfig.secret;
   }
   if (!resolved.hub53ai.botId && hostConfig.hub53ai?.botId) {
@@ -163,6 +166,30 @@ export function resolvePluginConfigWithHostDefaults(configPath: string, config?:
   }
 
   return resolved;
+}
+
+function shouldPreferHostGateway(configuredBaseUrl: string, hostBaseUrl: string): boolean {
+  if (configuredBaseUrl === hostBaseUrl) {
+    return false;
+  }
+  const configured = parseGatewayUrl(configuredBaseUrl);
+  const host = parseGatewayUrl(hostBaseUrl);
+  if (!configured || !host) {
+    return false;
+  }
+  return configured.isLoopback && host.isLoopback;
+}
+
+function parseGatewayUrl(value: string): { isLoopback: boolean } | undefined {
+  try {
+    const url = new URL(value);
+    const hostname = url.hostname.replace(/^\[|\]$/g, "").toLowerCase();
+    return {
+      isLoopback: hostname === "localhost" || hostname === "127.0.0.1" || hostname === "::1"
+    };
+  } catch {
+    return undefined;
+  }
 }
 
 export function sanitizePluginConfig<T extends PluginConfig | ResolvedPluginConfig>(config?: T): T | {} {

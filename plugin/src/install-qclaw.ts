@@ -1,7 +1,10 @@
 import { createHash } from "node:crypto";
-import { cp, mkdir, readFile, rm, writeFile } from "node:fs/promises";
+import { createInterface } from "node:readline/promises";
+import { cp, mkdir, open as openFile, readFile, rm, writeFile } from "node:fs/promises";
 import { existsSync } from "node:fs";
+import { homedir } from "node:os";
 import { dirname, join, resolve } from "node:path";
+import type { FileHandle } from "node:fs/promises";
 
 type InstallInput = {
   packageRoot: string;
@@ -21,7 +24,6 @@ type InstallInput = {
 };
 
 type ParsedArgs = {
-  target?: string;
   gateway?: string;
   "bot-id"?: string;
   secret?: string;
@@ -35,6 +37,21 @@ type ParsedArgs = {
   "config-path"?: string;
   "console-host"?: string;
   "console-port"?: string;
+};
+
+type InstallLabel = "Claw" | "QClaw" | "OpenClaw";
+
+export type HostDefinition = {
+  id: string;
+  label: InstallLabel;
+  configPath: string;
+  extensionsDir: string;
+};
+
+type InstallDestination = {
+  configPath: string;
+  extensionsDir: string;
+  label: InstallLabel;
 };
 
 type OpenClawConfig = {
@@ -76,6 +93,21 @@ type OpenClawConfig = {
 const PLUGIN_ID = "claw-control-center";
 const LEGACY_PLUGIN_ID = "53ai-openclaw";
 const COPY_ITEMS = ["dist", "openclaw.plugin.json", "package.json", "bin", "web-dist"] as const;
+const SUPPORTED_ARGS = new Set([
+  "gateway",
+  "bot-id",
+  "secret",
+  "prefer-responses-api",
+  "gateway-model",
+  "hub-ws-url",
+  "hub-bot-id",
+  "hub-secret",
+  "hub-enabled",
+  "extensions-dir",
+  "config-path",
+  "console-host",
+  "console-port"
+]);
 
 export async function installIntoQClaw(input: InstallInput): Promise<{
   configPath: string;
@@ -101,7 +133,7 @@ export async function installIntoOpenClaw(input: InstallInput): Promise<{
 
 async function installIntoHost(
   input: InstallInput,
-  hostLabel: "Claw" | "QClaw" | "OpenClaw"
+  hostLabel: InstallLabel
 ): Promise<{
   configPath: string;
   extensionsDir: string;
@@ -120,13 +152,15 @@ async function installIntoHost(
   const config = await readOpenClawConfig(input.configPath);
   const inferredGateway = inferGatewaySettings(config);
   const inferredHub53AI = inferHub53AISettings(config);
+  const explicitGatewayBaseUrl = input.gateway?.trim();
+  const explicitGatewaySecret = input.secret?.trim();
 
-  const gatewayBaseUrl = input.gateway?.trim() || inferredGateway.baseUrl;
+  const gatewayBaseUrl = explicitGatewayBaseUrl || inferredGateway.baseUrl;
   if (!gatewayBaseUrl) {
     throw new Error(`missing gateway URL and no local ${hostLabel} gateway could be inferred`);
   }
 
-  const secret = input.secret?.trim() || inferredGateway.secret;
+  const secret = explicitGatewaySecret || inferredGateway.secret;
   if (!secret) {
     throw new Error(`missing gateway secret and no local ${hostLabel} gateway token could be inferred`);
   }
@@ -168,8 +202,16 @@ async function installIntoHost(
   const previousEntry = ensureObject(entries, PLUGIN_ID);
   const previousConfig = ensureObject(previousEntry, "config");
   const previousGateway = ensureObject(previousConfig, "gateway");
-  previousGateway.baseUrl = gatewayBaseUrl;
-  previousGateway.secret = secret;
+  if (explicitGatewayBaseUrl) {
+    previousGateway.baseUrl = explicitGatewayBaseUrl;
+  } else {
+    delete previousGateway.baseUrl;
+  }
+  if (explicitGatewaySecret) {
+    previousGateway.secret = explicitGatewaySecret;
+  } else {
+    delete previousGateway.secret;
+  }
   previousGateway.preferResponsesApi = preferResponsesApi;
   if (botId) {
     previousGateway.botId = botId;
@@ -230,6 +272,9 @@ async function installIntoHost(
 export async function runInstallCommand(input: {
   argv?: string[];
   packageRoot: string;
+  hostDefinitions?: HostDefinition[];
+  selectHost?: (hosts: HostDefinition[]) => Promise<HostDefinition>;
+  ttyPath?: string;
 }): Promise<void> {
   const argv = input.argv ?? process.argv.slice(2);
   if (argv[0] !== "install") {
@@ -237,7 +282,11 @@ export async function runInstallCommand(input: {
   }
 
   const args = parseArgs(argv.slice(1));
-  const destination = resolveInstallDestination(args);
+  const destination = await resolveInstallDestination(args, {
+    hostDefinitions: input.hostDefinitions,
+    selectHost: input.selectHost,
+    ttyPath: input.ttyPath
+  });
 
   const result = await installIntoHost(
     {
@@ -256,40 +305,157 @@ export async function runInstallCommand(input: {
       consoleHost: args["console-host"],
       consolePort: args["console-port"] ? Number(args["console-port"]) : undefined
     },
-    "Claw"
+    destination.label
   );
 
   process.stdout.write(
     [
-      `Installed ${PLUGIN_ID} into Claw.`,
+      `Installed ${PLUGIN_ID} into ${destination.label}.`,
       `Extensions: ${result.extensionsDir}`,
       `Config: ${result.configPath}`,
       `Gateway: ${result.gatewayBaseUrl}`,
       `53AIHub: ${result.hub53aiConfigured ? "configured" : "not configured"}`,
       `Plugin build: ${result.pluginBuild}`,
-      "Restart your Claw host to load the plugin."
+      `Restart ${destination.label} to load the plugin.`
     ].join("\n") + "\n"
   );
 }
 
-function resolveInstallDestination(args: ParsedArgs): {
-  configPath: string;
-  extensionsDir: string;
-} {
-  if (args.target !== undefined) {
-    throw new Error("--target is no longer supported; pass --config-path and --extensions-dir from your Claw host");
-  }
-
+async function resolveInstallDestination(
+  args: ParsedArgs,
+  options: {
+    hostDefinitions?: HostDefinition[];
+    selectHost?: (hosts: HostDefinition[]) => Promise<HostDefinition>;
+    ttyPath?: string;
+  } = {}
+): Promise<InstallDestination> {
   const explicitConfigPath = args["config-path"] ? resolve(args["config-path"]) : undefined;
   const explicitExtensionsDir = args["extensions-dir"] ? resolve(args["extensions-dir"]) : undefined;
-  if (!explicitConfigPath || !explicitExtensionsDir) {
-    throw new Error("missing --config-path and --extensions-dir; provide the paths generated by your Claw host");
+
+  if (explicitConfigPath && explicitExtensionsDir) {
+    return {
+      configPath: explicitConfigPath,
+      extensionsDir: explicitExtensionsDir,
+      label: "Claw"
+    };
   }
 
+  if (explicitConfigPath || explicitExtensionsDir) {
+    throw new Error("pass --config-path and --extensions-dir together, or omit both to auto-detect Claw");
+  }
+
+  const detected = detectInstallHosts(options.hostDefinitions ?? getDefaultHostDefinitions());
+  if (detected.length === 1) {
+    return toInstallDestination(detected[0]!);
+  }
+  if (detected.length > 1) {
+    const selected = options.selectHost
+      ? await options.selectHost(detected)
+      : await promptForInstallHost(detected, options.ttyPath ?? "/dev/tty");
+    return toInstallDestination(selected);
+  }
+
+  throw new Error(
+    [
+      "could not auto-detect an installed Claw host.",
+      "Pass --config-path and --extensions-dir to install into a specific Claw.",
+      "",
+      "Supported default locations:",
+      ...formatHostList(options.hostDefinitions ?? getDefaultHostDefinitions())
+    ].join("\n")
+  );
+}
+
+function getDefaultHostDefinitions(): HostDefinition[] {
+  const home = homedir();
+  const qclawHome = resolve(home, ".qclaw");
+  const openClawHome = resolve(home, ".openclaw");
+  return [
+    {
+      id: "qclaw",
+      label: "QClaw",
+      configPath: join(qclawHome, "openclaw.json"),
+      extensionsDir: resolve(home, "Library/Application Support/QClaw/openclaw/config/extensions")
+    },
+    {
+      id: "openclaw",
+      label: "OpenClaw",
+      configPath: join(openClawHome, "openclaw.json"),
+      extensionsDir: resolve(openClawHome, "extensions")
+    }
+  ];
+}
+
+function detectInstallHosts(hosts: HostDefinition[]): HostDefinition[] {
+  const seen = new Set<string>();
+  return hosts.filter((host) => {
+    const key = `${resolve(host.configPath)}\0${resolve(host.extensionsDir)}`;
+    if (seen.has(key) || !existsSync(host.configPath)) {
+      return false;
+    }
+    seen.add(key);
+    return true;
+  });
+}
+
+async function promptForInstallHost(hosts: HostDefinition[], ttyPath: string): Promise<HostDefinition> {
+  let handle: FileHandle | undefined;
+  try {
+    handle = await openFile(ttyPath, "r+");
+    const input = handle.createReadStream();
+    const output = handle.createWriteStream();
+    const readline = createInterface({ input, output });
+    try {
+      output.write("Multiple Claw installations were detected.\n");
+      output.write("Choose where to install claw-control-center:\n");
+      hosts.forEach((host, index) => {
+        output.write(`${index + 1}. ${host.label}\n`);
+        output.write(`   Config: ${host.configPath}\n`);
+        output.write(`   Extensions: ${host.extensionsDir}\n`);
+      });
+      const answer = await readline.question(`Install location [1-${hosts.length}]: `);
+      const selectedIndex = Number(answer.trim());
+      if (!Number.isInteger(selectedIndex) || selectedIndex < 1 || selectedIndex > hosts.length) {
+        throw new Error(`invalid install location: ${answer}`);
+      }
+      return hosts[selectedIndex - 1]!;
+    } finally {
+      readline.close();
+      input.destroy();
+      output.end();
+    }
+  } catch (error) {
+    if (error instanceof Error && error.message.startsWith("invalid install location:")) {
+      throw error;
+    }
+    throw new Error(
+      [
+        "multiple Claw installations were detected, but no interactive terminal was available.",
+        "Run the installer again with --config-path and --extensions-dir.",
+        "",
+        "Detected locations:",
+        ...formatHostList(hosts)
+      ].join("\n")
+    );
+  } finally {
+    await handle?.close().catch(() => undefined);
+  }
+}
+
+function toInstallDestination(host: HostDefinition): InstallDestination {
   return {
-    configPath: explicitConfigPath,
-    extensionsDir: explicitExtensionsDir
+    configPath: resolve(host.configPath),
+    extensionsDir: resolve(host.extensionsDir),
+    label: host.label
   };
+}
+
+function formatHostList(hosts: HostDefinition[]): string[] {
+  return hosts.flatMap((host) => [
+    `- ${host.label}`,
+    `  Config: ${host.configPath}`,
+    `  Extensions: ${host.extensionsDir}`
+  ]);
 }
 
 function parseArgs(argv: string[]): ParsedArgs {
@@ -299,12 +465,19 @@ function parseArgs(argv: string[]): ParsedArgs {
     if (!entry.startsWith("--")) {
       continue;
     }
+    const key = entry.slice(2);
+    if (key === "target") {
+      throw new Error("--target has been removed; omit it to auto-detect Claw or pass --config-path and --extensions-dir");
+    }
+    if (!SUPPORTED_ARGS.has(key)) {
+      throw new Error(`unknown option: --${key}`);
+    }
     const next = argv[index + 1];
     if (next && !next.startsWith("--")) {
-      parsed[entry.slice(2) as keyof ParsedArgs] = next;
+      parsed[key as keyof ParsedArgs] = next;
       index += 1;
     } else {
-      parsed[entry.slice(2) as keyof ParsedArgs] = "true";
+      parsed[key as keyof ParsedArgs] = "true";
     }
   }
   return parsed;

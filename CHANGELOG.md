@@ -4,6 +4,17 @@ All notable changes to this project will be documented in this file.
 
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/).
 
+## [0.1.8] - 2026-06-01
+
+### Added
+- 新增 `install.sh`，支持 53AIHub 生成 `curl | bash` 一键安装命令，并在脚本内提供给 Claw 智能体读取的安装提示词。
+- 安装器支持自动发现本机 QClaw / OpenClaw；发现多个宿主时显示安装位置选项。
+
+### Fixed
+- 安装器删除 `--target`，改为自动发现或显式 `--config-path` / `--extensions-dir`。
+- 未显式传入 `--gateway` / `--secret` 时，不再把推断出的本地 Gateway 端口和密钥固化到插件配置中，避免 QClaw / OpenClaw 端口变化后继续连接旧端口。
+- 运行时遇到旧版配置残留的 loopback Gateway 地址时，会优先使用宿主 `openclaw.json` 中的当前 Gateway 配置。
+
 ## [0.1.3] - 2026-05-29
 
 ### Added
