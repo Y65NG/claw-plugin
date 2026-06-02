@@ -1,10 +1,10 @@
 # 53AI-OpenClaw
 
-53AI-OpenClaw 是 53AI Hub 接入 OpenClaw / QClaw 的通道插件。当前分支是基于旧版 `53AI-OpenClaw` 的新版实现，保留 53AIHub WebSocket 通道能力，并新增本地控制台、会话管理、Gateway RPC 适配和断线重放能力。
+53AI-OpenClaw 是 53AI Hub 接入 OpenClaw / QClaw / Hermes 的通道插件。当前分支是基于旧版 `53AI-OpenClaw` 的新版实现，保留 53AIHub WebSocket 通道能力，并新增本地控制台、会话管理、Gateway RPC 适配、Hermes 原生平台适配和断线重放能力。
 
 ## 功能
 
-- 将 OpenClaw / QClaw 接入 53AIHub。
+- 将 OpenClaw / QClaw / Hermes 接入 53AIHub。
 - 支持直接消息 (DM) 模式。
 - 支持 53AIHub WebSocket 实时通信。
 - 支持文本、图片、文件等多模态消息输入。
@@ -20,7 +20,7 @@
 
 ```text
 53AI-OpenClaw
-  -> plugin/               # OpenClaw / QClaw 插件实现
+  -> plugin/               # OpenClaw / QClaw 插件与 Hermes 平台适配器实现
   -> web/                  # 本地控制台前端
   -> plugin/web-dist/      # 构建后随插件发布的前端资源
   -> API.md                # 本地控制台与 Gateway API 文档
@@ -44,7 +44,7 @@ curl -fsSL https://raw.githubusercontent.com/53AI/53AI-OpenClaw/main/install.sh 
 
 `install.sh` 内部包含给 Claw 智能体 (agent) 的提示词：优先安装到当前正在运行的 Claw；如果能识别当前 Claw 的 `openclaw.json` 和 extensions 目录，可以自动补充精确路径；否则由安装器自动检测本机 Claw。
 
-如果用户是在普通终端手动执行同一条 curl 命令，安装器会扫描当前用户电脑上的 QClaw / OpenClaw。只发现一个宿主时会直接安装；发现多个宿主时会显示安装位置列表，让用户选择要写入的 Claw。
+如果用户是在普通终端手动执行同一条 curl 命令，安装器会扫描当前用户电脑上的 QClaw / OpenClaw / Hermes。只发现一个宿主时会直接安装；发现多个宿主时会显示安装位置列表，让用户选择一个或多个 Claw 写入插件。OpenClaw / QClaw 会安装 `openclaw.plugin.json` 扩展；Hermes 会安装 `plugin.yaml` 平台适配器，并把 53AIHub 连接参数写入 `~/.hermes/.env`。
 
 如发布包名调整为 `@53ai/53ai-openclaw`，`install.sh` 中调用的 npm 包名也应同步调整。
 
@@ -63,7 +63,7 @@ pnpm build
 node plugin/bin/install-qclaw.mjs install
 ```
 
-如果当前电脑有多个 Claw，安装器会显示可选安装位置。若需要跳过选择，显式传入配置文件和扩展目录：
+如果当前电脑有多个兼容 Claw，安装器会显示可选安装位置。可以输入单个编号、逗号分隔的多个编号，或输入 `all` 安装到全部兼容宿主。若需要跳过选择，显式传入配置文件和扩展目录：
 
 ```bash
 node plugin/bin/install-qclaw.mjs install \
@@ -167,7 +167,7 @@ pnpm pack
 
 安装脚本支持两种路径：
 
-1. 用户一键安装：不传安装目标参数，安装器自动发现当前用户电脑上的 QClaw / OpenClaw。
+1. 用户一键安装：不传安装目标参数，安装器自动发现当前用户电脑上的 QClaw / OpenClaw / Hermes。
 2. 宿主集成安装：显式传入 `--config-path` 与 `--extensions-dir`，由宿主决定安装位置。
 
 ```bash
@@ -177,7 +177,7 @@ npx claw-control-center install \
   --hub-ws-url "<hub-ws-url>"
 ```
 
-如果只检测到一个宿主，安装器会直接安装并打印实际写入的 `Extensions` 与 `Config`。如果检测到多个宿主，安装器会显示编号列表，让用户选择安装位置。由于 `curl | bash` 会占用标准输入 (stdin)，安装器会通过 `/dev/tty` 读取用户选择，以便普通终端手动安装时仍能交互。
+如果只检测到一个宿主，安装器会直接安装并打印实际写入的 `Extensions` 与 `Config`。如果检测到多个宿主，安装器会显示编号列表，让用户选择一个或多个安装位置。由于 `curl | bash` 会占用标准输入 (stdin)，安装器会通过 `/dev/tty` 读取用户选择，以便普通终端手动安装时仍能交互。
 
 如果宿主提供精确路径，则使用：
 
@@ -192,9 +192,9 @@ npx claw-control-center install \
 
 `--target` 已删除。继续传入 `--target` 会报错，并提示改用自动发现或显式路径参数。
 
-无论哪种方式，未显式传入 `--gateway` / `--secret` 时，插件都会在运行时读取宿主当前 Gateway 配置，避免把某台机器上的临时端口写死到插件配置中。
+无论哪种方式，OpenClaw / QClaw 未显式传入 `--gateway` / `--secret` 时，插件都会在运行时读取宿主当前 Gateway 配置，避免把某台机器上的临时端口写死到插件配置中。Hermes 不使用 OpenClaw Gateway Protocol，而是通过原生 Hermes 平台适配器收发消息。
 
-Gateway 协议版本由插件运行时自动协商，当前自写 Gateway client 支持 protocol 3 到 4。安装目录发现不参与协议版本判断。
+Gateway 协议版本由 OpenClaw / QClaw 插件运行时自动协商，当前自写 Gateway client 支持 protocol 3 到 4。安装目录发现不参与协议版本判断，Hermes 兼容也不通过 Gateway Protocol 实现。
 
 ## 启动与访问
 

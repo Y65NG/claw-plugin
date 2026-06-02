@@ -11,7 +11,8 @@
     "dist",
     "openclaw.plugin.json",
     "bin",
-    "web-dist"
+    "web-dist",
+    "hermes"
   ],
   "scripts": {
     "build": "node ./scripts/sync-web-dist.mjs && tsup",
@@ -26,7 +27,8 @@
     "openclaw": ">=2026.5.18"
   },
   "dependencies": {
-    "ws": "^8.18.3"
+    "ws": "^8.18.3",
+    "yaml": "^2.9.0"
   },
   "devDependencies": {
     "@types/node": "^24.10.1",

@@ -1,0 +1,9 @@
+name: 53aihub
+version: 0.1.0
+kind: platform
+description: Bridge Hermes conversations to 53AIHub through the 53AIHub WebSocket.
+author: 53AI
+requires_env:
+  - HUB53AI_BOT_ID
+  - HUB53AI_SECRET
+  - HUB53AI_WS_URL

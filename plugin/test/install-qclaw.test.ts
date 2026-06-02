@@ -2,6 +2,7 @@ import { afterEach, describe, expect, it } from "vitest";
 import { access, mkdtemp, mkdir, readFile, rm, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
+import { parse as parseYaml } from "yaml";
 
 import { installIntoOpenClaw, installIntoQClaw, runInstallCommand } from "../src/install-qclaw";
 import type { HostDefinition } from "../src/install-qclaw";
@@ -641,6 +642,196 @@ describe("QClaw installer", () => {
     expect(chunks.join("")).toContain("Installed claw-control-center into OpenClaw.");
   });
 
+  it("installs into multiple selected Claw hosts when several compatible hosts are detected", async () => {
+    const tempRoot = await mkdtemp(join(tmpdir(), "openclaw-install-"));
+    cleanupPaths.push(tempRoot);
+
+    const qclawConfigPath = join(tempRoot, ".qclaw", "openclaw.json");
+    const qclawExtensionsDir = join(tempRoot, "Library/Application Support/QClaw/openclaw/config/extensions");
+    const openClawConfigPath = join(tempRoot, ".openclaw", "openclaw.json");
+    const openClawExtensionsDir = join(tempRoot, ".openclaw", "extensions");
+    const packageRoot = await createPackageRoot(tempRoot);
+    await mkdir(join(tempRoot, ".qclaw"), { recursive: true });
+    await mkdir(join(tempRoot, ".openclaw"), { recursive: true });
+    await writeGatewayConfig(qclawConfigPath, 28789, "qclaw-token");
+    await writeGatewayConfig(openClawConfigPath, 18789, "openclaw-token");
+
+    const hosts: HostDefinition[] = [
+      {
+        id: "qclaw",
+        label: "QClaw",
+        configPath: qclawConfigPath,
+        extensionsDir: qclawExtensionsDir
+      },
+      {
+        id: "openclaw",
+        label: "OpenClaw",
+        configPath: openClawConfigPath,
+        extensionsDir: openClawExtensionsDir
+      }
+    ];
+
+    const chunks: string[] = [];
+    await withCapturedStdout(chunks, async () => {
+      await runInstallCommand({
+        packageRoot,
+        argv: ["install"],
+        hostDefinitions: hosts,
+        selectHosts: async (detected) => {
+          expect(detected).toEqual(hosts);
+          return detected;
+        }
+      });
+    });
+
+    const openClawConfig = JSON.parse(await readFile(openClawConfigPath, "utf8")) as {
+      plugins: {
+        allow: string[];
+        load: { paths: string[] };
+      };
+    };
+    const qclawConfig = JSON.parse(await readFile(qclawConfigPath, "utf8")) as {
+      plugins: {
+        allow: string[];
+        load: { paths: string[] };
+      };
+    };
+
+    expect(openClawConfig.plugins.allow).toContain("claw-control-center");
+    expect(openClawConfig.plugins.load.paths).toContain(openClawExtensionsDir);
+    expect(qclawConfig.plugins.allow).toContain("claw-control-center");
+    expect(qclawConfig.plugins.load.paths).toContain(qclawExtensionsDir);
+    expect(chunks.join("")).toContain("Installed claw-control-center into QClaw.");
+    expect(chunks.join("")).toContain("Installed claw-control-center into OpenClaw.");
+  });
+
+  it("auto-detects a single Hermes host and installs the native platform plugin", async () => {
+    const tempRoot = await mkdtemp(join(tmpdir(), "openclaw-install-"));
+    cleanupPaths.push(tempRoot);
+
+    const hermesConfigPath = join(tempRoot, ".hermes", "config.yaml");
+    const hermesPluginsDir = join(tempRoot, ".hermes", "plugins", "platforms");
+    const packageRoot = await createPackageRoot(tempRoot);
+    await mkdir(join(tempRoot, ".hermes"), { recursive: true });
+    await writeFile(
+      hermesConfigPath,
+      [
+        "plugins:",
+        "  enabled:",
+        "    - observability/langfuse",
+        "platforms:",
+        "  telegram:",
+        "    enabled: true",
+        ""
+      ].join("\n")
+    );
+    await writeFile(join(tempRoot, ".hermes", ".env"), "EXISTING=value\nHUB53AI_SECRET=\"old-secret\"\n");
+
+    const chunks: string[] = [];
+    await withCapturedStdout(chunks, async () => {
+      await runInstallCommand({
+        packageRoot,
+        argv: [
+          "install",
+          "--hub-ws-url",
+          "wss://hub.example.com/api/v1/openclaw/ws/connect",
+          "--hub-bot-id",
+          "hub-bot",
+          "--hub-secret",
+          "hub-secret"
+        ],
+        hostDefinitions: [
+          {
+            id: "hermes",
+            label: "Hermes",
+            configPath: hermesConfigPath,
+            extensionsDir: hermesPluginsDir,
+            installKind: "hermes"
+          }
+        ]
+      });
+    });
+
+    const updatedConfig = parseYaml(await readFile(hermesConfigPath, "utf8")) as any;
+    const updatedEnv = await readFile(join(tempRoot, ".hermes", ".env"), "utf8");
+
+    expect(updatedConfig.plugins.enabled).toContain("observability/langfuse");
+    expect(updatedConfig.plugins.enabled).toContain("platforms/53aihub");
+    expect(updatedConfig.plugins.enabled).toContain("53aihub");
+    expect(updatedConfig.platforms.telegram.enabled).toBe(true);
+    expect(updatedConfig.platforms["53aihub"]).toEqual({ enabled: true, extra: {} });
+    expect(updatedEnv).toContain("EXISTING=value");
+    expect(updatedEnv).toContain('HUB53AI_BOT_ID="hub-bot"');
+    expect(updatedEnv).toContain('HUB53AI_SECRET="hub-secret"');
+    expect(updatedEnv).toContain('HUB53AI_WS_URL="wss://hub.example.com/api/v1/openclaw/ws/connect"');
+    await access(join(hermesPluginsDir, "53aihub", "plugin.yaml"));
+    await access(join(hermesPluginsDir, "53aihub", "adapter.py"));
+    expect(chunks.join("")).toContain("Installed claw-control-center into Hermes.");
+    expect(chunks.join("")).not.toContain("Gateway:");
+  });
+
+  it("installs into both Hermes and OpenClaw when both are selected", async () => {
+    const tempRoot = await mkdtemp(join(tmpdir(), "openclaw-install-"));
+    cleanupPaths.push(tempRoot);
+
+    const hermesConfigPath = join(tempRoot, ".hermes", "config.yaml");
+    const hermesPluginsDir = join(tempRoot, ".hermes", "plugins", "platforms");
+    const openClawConfigPath = join(tempRoot, ".openclaw", "openclaw.json");
+    const openClawExtensionsDir = join(tempRoot, ".openclaw", "extensions");
+    const packageRoot = await createPackageRoot(tempRoot);
+    await mkdir(join(tempRoot, ".hermes"), { recursive: true });
+    await mkdir(join(tempRoot, ".openclaw"), { recursive: true });
+    await writeFile(hermesConfigPath, "plugins:\n  enabled: []\n");
+    await writeGatewayConfig(openClawConfigPath, 18789, "openclaw-token");
+
+    const hosts: HostDefinition[] = [
+      {
+        id: "hermes",
+        label: "Hermes",
+        configPath: hermesConfigPath,
+        extensionsDir: hermesPluginsDir,
+        installKind: "hermes"
+      },
+      {
+        id: "openclaw",
+        label: "OpenClaw",
+        configPath: openClawConfigPath,
+        extensionsDir: openClawExtensionsDir
+      }
+    ];
+
+    const chunks: string[] = [];
+    await withCapturedStdout(chunks, async () => {
+      await runInstallCommand({
+        packageRoot,
+        argv: [
+          "install",
+          "--hub-ws-url",
+          "wss://hub.example.com/api/v1/openclaw/ws/connect",
+          "--hub-bot-id",
+          "hub-bot",
+          "--hub-secret",
+          "hub-secret"
+        ],
+        hostDefinitions: hosts,
+        selectHosts: async (detected) => {
+          expect(detected).toEqual(hosts);
+          return detected;
+        }
+      });
+    });
+
+    const hermesConfig = parseYaml(await readFile(hermesConfigPath, "utf8")) as any;
+    const openClawConfig = JSON.parse(await readFile(openClawConfigPath, "utf8")) as any;
+
+    expect(hermesConfig.plugins.enabled).toContain("platforms/53aihub");
+    expect(openClawConfig.plugins.allow).toContain("claw-control-center");
+    await access(join(hermesPluginsDir, "53aihub", "adapter.py"));
+    await access(join(openClawExtensionsDir, "claw-control-center", "dist", "index.cjs"));
+    expect(chunks.join("")).toContain("Installed claw-control-center into Hermes.");
+    expect(chunks.join("")).toContain("Installed claw-control-center into OpenClaw.");
+  });
+
   it("rejects multiple detected hosts when no interactive terminal is available", async () => {
     const tempRoot = await mkdtemp(join(tmpdir(), "openclaw-install-"));
     cleanupPaths.push(tempRoot);
@@ -722,9 +913,13 @@ describe("QClaw installer", () => {
 async function createPackageRoot(tempRoot: string): Promise<string> {
   const packageRoot = join(tempRoot, "package");
   await mkdir(join(packageRoot, "dist"), { recursive: true });
+  await mkdir(join(packageRoot, "hermes", "platforms", "53aihub"), { recursive: true });
   await writeFile(join(packageRoot, "package.json"), JSON.stringify({ name: "@claw-plugin/claw-control-center" }));
   await writeFile(join(packageRoot, "openclaw.plugin.json"), JSON.stringify({ id: "claw-control-center" }));
   await writeFile(join(packageRoot, "dist", "index.cjs"), "module.exports = {};\n");
+  await writeFile(join(packageRoot, "hermes", "platforms", "53aihub", "plugin.yaml"), "name: 53aihub\nversion: 0.1.0\nkind: platform\n");
+  await writeFile(join(packageRoot, "hermes", "platforms", "53aihub", "__init__.py"), "from .adapter import register\n");
+  await writeFile(join(packageRoot, "hermes", "platforms", "53aihub", "adapter.py"), "def register(ctx):\n    pass\n");
   return packageRoot;
 }
 

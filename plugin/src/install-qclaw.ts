@@ -5,6 +5,7 @@ import { existsSync } from "node:fs";
 import { homedir } from "node:os";
 import { dirname, join, resolve } from "node:path";
 import type { FileHandle } from "node:fs/promises";
+import { parse as parseYaml, stringify as stringifyYaml } from "yaml";
 
 type InstallInput = {
   packageRoot: string;
@@ -39,19 +40,20 @@ type ParsedArgs = {
   "console-port"?: string;
 };
 
-type InstallLabel = "Claw" | "QClaw" | "OpenClaw";
-
 export type HostDefinition = {
   id: string;
-  label: InstallLabel;
+  label: string;
   configPath: string;
   extensionsDir: string;
+  installKind?: "openclaw" | "hermes";
+  incompatibilityReason?: string;
 };
 
 type InstallDestination = {
   configPath: string;
   extensionsDir: string;
-  label: InstallLabel;
+  label: string;
+  installKind: "openclaw" | "hermes";
 };
 
 type OpenClawConfig = {
@@ -93,6 +95,13 @@ type OpenClawConfig = {
 const PLUGIN_ID = "claw-control-center";
 const LEGACY_PLUGIN_ID = "53ai-openclaw";
 const COPY_ITEMS = ["dist", "openclaw.plugin.json", "package.json", "bin", "web-dist"] as const;
+const HERMES_PLATFORM_ID = "53aihub";
+const HERMES_PLUGIN_KEY = `platforms/${HERMES_PLATFORM_ID}`;
+const HERMES_ENV_KEYS = {
+  botId: "HUB53AI_BOT_ID",
+  secret: "HUB53AI_SECRET",
+  wsUrl: "HUB53AI_WS_URL"
+} as const;
 const SUPPORTED_ARGS = new Set([
   "gateway",
   "bot-id",
@@ -131,9 +140,43 @@ export async function installIntoOpenClaw(input: InstallInput): Promise<{
   return installIntoHost(input, "OpenClaw");
 }
 
+export async function installIntoHermes(input: InstallInput): Promise<{
+  configPath: string;
+  extensionsDir: string;
+  destination: string;
+  hub53aiConfigured: boolean;
+  pluginBuild: string;
+}> {
+  const hubWsUrl = input.hubWsUrl?.trim();
+  const hubBotId = input.hubBotId?.trim();
+  const hubSecret = input.hubSecret?.trim();
+  if (!hubWsUrl || !hubBotId || !hubSecret) {
+    throw new Error("Hermes install requires --hub-ws-url, --hub-bot-id, and --hub-secret");
+  }
+
+  const platformsDir = normalizeHermesPlatformsDir(input.extensionsDir);
+  const destination = join(platformsDir, HERMES_PLATFORM_ID);
+  await mkdir(destination, { recursive: true });
+  await copyHermesPlatformPackage(input.packageRoot, destination);
+  await updateHermesConfig(input.configPath);
+  await updateHermesEnv(input.configPath, {
+    botId: hubBotId,
+    secret: hubSecret,
+    wsUrl: hubWsUrl
+  });
+
+  return {
+    configPath: input.configPath,
+    extensionsDir: platformsDir,
+    destination,
+    hub53aiConfigured: true,
+    pluginBuild: await readHermesPluginBuildInfo(destination)
+  };
+}
+
 async function installIntoHost(
   input: InstallInput,
-  hostLabel: InstallLabel
+  hostLabel: string
 ): Promise<{
   configPath: string;
   extensionsDir: string;
@@ -273,6 +316,7 @@ export async function runInstallCommand(input: {
   argv?: string[];
   packageRoot: string;
   hostDefinitions?: HostDefinition[];
+  selectHosts?: (hosts: HostDefinition[], incompatibleHosts: HostDefinition[]) => Promise<HostDefinition[]>;
   selectHost?: (hosts: HostDefinition[]) => Promise<HostDefinition>;
   ttyPath?: string;
 }): Promise<void> {
@@ -282,14 +326,15 @@ export async function runInstallCommand(input: {
   }
 
   const args = parseArgs(argv.slice(1));
-  const destination = await resolveInstallDestination(args, {
+  const destinations = await resolveInstallDestinations(args, {
     hostDefinitions: input.hostDefinitions,
+    selectHosts: input.selectHosts,
     selectHost: input.selectHost,
     ttyPath: input.ttyPath
   });
 
-  const result = await installIntoHost(
-    {
+  for (const destination of destinations) {
+    const installInput: InstallInput = {
       packageRoot: input.packageRoot,
       extensionsDir: destination.extensionsDir,
       configPath: destination.configPath,
@@ -304,40 +349,46 @@ export async function runInstallCommand(input: {
       hubEnabled: parseOptionalBoolean(args["hub-enabled"]),
       consoleHost: args["console-host"],
       consolePort: args["console-port"] ? Number(args["console-port"]) : undefined
-    },
-    destination.label
-  );
+    };
+    const result =
+      destination.installKind === "hermes"
+        ? await installIntoHermes(installInput)
+        : await installIntoHost(installInput, destination.label);
 
-  process.stdout.write(
-    [
-      `Installed ${PLUGIN_ID} into ${destination.label}.`,
-      `Extensions: ${result.extensionsDir}`,
-      `Config: ${result.configPath}`,
-      `Gateway: ${result.gatewayBaseUrl}`,
-      `53AIHub: ${result.hub53aiConfigured ? "configured" : "not configured"}`,
-      `Plugin build: ${result.pluginBuild}`,
-      `Restart ${destination.label} to load the plugin.`
-    ].join("\n") + "\n"
-  );
+    process.stdout.write(
+      [
+        `Installed ${PLUGIN_ID} into ${destination.label}.`,
+        `Extensions: ${result.extensionsDir}`,
+        `Config: ${result.configPath}`,
+        ...(destination.installKind === "hermes" ? [] : [`Gateway: ${(result as Awaited<ReturnType<typeof installIntoHost>>).gatewayBaseUrl}`]),
+        `53AIHub: ${result.hub53aiConfigured ? "configured" : "not configured"}`,
+        `Plugin build: ${result.pluginBuild}`,
+        `Restart ${destination.label} to load the plugin.`
+      ].join("\n") + "\n"
+    );
+  }
 }
 
-async function resolveInstallDestination(
+async function resolveInstallDestinations(
   args: ParsedArgs,
   options: {
     hostDefinitions?: HostDefinition[];
+    selectHosts?: (hosts: HostDefinition[], incompatibleHosts: HostDefinition[]) => Promise<HostDefinition[]>;
     selectHost?: (hosts: HostDefinition[]) => Promise<HostDefinition>;
     ttyPath?: string;
   } = {}
-): Promise<InstallDestination> {
+): Promise<InstallDestination[]> {
   const explicitConfigPath = args["config-path"] ? resolve(args["config-path"]) : undefined;
   const explicitExtensionsDir = args["extensions-dir"] ? resolve(args["extensions-dir"]) : undefined;
 
   if (explicitConfigPath && explicitExtensionsDir) {
-    return {
+    const hermes = isHermesDestination(explicitConfigPath, explicitExtensionsDir);
+    return [{
       configPath: explicitConfigPath,
-      extensionsDir: explicitExtensionsDir,
-      label: "Claw"
-    };
+      extensionsDir: hermes ? normalizeHermesPlatformsDir(explicitExtensionsDir) : explicitExtensionsDir,
+      label: hermes ? "Hermes" : "Claw",
+      installKind: hermes ? "hermes" : "openclaw"
+    }];
   }
 
   if (explicitConfigPath || explicitExtensionsDir) {
@@ -345,16 +396,19 @@ async function resolveInstallDestination(
   }
 
   const detected = detectInstallHosts(options.hostDefinitions ?? getDefaultHostDefinitions());
-  if (detected.length === 1) {
-    return toInstallDestination(detected[0]!);
+  const compatible = detected;
+  const incompatible: HostDefinition[] = [];
+  if (compatible.length === 1) {
+    return [toInstallDestination(compatible[0]!)];
   }
-  if (detected.length > 1) {
-    const selected = options.selectHost
-      ? await options.selectHost(detected)
-      : await promptForInstallHost(detected, options.ttyPath ?? "/dev/tty");
-    return toInstallDestination(selected);
+  if (compatible.length > 1) {
+    const selected = options.selectHosts
+      ? await options.selectHosts(compatible, incompatible)
+      : options.selectHost
+        ? [await options.selectHost(compatible)]
+        : await promptForInstallHosts(compatible, incompatible, options.ttyPath ?? "/dev/tty");
+    return validateSelectedHosts(selected, compatible).map(toInstallDestination);
   }
-
   throw new Error(
     [
       "could not auto-detect an installed Claw host.",
@@ -370,6 +424,7 @@ function getDefaultHostDefinitions(): HostDefinition[] {
   const home = homedir();
   const qclawHome = resolve(home, ".qclaw");
   const openClawHome = resolve(home, ".openclaw");
+  const hermesHome = resolve(home, ".hermes");
   return [
     {
       id: "qclaw",
@@ -382,6 +437,13 @@ function getDefaultHostDefinitions(): HostDefinition[] {
       label: "OpenClaw",
       configPath: join(openClawHome, "openclaw.json"),
       extensionsDir: resolve(openClawHome, "extensions")
+    },
+    {
+      id: "hermes",
+      label: "Hermes",
+      configPath: join(hermesHome, "config.yaml"),
+      extensionsDir: resolve(hermesHome, "plugins", "platforms"),
+      installKind: "hermes"
     }
   ];
 }
@@ -398,7 +460,11 @@ function detectInstallHosts(hosts: HostDefinition[]): HostDefinition[] {
   });
 }
 
-async function promptForInstallHost(hosts: HostDefinition[], ttyPath: string): Promise<HostDefinition> {
+async function promptForInstallHosts(
+  hosts: HostDefinition[],
+  incompatibleHosts: HostDefinition[],
+  ttyPath: string
+): Promise<HostDefinition[]> {
   let handle: FileHandle | undefined;
   try {
     handle = await openFile(ttyPath, "r+");
@@ -407,18 +473,24 @@ async function promptForInstallHost(hosts: HostDefinition[], ttyPath: string): P
     const readline = createInterface({ input, output });
     try {
       output.write("Multiple Claw installations were detected.\n");
-      output.write("Choose where to install claw-control-center:\n");
+      output.write("Choose one or more locations to install claw-control-center:\n");
       hosts.forEach((host, index) => {
         output.write(`${index + 1}. ${host.label}\n`);
         output.write(`   Config: ${host.configPath}\n`);
         output.write(`   Extensions: ${host.extensionsDir}\n`);
       });
-      const answer = await readline.question(`Install location [1-${hosts.length}]: `);
-      const selectedIndex = Number(answer.trim());
-      if (!Number.isInteger(selectedIndex) || selectedIndex < 1 || selectedIndex > hosts.length) {
+      if (incompatibleHosts.length > 0) {
+        output.write("\nDetected but not installable by this OpenClaw plugin installer:\n");
+        for (const host of incompatibleHosts) {
+          output.write(`- ${host.label}: ${host.incompatibilityReason ?? "incompatible plugin format"}\n`);
+        }
+      }
+      const answer = await readline.question(`Install location(s) [1-${hosts.length}, comma-separated, or all]: `);
+      const selectedIndexes = parseInstallSelection(answer, hosts.length);
+      if (selectedIndexes.length === 0) {
         throw new Error(`invalid install location: ${answer}`);
       }
-      return hosts[selectedIndex - 1]!;
+      return selectedIndexes.map((index) => hosts[index - 1]!);
     } finally {
       readline.close();
       input.destroy();
@@ -446,15 +518,45 @@ function toInstallDestination(host: HostDefinition): InstallDestination {
   return {
     configPath: resolve(host.configPath),
     extensionsDir: resolve(host.extensionsDir),
-    label: host.label
+    label: host.label,
+    installKind: host.installKind ?? "openclaw"
   };
+}
+
+function validateSelectedHosts(selected: HostDefinition[], compatible: HostDefinition[]): HostDefinition[] {
+  const compatibleIds = new Set(compatible.map((host) => host.id));
+  const invalid = selected.find((host) => !compatibleIds.has(host.id));
+  if (invalid) {
+    throw new Error(`selected host is not installable: ${invalid.label}`);
+  }
+  const seen = new Set<string>();
+  return selected.filter((host) => {
+    if (seen.has(host.id)) {
+      return false;
+    }
+    seen.add(host.id);
+    return true;
+  });
+}
+
+function parseInstallSelection(answer: string, hostCount: number): number[] {
+  const trimmed = answer.trim().toLowerCase();
+  if (trimmed === "all" || trimmed === "*") {
+    return Array.from({ length: hostCount }, (_, index) => index + 1);
+  }
+  const indexes = trimmed
+    .split(",")
+    .map((part) => Number(part.trim()))
+    .filter((index) => Number.isInteger(index) && index >= 1 && index <= hostCount);
+  return Array.from(new Set(indexes));
 }
 
 function formatHostList(hosts: HostDefinition[]): string[] {
   return hosts.flatMap((host) => [
     `- ${host.label}`,
     `  Config: ${host.configPath}`,
-    `  Extensions: ${host.extensionsDir}`
+    `  Extensions: ${host.extensionsDir}`,
+    ...(host.incompatibilityReason ? [`  Note: ${host.incompatibilityReason}`] : [])
   ]);
 }
 
@@ -499,6 +601,16 @@ async function copyPublishablePackage(packageRoot: string, destination: string) 
   }
 }
 
+async function copyHermesPlatformPackage(packageRoot: string, destination: string) {
+  const source = join(packageRoot, "hermes", "platforms", HERMES_PLATFORM_ID);
+  if (!existsSync(source)) {
+    throw new Error(`Hermes platform package does not exist: ${source}`);
+  }
+  await rm(destination, { recursive: true, force: true });
+  await mkdir(dirname(destination), { recursive: true });
+  await cp(source, destination, { recursive: true, force: true });
+}
+
 async function readPluginBuildInfo(destination: string): Promise<string> {
   const packagePath = join(destination, "package.json");
   const entryPath = join(destination, "dist", "index.cjs");
@@ -521,12 +633,94 @@ async function readPluginBuildInfo(destination: string): Promise<string> {
   }
 }
 
+async function readHermesPluginBuildInfo(destination: string): Promise<string> {
+  const manifestPath = join(destination, "plugin.yaml");
+  try {
+    const manifest = parseYaml(await readFile(manifestPath, "utf8")) as { version?: unknown };
+    const version = typeof manifest?.version === "string" || typeof manifest?.version === "number" ? String(manifest.version) : "unknown";
+    const adapter = await readFile(join(destination, "adapter.py"));
+    const digest = createHash("sha256").update(adapter).digest("hex").slice(0, 12);
+    return `${PLUGIN_ID}/hermes@${version} sha256:${digest}`;
+  } catch {
+    return `${PLUGIN_ID}/hermes@unknown sha256:missing`;
+  }
+}
+
 async function readOpenClawConfig(configPath: string): Promise<OpenClawConfig & Record<string, unknown>> {
   if (!existsSync(configPath)) {
     return {};
   }
 
   return JSON.parse(await readFile(configPath, "utf8")) as OpenClawConfig & Record<string, unknown>;
+}
+
+async function updateHermesConfig(configPath: string): Promise<void> {
+  await mkdir(dirname(configPath), { recursive: true });
+  const config = await readHermesConfig(configPath);
+  const plugins = ensureObject(config, "plugins");
+  plugins.enabled = dedupeStrings([...(Array.isArray(plugins.enabled) ? plugins.enabled : []), HERMES_PLUGIN_KEY, HERMES_PLATFORM_ID]);
+
+  const platforms = ensureObject(config, "platforms");
+  const platform = ensureObject(platforms, HERMES_PLATFORM_ID);
+  platform.enabled = true;
+  ensureObject(platform, "extra");
+
+  await writeFile(configPath, stringifyYaml(config));
+}
+
+async function readHermesConfig(configPath: string): Promise<Record<string, unknown>> {
+  if (!existsSync(configPath)) {
+    return {};
+  }
+  const parsed = parseYaml(await readFile(configPath, "utf8"));
+  return parsed && typeof parsed === "object" && !Array.isArray(parsed) ? (parsed as Record<string, unknown>) : {};
+}
+
+async function updateHermesEnv(configPath: string, values: { botId: string; secret: string; wsUrl: string }): Promise<void> {
+  const envPath = join(dirname(configPath), ".env");
+  await mkdir(dirname(envPath), { recursive: true });
+  const existing = existsSync(envPath) ? await readFile(envPath, "utf8") : "";
+  const updates = new Map<string, string>([
+    [HERMES_ENV_KEYS.botId, values.botId],
+    [HERMES_ENV_KEYS.secret, values.secret],
+    [HERMES_ENV_KEYS.wsUrl, values.wsUrl]
+  ]);
+  const seen = new Set<string>();
+  const lines = existing.split(/\r?\n/).map((line) => {
+    const match = line.match(/^([A-Za-z_][A-Za-z0-9_]*)=/);
+    if (!match || !updates.has(match[1]!)) {
+      return line;
+    }
+    const key = match[1]!;
+    seen.add(key);
+    return `${key}=${quoteEnvValue(updates.get(key)!)}`;
+  });
+  for (const [key, value] of updates) {
+    if (!seen.has(key)) {
+      lines.push(`${key}=${quoteEnvValue(value)}`);
+    }
+  }
+  await writeFile(envPath, `${lines.filter((line, index, all) => line || index < all.length - 1).join("\n")}\n`);
+}
+
+function quoteEnvValue(value: string): string {
+  return JSON.stringify(value);
+}
+
+function isHermesDestination(configPath: string, extensionsDir: string): boolean {
+  const tail = extensionsDir.split(/[\\/]/).filter(Boolean).slice(-2).join("/");
+  return configPath.endsWith("config.yaml") && (tail === "plugins/platforms" || tail.endsWith("/plugins"));
+}
+
+function normalizeHermesPlatformsDir(extensionsDir: string): string {
+  const parts = extensionsDir.split(/[\\/]/).filter(Boolean);
+  if (parts.at(-1) === "platforms" && parts.at(-2) === "plugins") {
+    return extensionsDir;
+  }
+  if (parts.at(-1) === "plugins") {
+    return join(extensionsDir, "platforms");
+  }
+  return extensionsDir;
 }
 
 function inferGatewaySettings(config: OpenClawConfig): { baseUrl: string; secret: string } {
