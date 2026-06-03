@@ -686,7 +686,7 @@ describe("QClaw installer", () => {
     expect(chunks.join("")).toContain("Installed claw-control-center into OpenClaw.");
   });
 
-  it("uses the cross-platform keyboard prompt when multiple Claw hosts are detected", async () => {
+  it("uses the cross-platform keyboard prompt to select one Claw host when multiple hosts are detected", async () => {
     const tempRoot = await mkdtemp(join(tmpdir(), "openclaw-install-"));
     cleanupPaths.push(tempRoot);
 
@@ -721,10 +721,10 @@ describe("QClaw installer", () => {
         packageRoot,
         argv: ["install"],
         hostDefinitions: hosts,
-        promptSelectHosts: async (detected: HostDefinition[], incompatible: HostDefinition[]) => {
+        promptSelectHost: async (detected: HostDefinition[], incompatible: HostDefinition[]) => {
           expect(detected).toEqual(hosts);
           expect(incompatible).toEqual([]);
-          return [detected[1]!];
+          return detected[1]!;
         }
       });
     });
@@ -747,7 +747,7 @@ describe("QClaw installer", () => {
     expect(chunks.join("")).toContain("Installed claw-control-center into OpenClaw.");
   });
 
-  it("installs into multiple selected Claw hosts when several compatible hosts are detected", async () => {
+  it("rejects multiple selected Claw hosts when several compatible hosts are detected", async () => {
     const tempRoot = await mkdtemp(join(tmpdir(), "openclaw-install-"));
     cleanupPaths.push(tempRoot);
 
@@ -776,9 +776,8 @@ describe("QClaw installer", () => {
       }
     ];
 
-    const chunks: string[] = [];
-    await withCapturedStdout(chunks, async () => {
-      await runInstallCommand({
+    await expect(
+      runInstallCommand({
         packageRoot,
         argv: ["install"],
         hostDefinitions: hosts,
@@ -786,28 +785,8 @@ describe("QClaw installer", () => {
           expect(detected).toEqual(hosts);
           return detected;
         }
-      });
-    });
-
-    const openClawConfig = JSON.parse(await readFile(openClawConfigPath, "utf8")) as {
-      plugins: {
-        allow: string[];
-        load: { paths: string[] };
-      };
-    };
-    const qclawConfig = JSON.parse(await readFile(qclawConfigPath, "utf8")) as {
-      plugins: {
-        allow: string[];
-        load: { paths: string[] };
-      };
-    };
-
-    expect(openClawConfig.plugins.allow).toContain("claw-control-center");
-    expect(openClawConfig.plugins.load.paths).toContain(openClawExtensionsDir);
-    expect(qclawConfig.plugins.allow).toContain("claw-control-center");
-    expect(qclawConfig.plugins.load.paths).toContain(qclawExtensionsDir);
-    expect(chunks.join("")).toContain("Installed claw-control-center into QClaw.");
-    expect(chunks.join("")).toContain("Installed claw-control-center into OpenClaw.");
+      })
+    ).rejects.toThrow("select exactly one Claw host");
   });
 
   it("auto-detects a single Hermes host and installs the native platform plugin", async () => {
@@ -883,7 +862,7 @@ describe("QClaw installer", () => {
     expect(chunks.join("")).not.toContain("Gateway:");
   });
 
-  it("installs into both Hermes and OpenClaw when both are selected", async () => {
+  it("installs only into the selected host when Hermes and OpenClaw are both detected", async () => {
     const tempRoot = await mkdtemp(join(tmpdir(), "openclaw-install-"));
     cleanupPaths.push(tempRoot);
 
@@ -927,23 +906,21 @@ describe("QClaw installer", () => {
           "hub-secret"
         ],
         hostDefinitions: hosts,
-        selectHosts: async (detected) => {
+        promptSelectHost: async (detected) => {
           expect(detected).toEqual(hosts);
-          return detected;
+          return detected[0]!;
         }
       });
     });
 
     const hermesConfig = parseYaml(await readFile(hermesConfigPath, "utf8")) as any;
-    const openClawConfig = JSON.parse(await readFile(openClawConfigPath, "utf8")) as any;
 
     expect(hermesConfig.plugins.enabled).toContain("platforms/53aihub");
     expect(hermesConfig.display.platforms["53aihub"].show_reasoning).toBe(true);
-    expect(openClawConfig.plugins.allow).toContain("claw-control-center");
     await access(join(hermesPluginsDir, "53aihub", "adapter.py"));
-    await access(join(openClawExtensionsDir, "claw-control-center", "dist", "index.cjs"));
     expect(chunks.join("")).toContain("Installed claw-control-center into Hermes.");
-    expect(chunks.join("")).toContain("Installed claw-control-center into OpenClaw.");
+    expect(chunks.join("")).not.toContain("Installed claw-control-center into OpenClaw.");
+    await expect(access(join(openClawExtensionsDir, "claw-control-center", "dist", "index.cjs"))).rejects.toThrow();
   });
 
   it("rejects multiple detected hosts when no interactive terminal is available", async () => {

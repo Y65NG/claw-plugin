@@ -3,7 +3,7 @@ import { cp, mkdir, readFile, rm, writeFile } from "node:fs/promises";
 import { existsSync } from "node:fs";
 import { homedir } from "node:os";
 import { dirname, join, resolve } from "node:path";
-import { checkbox } from "@inquirer/prompts";
+import { select } from "@inquirer/prompts";
 import { parse as parseYaml, stringify as stringifyYaml } from "yaml";
 
 type InstallInput = {
@@ -55,10 +55,10 @@ type InstallDestination = {
   installKind: "openclaw" | "hermes";
 };
 
-export type PromptSelectHosts = (
+export type PromptSelectHost = (
   hosts: HostDefinition[],
   incompatibleHosts: HostDefinition[]
-) => Promise<HostDefinition[]>;
+) => Promise<HostDefinition>;
 
 type OpenClawConfig = {
   gateway?: {
@@ -322,7 +322,7 @@ export async function runInstallCommand(input: {
   hostDefinitions?: HostDefinition[];
   selectHosts?: (hosts: HostDefinition[], incompatibleHosts: HostDefinition[]) => Promise<HostDefinition[]>;
   selectHost?: (hosts: HostDefinition[]) => Promise<HostDefinition>;
-  promptSelectHosts?: PromptSelectHosts;
+  promptSelectHost?: PromptSelectHost;
   ttyPath?: string;
 }): Promise<void> {
   const argv = input.argv ?? process.argv.slice(2);
@@ -335,7 +335,7 @@ export async function runInstallCommand(input: {
     hostDefinitions: input.hostDefinitions,
     selectHosts: input.selectHosts,
     selectHost: input.selectHost,
-    promptSelectHosts: input.promptSelectHosts,
+    promptSelectHost: input.promptSelectHost,
     ttyPath: input.ttyPath
   });
 
@@ -381,7 +381,7 @@ async function resolveInstallDestinations(
     hostDefinitions?: HostDefinition[];
     selectHosts?: (hosts: HostDefinition[], incompatibleHosts: HostDefinition[]) => Promise<HostDefinition[]>;
     selectHost?: (hosts: HostDefinition[]) => Promise<HostDefinition>;
-    promptSelectHosts?: PromptSelectHosts;
+    promptSelectHost?: PromptSelectHost;
     ttyPath?: string;
   } = {}
 ): Promise<InstallDestination[]> {
@@ -410,11 +410,11 @@ async function resolveInstallDestinations(
   }
   if (compatible.length > 1) {
     const selected = options.selectHosts
-      ? await options.selectHosts(compatible, incompatible)
+      ? validateSingleSelectedHost(await options.selectHosts(compatible, incompatible), compatible)
       : options.selectHost
-        ? [await options.selectHost(compatible)]
-        : await (options.promptSelectHosts ?? promptForInstallHosts)(compatible, incompatible);
-    return validateSelectedHosts(selected, compatible).map(toInstallDestination);
+        ? validateSingleSelectedHost(await options.selectHost(compatible), compatible)
+        : validateSingleSelectedHost(await (options.promptSelectHost ?? promptForInstallHost)(compatible, incompatible), compatible);
+    return [toInstallDestination(selected)];
   }
   throw new Error(
     [
@@ -467,10 +467,10 @@ function detectInstallHosts(hosts: HostDefinition[]): HostDefinition[] {
   });
 }
 
-async function promptForInstallHosts(
+async function promptForInstallHost(
   hosts: HostDefinition[],
   incompatibleHosts: HostDefinition[]
-): Promise<HostDefinition[]> {
+): Promise<HostDefinition> {
   try {
     if (!process.stdin.isTTY || !process.stdout.isTTY) {
       throw new Error("interactive terminal is required");
@@ -491,15 +491,11 @@ async function promptForInstallHosts(
       }))
     ];
 
-    return await checkbox<HostDefinition>({
-      message: "Choose one or more Claw installations to install claw-control-center:",
+    return await select<HostDefinition>({
+      message: "Choose the Claw installation to connect with this 53AIHub agent:",
       choices,
       pageSize: Math.min(Math.max(choices.length, 5), 12),
-      required: true,
-      shortcuts: {
-        all: "a",
-        invert: "i"
-      }
+      loop: true
     });
   } catch (error) {
     throw new Error(
@@ -524,20 +520,18 @@ function toInstallDestination(host: HostDefinition): InstallDestination {
   };
 }
 
-function validateSelectedHosts(selected: HostDefinition[], compatible: HostDefinition[]): HostDefinition[] {
-  const compatibleIds = new Set(compatible.map((host) => host.id));
-  const invalid = selected.find((host) => !compatibleIds.has(host.id));
-  if (invalid) {
-    throw new Error(`selected host is not installable: ${invalid.label}`);
-  }
-  const seen = new Set<string>();
-  return selected.filter((host) => {
-    if (seen.has(host.id)) {
-      return false;
+function validateSingleSelectedHost(selected: HostDefinition | HostDefinition[], compatible: HostDefinition[]): HostDefinition {
+  if (Array.isArray(selected)) {
+    if (selected.length !== 1) {
+      throw new Error("select exactly one Claw host for this 53AIHub agent");
     }
-    seen.add(host.id);
-    return true;
-  });
+    return validateSingleSelectedHost(selected[0]!, compatible);
+  }
+  const compatibleIds = new Set(compatible.map((host) => host.id));
+  if (!compatibleIds.has(selected.id)) {
+    throw new Error(`selected host is not installable: ${selected.label}`);
+  }
+  return selected;
 }
 
 function formatHostList(hosts: HostDefinition[]): string[] {
