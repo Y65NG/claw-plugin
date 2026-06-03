@@ -2,16 +2,18 @@ from __future__ import annotations
 
 import asyncio
 import base64
+import inspect
 import json
 import logging
 import os
+import re
 import time
 import uuid
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Dict, List, Optional
 
-from gateway.config import Platform, PlatformConfig
+from gateway.config import HomeChannel, Platform, PlatformConfig
 from gateway.platforms.base import BasePlatformAdapter, MessageEvent, MessageType, SendResult
 
 try:
@@ -26,10 +28,13 @@ logger = logging.getLogger(__name__)
 PLATFORM_NAME = "53aihub"
 MODEL_NAME = "hermes-agent"
 STATE_FILENAME = "53aihub-state.json"
+SESSION_ID_PREFIX = f"agent:main:{PLATFORM_NAME}:dm:"
 HEARTBEAT_INTERVAL_SECONDS = 30
 RECONNECT_BASE_SECONDS = 2
 RECONNECT_MAX_SECONDS = 30
 MAX_STORED_OUTBOX = 200
+HOME_CHANNEL_ENV = "HUB53AI_HOME_CHANNEL"
+HOME_CHANNEL_THREAD_ENV = "HUB53AI_HOME_CHANNEL_THREAD_ID"
 
 RPC_ACTIONS = {
     "sessions.list",
@@ -110,6 +115,50 @@ def _extract_latest_user_message(messages: Any) -> str:
     return ""
 
 
+def _parse_tool_progress_text(content: str) -> Optional[tuple[str, str]]:
+    text = _string_or(content)
+    if not text:
+        return None
+    # Hermes progress lines are usually rendered as:
+    #   "🔍 web_extract: \"https://...\""
+    #   "🧠 memory: \"list\""
+    #   "⚙️ execute_code..."
+    #   "🔧 terminal(['cmd'])\n{...}"
+    match = re.match(
+        r"^\s*(?:[^\w\s./-]+(?:\ufe0f)?\s+)?"
+        r"(?P<name>[A-Za-z_][\w.-]*)"
+        r"(?:\((?P<keys>[^)]*)\))?"
+        r"(?:\s*:\s*[\"“](?P<quoted>.*?)[\"”]\s*|\s*:\s*(?P<plain>.+?)\s*|\s*\.{3}\s*|\s*$)",
+        text,
+        flags=re.DOTALL,
+    )
+    if not match:
+        return None
+    name = _string_or(match.group("name"))
+    if not name or name.lower() in {"working", "loading", "thinking"}:
+        return None
+    preview = _string_or(match.group("quoted"), match.group("plain"), match.group("keys"))
+    return name, preview
+
+
+def _split_reasoning_preface(content: str) -> tuple[str, str]:
+    text = _string_or(content)
+    if not text:
+        return "", ""
+    match = re.match(
+        r"^\s*(?:💭\s*)?\*\*Reasoning:\*\*\s*"
+        r"```(?:[A-Za-z0-9_-]+)?\s*\n(?P<reasoning>.*?)\n```\s*"
+        r"(?P<answer>.*)$",
+        text,
+        flags=re.DOTALL,
+    )
+    if not match:
+        return "", text
+    reasoning = _string_or(match.group("reasoning"))
+    answer = _string_or(match.group("answer"))
+    return reasoning, answer
+
+
 def _parse_incoming_message(raw_payload: str) -> Optional[Dict[str, Any]]:
     try:
         frame = json.loads(raw_payload)
@@ -185,6 +234,7 @@ def _parse_rpc_request(raw_payload: str) -> Optional[Dict[str, Any]]:
 
 class Hermes53AIHubAdapter(BasePlatformAdapter):
     MAX_MESSAGE_LENGTH = 16000
+    SUPPORTS_MESSAGE_EDITING = True
 
     def __init__(self, config: PlatformConfig):
         super().__init__(config=config, platform=Platform(PLATFORM_NAME))
@@ -207,6 +257,10 @@ class Hermes53AIHubAdapter(BasePlatformAdapter):
             "events": {},
             "outbox": [],
         }
+
+    @property
+    def enforces_own_access_policy(self) -> bool:
+        return True
 
     async def connect(self) -> bool:
         import aiohttp
@@ -252,8 +306,52 @@ class Hermes53AIHubAdapter(BasePlatformAdapter):
         metadata: Optional[Dict[str, Any]] = None,
     ) -> SendResult:
         message_id = f"assistant:{uuid.uuid4()}"
-        await self._record_assistant_message(chat_id, message_id, content)
-        await self._send_chat_chunk(chat_id, content, status="streaming", message_id=message_id, replace=False)
+        streaming = self._is_stream_consumer_send()
+        if not streaming and self._is_hermes_interim_send(metadata):
+            thinking_message_id = f"thinking:{uuid.uuid4()}"
+            await self._emit_thinking_update(
+                chat_id,
+                thinking_message_id,
+                content,
+                replace=True,
+                source="hermes-progress",
+            )
+            return SendResult(success=True, message_id=thinking_message_id)
+
+        reasoning, final_content = _split_reasoning_preface(content)
+        if reasoning and final_content:
+            await self._emit_thinking_update(
+                chat_id,
+                f"thinking:{uuid.uuid4()}",
+                reasoning,
+                replace=True,
+                source="hermes-reasoning",
+            )
+
+        status = "streaming" if streaming else self._terminal_send_status(final_content)
+        await self._record_assistant_message(chat_id, message_id, final_content)
+        await self._send_chat_chunk(chat_id, final_content, status=status, message_id=message_id, replace=False)
+        if not streaming:
+            event_kind = "run.failed" if status == "error" else "run.completed"
+            await self._record_event(chat_id, event_kind, {"message_id": message_id, "content": final_content})
+        return SendResult(success=True, message_id=message_id)
+
+    async def send_or_update_status(
+        self,
+        chat_id: str,
+        status_key: str,
+        content: str,
+        metadata: Optional[Dict[str, Any]] = None,
+    ) -> SendResult:
+        message_id = f"status:{chat_id}:{status_key or 'default'}"
+        await self._emit_thinking_update(
+            chat_id,
+            message_id,
+            content,
+            replace=True,
+            source="hermes-status",
+            status_key=status_key,
+        )
         return SendResult(success=True, message_id=message_id)
 
     async def edit_message(
@@ -264,10 +362,30 @@ class Hermes53AIHubAdapter(BasePlatformAdapter):
         *,
         finalize: bool = False,
     ) -> SendResult:
-        await self._record_assistant_message(chat_id, message_id, content, replace=True)
+        if not finalize and self._is_hermes_interim_edit():
+            await self._emit_thinking_update(
+                chat_id,
+                message_id,
+                content,
+                replace=True,
+                source="hermes-progress",
+            )
+            return SendResult(success=True, message_id=message_id)
+
+        reasoning, final_content = _split_reasoning_preface(content)
+        if reasoning and final_content:
+            await self._emit_thinking_update(
+                chat_id,
+                f"thinking:{message_id}",
+                reasoning,
+                replace=True,
+                source="hermes-reasoning",
+            )
+
+        await self._record_assistant_message(chat_id, message_id, final_content, replace=True)
         await self._send_chat_chunk(
             chat_id,
-            content,
+            final_content,
             status="done" if finalize else "streaming",
             message_id=message_id,
             replace=True,
@@ -275,6 +393,19 @@ class Hermes53AIHubAdapter(BasePlatformAdapter):
         if finalize:
             await self._record_event(chat_id, "run.completed", {"ok": True})
         return SendResult(success=True, message_id=message_id)
+
+    async def get_chat_info(self, chat_id: str) -> Dict[str, Any]:
+        session = await self._latest_conversation(chat_id)
+        name = _string_or(
+            session.get("title") if session else None,
+            session.get("name") if session else None,
+            chat_id,
+        )
+        return {
+            "name": name,
+            "type": "dm",
+            "chat_id": chat_id,
+        }
 
     async def _ws_loop(self) -> None:
         import aiohttp
@@ -331,9 +462,10 @@ class Hermes53AIHubAdapter(BasePlatformAdapter):
         await self._handle_incoming_chat(incoming)
 
     async def _handle_incoming_chat(self, incoming: Dict[str, Any]) -> None:
-        chat_id = incoming["chatId"]
+        chat_id = self._internal_chat_id(incoming["chatId"])
         msg_id = incoming["msgId"]
         title = self._conversation_title(incoming)
+        self._ensure_home_channel(chat_id, title)
         await self._upsert_conversation(chat_id, title, incoming["reqId"], incoming.get("userName") or incoming["userId"])
         await self._record_user_message(chat_id, msg_id, incoming["text"], incoming)
         await self._record_event(chat_id, "user.message", {"message_id": msg_id, "content": incoming["text"]})
@@ -392,9 +524,10 @@ class Hermes53AIHubAdapter(BasePlatformAdapter):
             return session
         if action == "sessions.messages":
             session_id = self._read_session_id(record)
+            chat_id = self._internal_chat_id(session_id)
             limit, offset = self._pagination(record, 100)
-            messages = await self._messages_for(session_id)
-            events = await self._events_for(session_id, 0)
+            messages = await self._messages_for(chat_id)
+            events = await self._events_for(chat_id, 0)
             page = self._slice_latest(messages, limit, offset)
             total = len(messages)
             return {
@@ -404,36 +537,58 @@ class Hermes53AIHubAdapter(BasePlatformAdapter):
             }
         if action == "sessions.events":
             session_id = self._read_session_id(record)
+            chat_id = self._internal_chat_id(session_id)
             limit, offset = self._pagination(record, 100)
             after_seq = int(record.get("after_seq") or record.get("afterSeq") or 0)
-            events = await self._events_for(session_id, after_seq)
+            events = await self._events_for(chat_id, after_seq)
             page = events[offset:offset + limit]
             return {
                 "events": page,
                 "pagination": self._pagination_response(limit, offset, len(events), len(page)),
             }
         if action == "sessions.control":
-            return {
-                "ok": False,
-                "action": _string_or(record.get("action"), "stop"),
-                "session_id": self._read_session_id(record),
-                "conversation_id": self._read_session_id(record),
-                "unsupported": True,
-                "message": "Hermes 53AIHub adapter does not support cancelling active runs yet.",
-            }
+            session_id = self._read_session_id(record)
+            chat_id = self._internal_chat_id(session_id)
+            control_action = _string_or(record.get("action"), "stop")
+            if control_action != "stop":
+                return {
+                    "ok": False,
+                    "action": control_action,
+                    "session_id": session_id,
+                    "conversation_id": session_id,
+                    "unsupported": True,
+                    "message": f"Hermes 53AIHub adapter does not support {control_action!r} control yet.",
+                }
+            return await self._stop_session(chat_id)
         if action == "runtime.get":
+            connected = self._ws is not None
+            connection_status = "connected" if connected else "disconnected"
             return {
-                "status": {
-                    "platform": PLATFORM_NAME,
-                    "connected": self._ws is not None,
+                "healthy": connected,
+                "connectionHealthy": connected,
+                "connectionStatus": connection_status,
+                "hub53ai": {
+                    "connectionStatus": connection_status,
+                    "connected": connected,
                     "botId": self._masked_bot_id(),
                     "wsUrl": self._safe_ws_url(),
+                },
+                "status": {
+                    "platform": PLATFORM_NAME,
+                    "connected": connected,
+                    "connectionStatus": connection_status,
+                    "botId": self._masked_bot_id(),
+                    "wsUrl": self._safe_ws_url(),
+                },
+                "gatewayHealth": {
+                    "status": "ok" if connected else "disconnected",
                 },
                 "config": {
                     "platform": PLATFORM_NAME,
                     "streaming": True,
                 },
-                "skills": {"skills": []},
+                "skills": [],
+                "enabledSkills": [],
                 "cronTasks": [],
             }
         if action == "cron.tasks":
@@ -453,8 +608,16 @@ class Hermes53AIHubAdapter(BasePlatformAdapter):
         status: str,
         message_id: str,
         replace: bool,
+        event_kind: str = "",
+        payload: Optional[Dict[str, Any]] = None,
     ) -> None:
         req_id = await self._req_id_for(chat_id)
+        session_id = self._external_session_id(chat_id)
+        delta_content = content
+        if event_kind == "tool.call":
+            delta_content = "Used a tool"
+        elif event_kind == "tool.result":
+            delta_content = "Tool returned a result"
         frame = {
             "req_id": req_id,
             "action": "chat",
@@ -467,19 +630,63 @@ class Hermes53AIHubAdapter(BasePlatformAdapter):
                 "status": status,
                 "mode": "replace" if replace else "append",
                 "replace": replace,
-                "session_id": chat_id,
-                "conversation_id": chat_id,
+                **({"event_kind": event_kind} if event_kind else {}),
+                **({"payload": payload} if payload else {}),
+                "session_id": session_id,
+                "conversation_id": session_id,
+                "chat_id": chat_id,
                 "choices": [{
                     "index": 0,
                     "delta": {
                         "role": "assistant",
-                        "content": content,
+                        "content": delta_content,
                     },
                     "finish_reason": "stop" if status == "done" else None,
                 }],
             },
         }
         await self._send_or_queue(frame)
+
+    async def _emit_thinking_update(
+        self,
+        chat_id: str,
+        message_id: str,
+        content: str,
+        *,
+        replace: bool,
+        source: str,
+        status_key: str = "",
+    ) -> None:
+        text = _string_or(content)
+        if not text:
+            return
+        payload: Dict[str, Any] = {
+            "message_id": message_id,
+            "content": text,
+            "source": source,
+            "mode": "replace" if replace else "append",
+            "replace": replace,
+        }
+        if status_key:
+            payload["status_key"] = status_key
+        event_kind = "assistant.thinking"
+        event_payload = payload
+        if source == "hermes-progress":
+            tool_payload = self._tool_call_payload_from_progress(message_id, text, payload)
+            if tool_payload is not None:
+                event_kind = "tool.call"
+                event_payload = tool_payload
+
+        await self._record_event(chat_id, event_kind, event_payload)
+        await self._send_chat_chunk(
+            chat_id,
+            text,
+            status="thinking",
+            message_id=message_id,
+            replace=replace,
+            event_kind=event_kind,
+            payload=event_payload,
+        )
 
     async def _send_app_ping(self) -> None:
         await self._send_raw(json.dumps({"action": "ping", "data": {"botId": self.bot_id}}, ensure_ascii=False))
@@ -538,11 +745,15 @@ class Hermes53AIHubAdapter(BasePlatformAdapter):
             conversations = _as_dict(self._state.setdefault("conversations", {}))
             previous = _as_dict(conversations.get(chat_id))
             now = _now_iso()
+            session_id = self._external_session_id(chat_id)
             conversations[chat_id] = {
                 **previous,
-                "id": chat_id,
-                "conversation_id": chat_id,
-                "session_id": chat_id,
+                "id": session_id,
+                "conversation_id": session_id,
+                "session_id": session_id,
+                "chat_id": chat_id,
+                "chatId": chat_id,
+                "hermes_chat_id": chat_id,
                 "title": previous.get("title") or title,
                 "status": previous.get("status") or "running",
                 "createdAt": previous.get("createdAt") or now,
@@ -595,10 +806,12 @@ class Hermes53AIHubAdapter(BasePlatformAdapter):
     async def _record_event(self, chat_id: str, kind: str, payload: Dict[str, Any]) -> Dict[str, Any]:
         async with self._state_lock:
             self._seq += 1
+            session_id = self._external_session_id(chat_id)
             event = {
                 "id": f"{chat_id}:event:{self._seq}",
-                "sessionId": chat_id,
-                "session_id": chat_id,
+                "sessionId": session_id,
+                "session_id": session_id,
+                "chat_id": chat_id,
                 "seq": self._seq,
                 "kind": kind,
                 "payload": payload,
@@ -612,32 +825,106 @@ class Hermes53AIHubAdapter(BasePlatformAdapter):
         await self._persist_state()
         return event
 
+    async def _set_conversation_status(self, chat_id: str, status: str) -> None:
+        async with self._state_lock:
+            conversations = _as_dict(self._state.setdefault("conversations", {}))
+            conv = _as_dict(conversations.get(chat_id))
+            if conv:
+                now = _now_iso()
+                conv["status"] = status
+                conv["updatedAt"] = now
+                conv["updated_at"] = now
+                conversations[chat_id] = conv
+        await self._persist_state()
+
+    async def _stop_session(self, chat_id: str) -> Dict[str, Any]:
+        session_key = self._session_key_for_chat_id(chat_id)
+        cancel = getattr(self, "cancel_session_processing", None)
+        if callable(cancel):
+            await cancel(session_key, release_guard=True, discard_pending=True)
+        else:
+            await self.interrupt_session_activity(session_key, chat_id)
+        await self._set_conversation_status(chat_id, "interrupted")
+        await self._record_event(chat_id, "run.interrupted", {"reason": "stopped by 53AIHub"})
+        return {
+            "ok": True,
+            "action": "stop",
+            "session_id": self._external_session_id(chat_id),
+            "conversation_id": self._external_session_id(chat_id),
+        }
+
     async def _list_conversations(self) -> List[Dict[str, Any]]:
         async with self._state_lock:
-            sessions = [_as_dict(value).copy() for value in _as_dict(self._state.get("conversations")).values()]
+            by_session_id: Dict[str, Dict[str, Any]] = {}
+            for chat_id, value in _as_dict(self._state.get("conversations")).items():
+                session = self._normalize_conversation_record(chat_id, _as_dict(value).copy())
+                session_id = _string_or(session.get("id"), session.get("conversation_id"), session.get("session_id"))
+                previous = by_session_id.get(session_id)
+                if not previous:
+                    by_session_id[session_id] = session
+                    continue
+                previous_ts = _string_or(previous.get("updatedAt"), previous.get("updated_at"), previous.get("createdAt"), previous.get("created_at"))
+                current_ts = _string_or(session.get("updatedAt"), session.get("updated_at"), session.get("createdAt"), session.get("created_at"))
+                if current_ts >= previous_ts:
+                    by_session_id[session_id] = session
+            sessions = list(by_session_id.values())
         return sorted(sessions, key=lambda item: _string_or(item.get("updatedAt"), item.get("createdAt")), reverse=True)
 
     async def _latest_conversation(self, chat_id: str = "") -> Optional[Dict[str, Any]]:
         sessions = await self._list_conversations()
         if chat_id:
+            internal_chat_id = self._internal_chat_id(chat_id)
             for session in sessions:
-                if session.get("id") == chat_id or session.get("conversation_id") == chat_id:
+                if (
+                    session.get("id") == chat_id
+                    or session.get("conversation_id") == chat_id
+                    or session.get("session_id") == chat_id
+                    or session.get("chat_id") == internal_chat_id
+                    or session.get("chatId") == internal_chat_id
+                    or session.get("hermes_chat_id") == internal_chat_id
+                ):
                     return session
         return sessions[0] if sessions else None
 
     async def _messages_for(self, chat_id: str) -> List[Dict[str, Any]]:
         async with self._state_lock:
-            return [_as_dict(message).copy() for message in _as_list(_as_dict(self._state.get("messages")).get(chat_id))]
+            messages_by_chat = _as_dict(self._state.get("messages"))
+            messages: List[Dict[str, Any]] = []
+            seen: set[str] = set()
+            for key in self._chat_state_keys(chat_id):
+                for message in _as_list(messages_by_chat.get(key)):
+                    item = self._normalize_message_record(chat_id, _as_dict(message).copy())
+                    dedupe_key = _string_or(item.get("id"), item.get("message_id"), json.dumps(item, sort_keys=True, ensure_ascii=False))
+                    if dedupe_key in seen:
+                        continue
+                    seen.add(dedupe_key)
+                    messages.append(item)
+            return messages
 
     async def _events_for(self, chat_id: str, after_seq: int) -> List[Dict[str, Any]]:
         async with self._state_lock:
-            events = [_as_dict(event).copy() for event in _as_list(_as_dict(self._state.get("events")).get(chat_id))]
+            events_by_chat = _as_dict(self._state.get("events"))
+            events: List[Dict[str, Any]] = []
+            seen: set[str] = set()
+            for key in self._chat_state_keys(chat_id):
+                for event in _as_list(events_by_chat.get(key)):
+                    item = self._normalize_event_record(chat_id, _as_dict(event).copy())
+                    dedupe_key = _string_or(item.get("id"), f"{item.get('kind')}:{item.get('seq')}")
+                    if dedupe_key in seen:
+                        continue
+                    seen.add(dedupe_key)
+                    events.append(item)
         return [event for event in events if int(event.get("seq", 0)) > after_seq]
 
     async def _req_id_for(self, chat_id: str) -> str:
         async with self._state_lock:
-            conv = _as_dict(_as_dict(self._state.get("conversations")).get(chat_id))
-            return _string_or(conv.get("reqId"), chat_id)
+            conversations = _as_dict(self._state.get("conversations"))
+            for key in self._chat_state_keys(chat_id):
+                conv = _as_dict(conversations.get(key))
+                req_id = _string_or(conv.get("reqId"))
+                if req_id:
+                    return req_id
+            return self._internal_chat_id(chat_id)
 
     def _auth_headers(self) -> Dict[str, str]:
         auth = base64.b64encode(f"{self.bot_id}:{self.secret}".encode("utf-8")).decode("ascii")
@@ -656,11 +943,175 @@ class Hermes53AIHubAdapter(BasePlatformAdapter):
         summary = incoming["text"].replace("\n", " ").strip()[:40] or "新对话"
         return f"53AI Hub-{user}：{summary}"
 
+    def _ensure_home_channel(self, chat_id: str, title: str) -> None:
+        if not chat_id or os.getenv(HOME_CHANNEL_ENV):
+            return
+        os.environ[HOME_CHANNEL_ENV] = str(chat_id)
+        os.environ.setdefault(HOME_CHANNEL_THREAD_ENV, "")
+        try:
+            from hermes_cli.config import save_env_value
+
+            save_env_value(HOME_CHANNEL_ENV, str(chat_id))
+        except Exception as exc:
+            logger.warning("53AIHub: failed to persist %s: %s", HOME_CHANNEL_ENV, exc)
+        try:
+            self.config.home_channel = HomeChannel(
+                platform=Platform(PLATFORM_NAME),
+                chat_id=str(chat_id),
+                name=title or "53AIHub",
+            )
+        except Exception as exc:
+            logger.debug("53AIHub: failed to update in-process home channel: %s", exc)
+
+    def _is_stream_consumer_send(self) -> bool:
+        frame = inspect.currentframe()
+        if frame is None:
+            return False
+        frame = frame.f_back
+        while frame is not None:
+            filename = frame.f_code.co_filename.replace("\\", "/")
+            if filename.endswith("/gateway/stream_consumer.py"):
+                return True
+            frame = frame.f_back
+        return False
+
+    def _is_hermes_interim_send(self, metadata: Optional[Dict[str, Any]]) -> bool:
+        if _as_dict(metadata).get("notify") is True:
+            return False
+        return self._has_stack_function({
+            "_send_progress_text",
+            "_send_or_update_status_coro",
+            "_notify_long_running",
+        })
+
+    def _is_hermes_interim_edit(self) -> bool:
+        return self._has_stack_function({"_edit_progress_message"})
+
+    def _has_stack_function(self, names: set[str]) -> bool:
+        frame = inspect.currentframe()
+        if frame is None:
+            return False
+        frame = frame.f_back
+        while frame is not None:
+            if frame.f_code.co_name in names:
+                return True
+            frame = frame.f_back
+        return False
+
+    def _terminal_send_status(self, content: str) -> str:
+        normalized = (content or "").lower()
+        error_markers = (
+            "sorry, i encountered an error",
+            "the request failed:",
+            "runtimeerror",
+            "provider '",
+            "api key was found",
+            "try again or use /reset",
+        )
+        return "error" if any(marker in normalized for marker in error_markers) else "done"
+
+    def _tool_call_payload_from_progress(
+        self,
+        message_id: str,
+        content: str,
+        base_payload: Dict[str, Any],
+    ) -> Optional[Dict[str, Any]]:
+        parsed = _parse_tool_progress_text(content)
+        if parsed is None:
+            return None
+        tool_name, preview = parsed
+        args: Dict[str, Any] = {}
+        if preview:
+            args["preview"] = preview
+        return {
+            **base_payload,
+            "data": {
+                "phase": "call",
+                "name": tool_name,
+                "toolCallId": message_id,
+                "args": args,
+                "meta": preview,
+            },
+        }
+
     def _read_session_id(self, record: Dict[str, Any]) -> str:
         session_id = _string_or(record.get("session_id"), record.get("sessionId"), record.get("conversation_id"), record.get("conversationId"))
         if not session_id:
             raise ValueError("session_id or conversation_id is required")
         return session_id
+
+    def _normalize_conversation_record(self, chat_id: str, record: Dict[str, Any]) -> Dict[str, Any]:
+        raw_chat_id = _string_or(
+            record.get("chat_id"),
+            record.get("chatId"),
+            record.get("hermes_chat_id"),
+            self._internal_chat_id(_string_or(record.get("id"), record.get("conversation_id"), record.get("session_id"))),
+            chat_id,
+        )
+        internal_chat_id = self._internal_chat_id(raw_chat_id)
+        session_id = self._external_session_id(internal_chat_id)
+        return {
+            **record,
+            "id": session_id,
+            "conversation_id": session_id,
+            "session_id": session_id,
+            "chat_id": internal_chat_id,
+            "chatId": internal_chat_id,
+            "hermes_chat_id": internal_chat_id,
+        }
+
+    def _normalize_message_record(self, chat_id: str, record: Dict[str, Any]) -> Dict[str, Any]:
+        internal_chat_id = self._internal_chat_id(chat_id)
+        session_id = self._external_session_id(internal_chat_id)
+        return {
+            **record,
+            "sessionId": session_id,
+            "session_id": session_id,
+            "conversation_id": session_id,
+            "chat_id": internal_chat_id,
+        }
+
+    def _normalize_event_record(self, chat_id: str, record: Dict[str, Any]) -> Dict[str, Any]:
+        internal_chat_id = self._internal_chat_id(_string_or(
+            record.get("chat_id"),
+            record.get("chatId"),
+            record.get("hermes_chat_id"),
+            record.get("sessionId"),
+            record.get("session_id"),
+            chat_id,
+        ))
+        session_id = self._external_session_id(internal_chat_id)
+        return {
+            **record,
+            "sessionId": session_id,
+            "session_id": session_id,
+            "conversation_id": session_id,
+            "chat_id": internal_chat_id,
+        }
+
+    def _external_session_id(self, chat_id: str) -> str:
+        value = _string_or(chat_id)
+        if value.startswith(SESSION_ID_PREFIX):
+            return value
+        return f"{SESSION_ID_PREFIX}{value}"
+
+    def _internal_chat_id(self, session_id: str) -> str:
+        value = _string_or(session_id)
+        if value.startswith(SESSION_ID_PREFIX):
+            return value[len(SESSION_ID_PREFIX):]
+        return value
+
+    def _chat_state_keys(self, chat_id: str) -> List[str]:
+        internal_chat_id = self._internal_chat_id(chat_id)
+        external_session_id = self._external_session_id(internal_chat_id)
+        keys = [internal_chat_id, external_session_id]
+        original = _string_or(chat_id)
+        if original and original not in keys:
+            keys.append(original)
+        return keys
+
+    def _session_key_for_chat_id(self, chat_id: str) -> str:
+        return self._external_session_id(chat_id)
 
     def _pagination(self, record: Dict[str, Any], default_limit: int) -> tuple[int, int]:
         limit = int(record.get("limit") or default_limit)
@@ -720,6 +1171,9 @@ def register(ctx) -> None:
         check_fn=check_requirements,
         validate_config=lambda config: bool(config.enabled),
         required_env=["HUB53AI_BOT_ID", "HUB53AI_SECRET", "HUB53AI_WS_URL"],
+        allowed_users_env="HUB53AI_ALLOWED_USERS",
+        allow_all_env="HUB53AI_ALLOW_ALL_USERS",
+        cron_deliver_env_var=HOME_CHANNEL_ENV,
         install_hint="Set HUB53AI_BOT_ID, HUB53AI_SECRET, HUB53AI_WS_URL and enable platforms/53aihub.",
         env_enablement_fn=_env_enablement,
         apply_yaml_config_fn=_apply_yaml_config,

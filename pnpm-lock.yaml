@@ -9,13 +9,6 @@ importers:
   .: {}
 
   plugin:
-    dependencies:
-      ws:
-        specifier: ^8.18.3
-        version: 8.20.1
-      yaml:
-        specifier: ^2.9.0
-        version: 2.9.0
     devDependencies:
       '@types/node':
         specifier: ^24.10.1
@@ -35,6 +28,12 @@ importers:
       vitest:
         specifier: ^3.2.4
         version: 3.2.4(@types/node@24.12.4)(jiti@2.7.0)(jsdom@27.4.0)(yaml@2.9.0)
+      ws:
+        specifier: ^8.18.3
+        version: 8.20.1
+      yaml:
+        specifier: ^2.9.0
+        version: 2.9.0
 
   web:
     dependencies:

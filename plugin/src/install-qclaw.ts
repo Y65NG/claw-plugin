@@ -599,6 +599,18 @@ async function copyPublishablePackage(packageRoot: string, destination: string) 
     await rm(target, { recursive: true, force: true });
     await cp(source, target, { recursive: true, force: true });
   }
+  await sanitizeExtensionPackageJson(destination);
+}
+
+async function sanitizeExtensionPackageJson(destination: string): Promise<void> {
+  const packageJsonPath = join(destination, "package.json");
+  if (!existsSync(packageJsonPath)) {
+    return;
+  }
+  const packageJson = JSON.parse(await readFile(packageJsonPath, "utf8")) as Record<string, unknown>;
+  delete packageJson.dependencies;
+  delete packageJson.optionalDependencies;
+  await writeFile(packageJsonPath, `${JSON.stringify(packageJson, null, 2)}\n`);
 }
 
 async function copyHermesPlatformPackage(packageRoot: string, destination: string) {
@@ -664,6 +676,11 @@ async function updateHermesConfig(configPath: string): Promise<void> {
   const platform = ensureObject(platforms, HERMES_PLATFORM_ID);
   platform.enabled = true;
   ensureObject(platform, "extra");
+
+  const display = ensureObject(config, "display");
+  const displayPlatforms = ensureObject(display, "platforms");
+  const displayPlatform = ensureObject(displayPlatforms, HERMES_PLATFORM_ID);
+  displayPlatform.show_reasoning = true;
 
   await writeFile(configPath, stringifyYaml(config));
 }

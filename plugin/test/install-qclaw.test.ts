@@ -202,6 +202,50 @@ describe("QClaw installer", () => {
     expect(await readFile(join(stalePluginDir, "web-dist", "assets", "new-bundle.js"), "utf8")).toContain("fresh");
   });
 
+  it("removes runtime dependency declarations from the copied extension package", async () => {
+    const tempRoot = await mkdtemp(join(tmpdir(), "qclaw-install-"));
+    cleanupPaths.push(tempRoot);
+
+    const configPath = join(tempRoot, "openclaw.json");
+    const extensionsDir = join(tempRoot, "extensions");
+    const packageRoot = join(tempRoot, "package");
+    await mkdir(join(packageRoot, "dist"), { recursive: true });
+    await writeFile(
+      join(packageRoot, "package.json"),
+      JSON.stringify({
+        name: "claw-control-center",
+        version: "0.1.9",
+        dependencies: {
+          ws: "^8.18.3",
+          yaml: "^2.9.0"
+        },
+        optionalDependencies: {
+          bufferutil: "^4.0.0"
+        },
+        devDependencies: {
+          vitest: "^3.2.4"
+        }
+      })
+    );
+    await writeFile(join(packageRoot, "openclaw.plugin.json"), JSON.stringify({ id: "claw-control-center" }));
+    await writeFile(join(packageRoot, "dist", "index.cjs"), "module.exports = {};\n");
+    await writeGatewayConfig(configPath, 28789, "local-token");
+
+    await installIntoOpenClaw({
+      packageRoot,
+      extensionsDir,
+      configPath
+    });
+
+    const copiedPackage = JSON.parse(
+      await readFile(join(extensionsDir, "claw-control-center", "package.json"), "utf8")
+    ) as Record<string, unknown>;
+
+    expect(copiedPackage.dependencies).toBeUndefined();
+    expect(copiedPackage.optionalDependencies).toBeUndefined();
+    expect(copiedPackage.devDependencies).toEqual({ vitest: "^3.2.4" });
+  });
+
   it("writes explicit 53AIHub bridge config without mixing it into the local gateway config", async () => {
     const tempRoot = await mkdtemp(join(tmpdir(), "qclaw-install-"));
     cleanupPaths.push(tempRoot);
@@ -722,6 +766,10 @@ describe("QClaw installer", () => {
         "platforms:",
         "  telegram:",
         "    enabled: true",
+        "display:",
+        "  platforms:",
+        "    telegram:",
+        "      show_reasoning: false",
         ""
       ].join("\n")
     );
@@ -760,10 +808,14 @@ describe("QClaw installer", () => {
     expect(updatedConfig.plugins.enabled).toContain("53aihub");
     expect(updatedConfig.platforms.telegram.enabled).toBe(true);
     expect(updatedConfig.platforms["53aihub"]).toEqual({ enabled: true, extra: {} });
+    expect(updatedConfig.display.platforms.telegram.show_reasoning).toBe(false);
+    expect(updatedConfig.display.platforms["53aihub"].show_reasoning).toBe(true);
     expect(updatedEnv).toContain("EXISTING=value");
     expect(updatedEnv).toContain('HUB53AI_BOT_ID="hub-bot"');
     expect(updatedEnv).toContain('HUB53AI_SECRET="hub-secret"');
     expect(updatedEnv).toContain('HUB53AI_WS_URL="wss://hub.example.com/api/v1/openclaw/ws/connect"');
+    expect(updatedEnv).not.toContain("GATEWAY_ALLOW_ALL_USERS");
+    expect(updatedEnv).not.toContain("HUB53AI_HOME_CHANNEL");
     await access(join(hermesPluginsDir, "53aihub", "plugin.yaml"));
     await access(join(hermesPluginsDir, "53aihub", "adapter.py"));
     expect(chunks.join("")).toContain("Installed claw-control-center into Hermes.");
@@ -825,6 +877,7 @@ describe("QClaw installer", () => {
     const openClawConfig = JSON.parse(await readFile(openClawConfigPath, "utf8")) as any;
 
     expect(hermesConfig.plugins.enabled).toContain("platforms/53aihub");
+    expect(hermesConfig.display.platforms["53aihub"].show_reasoning).toBe(true);
     expect(openClawConfig.plugins.allow).toContain("claw-control-center");
     await access(join(hermesPluginsDir, "53aihub", "adapter.py"));
     await access(join(openClawExtensionsDir, "claw-control-center", "dist", "index.cjs"));
