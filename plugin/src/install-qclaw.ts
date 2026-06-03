@@ -405,10 +405,7 @@ async function resolveInstallDestinations(
   const detected = detectInstallHosts(options.hostDefinitions ?? getDefaultHostDefinitions());
   const compatible = detected;
   const incompatible: HostDefinition[] = [];
-  if (compatible.length === 1) {
-    return [toInstallDestination(compatible[0]!)];
-  }
-  if (compatible.length > 1) {
+  if (compatible.length > 0) {
     const selected = options.selectHosts
       ? validateSingleSelectedHost(await options.selectHosts(compatible, incompatible), compatible)
       : options.selectHost

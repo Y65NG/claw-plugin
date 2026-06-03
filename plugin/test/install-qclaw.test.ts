@@ -547,6 +547,7 @@ describe("QClaw installer", () => {
     await writeGatewayConfig(configPath, 28789, "qclaw-token");
 
     const chunks: string[] = [];
+    let promptCalled = false;
     await withCapturedStdout(chunks, async () => {
       await runInstallCommand({
         packageRoot,
@@ -564,7 +565,14 @@ describe("QClaw installer", () => {
             configPath: join(tempRoot, ".openclaw", "openclaw.json"),
             extensionsDir: join(tempRoot, ".openclaw", "extensions")
           }
-        ]
+        ],
+        promptSelectHost: async (detected, incompatible) => {
+          promptCalled = true;
+          expect(detected).toHaveLength(1);
+          expect(detected[0]?.id).toBe("qclaw");
+          expect(incompatible).toEqual([]);
+          return detected[0]!;
+        }
       });
     });
 
@@ -575,6 +583,7 @@ describe("QClaw installer", () => {
       };
     };
 
+    expect(promptCalled).toBe(true);
     expect(updated.plugins.allow).toContain("claw-control-center");
     expect(updated.plugins.load.paths).toContain(extensionsDir);
     expect(chunks.join("")).toContain("Installed claw-control-center into QClaw.");
@@ -592,6 +601,7 @@ describe("QClaw installer", () => {
     await writeGatewayConfig(configPath, 18789, "openclaw-token");
 
     const chunks: string[] = [];
+    let promptCalled = false;
     await withCapturedStdout(chunks, async () => {
       await runInstallCommand({
         packageRoot,
@@ -609,7 +619,14 @@ describe("QClaw installer", () => {
             configPath,
             extensionsDir
           }
-        ]
+        ],
+        promptSelectHost: async (detected, incompatible) => {
+          promptCalled = true;
+          expect(detected).toHaveLength(1);
+          expect(detected[0]?.id).toBe("openclaw");
+          expect(incompatible).toEqual([]);
+          return detected[0]!;
+        }
       });
     });
 
@@ -620,6 +637,7 @@ describe("QClaw installer", () => {
       };
     };
 
+    expect(promptCalled).toBe(true);
     expect(updated.plugins.allow).toContain("claw-control-center");
     expect(updated.plugins.load.paths).toContain(extensionsDir);
     expect(chunks.join("")).toContain("Installed claw-control-center into OpenClaw.");
@@ -816,6 +834,7 @@ describe("QClaw installer", () => {
     await writeFile(join(tempRoot, ".hermes", ".env"), "EXISTING=value\nHUB53AI_SECRET=\"old-secret\"\n");
 
     const chunks: string[] = [];
+    let promptCalled = false;
     await withCapturedStdout(chunks, async () => {
       await runInstallCommand({
         packageRoot,
@@ -836,13 +855,21 @@ describe("QClaw installer", () => {
             extensionsDir: hermesPluginsDir,
             installKind: "hermes"
           }
-        ]
+        ],
+        promptSelectHost: async (detected, incompatible) => {
+          promptCalled = true;
+          expect(detected).toHaveLength(1);
+          expect(detected[0]?.id).toBe("hermes");
+          expect(incompatible).toEqual([]);
+          return detected[0]!;
+        }
       });
     });
 
     const updatedConfig = parseYaml(await readFile(hermesConfigPath, "utf8")) as any;
     const updatedEnv = await readFile(join(tempRoot, ".hermes", ".env"), "utf8");
 
+    expect(promptCalled).toBe(true);
     expect(updatedConfig.plugins.enabled).toContain("observability/langfuse");
     expect(updatedConfig.plugins.enabled).toContain("platforms/53aihub");
     expect(updatedConfig.plugins.enabled).toContain("53aihub");
