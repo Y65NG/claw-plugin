@@ -5,5 +5,5 @@ export default defineConfig({
   format: ["cjs"],
   dts: true,
   platform: "node",
-  noExternal: ["ws", "yaml"]
+  noExternal: ["ws", "yaml", /^@inquirer\//]
 });

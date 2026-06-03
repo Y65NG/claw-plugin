@@ -1,6 +1,6 @@
 {
   "name": "claw-control-center",
-  "version": "0.1.10",
+  "version": "0.1.11",
   "type": "module",
   "main": "dist/index.cjs",
   "types": "dist/index.d.ts",
@@ -27,6 +27,7 @@
     "openclaw": ">=2026.5.18"
   },
   "devDependencies": {
+    "@inquirer/prompts": "^8.5.2",
     "@types/node": "^24.10.1",
     "@types/ws": "^8.18.1",
     "openclaw": "2026.5.18",

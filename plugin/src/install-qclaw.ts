@@ -1,10 +1,9 @@
 import { createHash } from "node:crypto";
-import { createInterface } from "node:readline/promises";
-import { cp, mkdir, open as openFile, readFile, rm, writeFile } from "node:fs/promises";
+import { cp, mkdir, readFile, rm, writeFile } from "node:fs/promises";
 import { existsSync } from "node:fs";
 import { homedir } from "node:os";
 import { dirname, join, resolve } from "node:path";
-import type { FileHandle } from "node:fs/promises";
+import { checkbox } from "@inquirer/prompts";
 import { parse as parseYaml, stringify as stringifyYaml } from "yaml";
 
 type InstallInput = {
@@ -55,6 +54,11 @@ type InstallDestination = {
   label: string;
   installKind: "openclaw" | "hermes";
 };
+
+export type PromptSelectHosts = (
+  hosts: HostDefinition[],
+  incompatibleHosts: HostDefinition[]
+) => Promise<HostDefinition[]>;
 
 type OpenClawConfig = {
   gateway?: {
@@ -318,6 +322,7 @@ export async function runInstallCommand(input: {
   hostDefinitions?: HostDefinition[];
   selectHosts?: (hosts: HostDefinition[], incompatibleHosts: HostDefinition[]) => Promise<HostDefinition[]>;
   selectHost?: (hosts: HostDefinition[]) => Promise<HostDefinition>;
+  promptSelectHosts?: PromptSelectHosts;
   ttyPath?: string;
 }): Promise<void> {
   const argv = input.argv ?? process.argv.slice(2);
@@ -330,6 +335,7 @@ export async function runInstallCommand(input: {
     hostDefinitions: input.hostDefinitions,
     selectHosts: input.selectHosts,
     selectHost: input.selectHost,
+    promptSelectHosts: input.promptSelectHosts,
     ttyPath: input.ttyPath
   });
 
@@ -375,6 +381,7 @@ async function resolveInstallDestinations(
     hostDefinitions?: HostDefinition[];
     selectHosts?: (hosts: HostDefinition[], incompatibleHosts: HostDefinition[]) => Promise<HostDefinition[]>;
     selectHost?: (hosts: HostDefinition[]) => Promise<HostDefinition>;
+    promptSelectHosts?: PromptSelectHosts;
     ttyPath?: string;
   } = {}
 ): Promise<InstallDestination[]> {
@@ -406,7 +413,7 @@ async function resolveInstallDestinations(
       ? await options.selectHosts(compatible, incompatible)
       : options.selectHost
         ? [await options.selectHost(compatible)]
-        : await promptForInstallHosts(compatible, incompatible, options.ttyPath ?? "/dev/tty");
+        : await (options.promptSelectHosts ?? promptForInstallHosts)(compatible, incompatible);
     return validateSelectedHosts(selected, compatible).map(toInstallDestination);
   }
   throw new Error(
@@ -462,55 +469,49 @@ function detectInstallHosts(hosts: HostDefinition[]): HostDefinition[] {
 
 async function promptForInstallHosts(
   hosts: HostDefinition[],
-  incompatibleHosts: HostDefinition[],
-  ttyPath: string
+  incompatibleHosts: HostDefinition[]
 ): Promise<HostDefinition[]> {
-  let handle: FileHandle | undefined;
   try {
-    handle = await openFile(ttyPath, "r+");
-    const input = handle.createReadStream();
-    const output = handle.createWriteStream();
-    const readline = createInterface({ input, output });
-    try {
-      output.write("Multiple Claw installations were detected.\n");
-      output.write("Choose one or more locations to install claw-control-center:\n");
-      hosts.forEach((host, index) => {
-        output.write(`${index + 1}. ${host.label}\n`);
-        output.write(`   Config: ${host.configPath}\n`);
-        output.write(`   Extensions: ${host.extensionsDir}\n`);
-      });
-      if (incompatibleHosts.length > 0) {
-        output.write("\nDetected but not installable by this OpenClaw plugin installer:\n");
-        for (const host of incompatibleHosts) {
-          output.write(`- ${host.label}: ${host.incompatibilityReason ?? "incompatible plugin format"}\n`);
-        }
-      }
-      const answer = await readline.question(`Install location(s) [1-${hosts.length}, comma-separated, or all]: `);
-      const selectedIndexes = parseInstallSelection(answer, hosts.length);
-      if (selectedIndexes.length === 0) {
-        throw new Error(`invalid install location: ${answer}`);
-      }
-      return selectedIndexes.map((index) => hosts[index - 1]!);
-    } finally {
-      readline.close();
-      input.destroy();
-      output.end();
+    if (!process.stdin.isTTY || !process.stdout.isTTY) {
+      throw new Error("interactive terminal is required");
     }
+    const choices = [
+      ...hosts.map((host) => ({
+        name: host.label,
+        value: host,
+        short: host.label,
+        description: `Config: ${host.configPath}\nExtensions: ${host.extensionsDir}`
+      })),
+      ...incompatibleHosts.map((host) => ({
+        name: host.label,
+        value: host,
+        short: host.label,
+        disabled: host.incompatibilityReason ?? "incompatible plugin format",
+        description: `Config: ${host.configPath}\nExtensions: ${host.extensionsDir}`
+      }))
+    ];
+
+    return await checkbox<HostDefinition>({
+      message: "Choose one or more Claw installations to install claw-control-center:",
+      choices,
+      pageSize: Math.min(Math.max(choices.length, 5), 12),
+      required: true,
+      shortcuts: {
+        all: "a",
+        invert: "i"
+      }
+    });
   } catch (error) {
-    if (error instanceof Error && error.message.startsWith("invalid install location:")) {
-      throw error;
-    }
     throw new Error(
       [
         "multiple Claw installations were detected, but no interactive terminal was available.",
-        "Run the installer again with --config-path and --extensions-dir.",
+        "Run the installer again in an interactive terminal, or pass --config-path and --extensions-dir.",
         "",
         "Detected locations:",
-        ...formatHostList(hosts)
+        ...formatHostList(hosts),
+        ...(error instanceof Error && error.message ? ["", `Prompt error: ${error.message}`] : [])
       ].join("\n")
     );
-  } finally {
-    await handle?.close().catch(() => undefined);
   }
 }
 
@@ -537,18 +538,6 @@ function validateSelectedHosts(selected: HostDefinition[], compatible: HostDefin
     seen.add(host.id);
     return true;
   });
-}
-
-function parseInstallSelection(answer: string, hostCount: number): number[] {
-  const trimmed = answer.trim().toLowerCase();
-  if (trimmed === "all" || trimmed === "*") {
-    return Array.from({ length: hostCount }, (_, index) => index + 1);
-  }
-  const indexes = trimmed
-    .split(",")
-    .map((part) => Number(part.trim()))
-    .filter((index) => Number.isInteger(index) && index >= 1 && index <= hostCount);
-  return Array.from(new Set(indexes));
 }
 
 function formatHostList(hosts: HostDefinition[]): string[] {

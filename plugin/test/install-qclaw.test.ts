@@ -686,6 +686,67 @@ describe("QClaw installer", () => {
     expect(chunks.join("")).toContain("Installed claw-control-center into OpenClaw.");
   });
 
+  it("uses the cross-platform keyboard prompt when multiple Claw hosts are detected", async () => {
+    const tempRoot = await mkdtemp(join(tmpdir(), "openclaw-install-"));
+    cleanupPaths.push(tempRoot);
+
+    const qclawConfigPath = join(tempRoot, ".qclaw", "openclaw.json");
+    const qclawExtensionsDir = join(tempRoot, "Library/Application Support/QClaw/openclaw/config/extensions");
+    const openClawConfigPath = join(tempRoot, ".openclaw", "openclaw.json");
+    const openClawExtensionsDir = join(tempRoot, ".openclaw", "extensions");
+    const packageRoot = await createPackageRoot(tempRoot);
+    await mkdir(join(tempRoot, ".qclaw"), { recursive: true });
+    await mkdir(join(tempRoot, ".openclaw"), { recursive: true });
+    await writeGatewayConfig(qclawConfigPath, 28789, "qclaw-token");
+    await writeGatewayConfig(openClawConfigPath, 18789, "openclaw-token");
+
+    const hosts: HostDefinition[] = [
+      {
+        id: "qclaw",
+        label: "QClaw",
+        configPath: qclawConfigPath,
+        extensionsDir: qclawExtensionsDir
+      },
+      {
+        id: "openclaw",
+        label: "OpenClaw",
+        configPath: openClawConfigPath,
+        extensionsDir: openClawExtensionsDir
+      }
+    ];
+
+    const chunks: string[] = [];
+    await withCapturedStdout(chunks, async () => {
+      await runInstallCommand({
+        packageRoot,
+        argv: ["install"],
+        hostDefinitions: hosts,
+        promptSelectHosts: async (detected: HostDefinition[], incompatible: HostDefinition[]) => {
+          expect(detected).toEqual(hosts);
+          expect(incompatible).toEqual([]);
+          return [detected[1]!];
+        }
+      });
+    });
+
+    const openClawConfig = JSON.parse(await readFile(openClawConfigPath, "utf8")) as {
+      plugins: {
+        allow: string[];
+        load: { paths: string[] };
+      };
+    };
+    const qclawConfig = JSON.parse(await readFile(qclawConfigPath, "utf8")) as {
+      plugins?: {
+        allow?: string[];
+      };
+    };
+
+    expect(openClawConfig.plugins.allow).toContain("claw-control-center");
+    expect(openClawConfig.plugins.load.paths).toContain(openClawExtensionsDir);
+    expect(qclawConfig.plugins?.allow).toBeUndefined();
+    expect(chunks.join("")).toContain("Installed claw-control-center into OpenClaw.");
+  });
+
   it("installs into multiple selected Claw hosts when several compatible hosts are detected", async () => {
     const tempRoot = await mkdtemp(join(tmpdir(), "openclaw-install-"));
     cleanupPaths.push(tempRoot);
