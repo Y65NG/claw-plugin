@@ -1,0 +1,23 @@
+{
+  "mcpServers": {
+    "53aihub-channel": {
+      "command": "node",
+      "args": [
+        "dist/workbuddy-supervisor.cjs"
+      ],
+      "env": {
+        "HUB53AI_WS_URL": "",
+        "HUB53AI_BOT_ID": "",
+        "HUB53AI_SECRET": "",
+        "HUB53AI_ACCESS_POLICY": "open",
+        "HUB53AI_ALLOW_FROM": "",
+        "HUB53AI_SEND_THINKING_MESSAGE": "true",
+        "HUB53AI_CHANNEL_ENTRY_PATH": "",
+        "HUB53AI_WORKBUDDY_HOME": "",
+        "HUB53AI_WORKBUDDY_WORKSPACE": "",
+        "HUB53AI_WORKBUDDY_HISTORY_SCOPE": "all",
+        "HUB53AI_WORKBUDDY_SESSION_ID": "53aihub-workbuddy-shared"
+      }
+    }
+  }
+}

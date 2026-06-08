@@ -1,8 +1,10 @@
 import { createHash } from "node:crypto";
+import { execFile } from "node:child_process";
 import { cp, mkdir, readFile, rm, writeFile } from "node:fs/promises";
 import { existsSync } from "node:fs";
 import { homedir } from "node:os";
 import { dirname, join, resolve } from "node:path";
+import { promisify } from "node:util";
 import { select } from "@inquirer/prompts";
 import { parse as parseYaml, stringify as stringifyYaml } from "yaml";
 
@@ -23,6 +25,15 @@ type InstallInput = {
   consolePort?: number;
 };
 
+type WorkBuddyInstallInput = {
+  packageRoot: string;
+  workbuddyHome: string;
+  hubWsUrl?: string;
+  hubBotId?: string;
+  hubSecret?: string;
+  cleanupWorkBuddyChannelProcesses?: (targets: string[]) => Promise<void>;
+};
+
 type ParsedArgs = {
   gateway?: string;
   "bot-id"?: string;
@@ -37,6 +48,7 @@ type ParsedArgs = {
   "config-path"?: string;
   "console-host"?: string;
   "console-port"?: string;
+  "workbuddy-home"?: string;
 };
 
 export type HostDefinition = {
@@ -44,7 +56,8 @@ export type HostDefinition = {
   label: string;
   configPath: string;
   extensionsDir: string;
-  installKind?: "openclaw" | "hermes";
+  installKind?: "openclaw" | "hermes" | "workbuddy";
+  workbuddyHome?: string;
   incompatibilityReason?: string;
 };
 
@@ -52,7 +65,8 @@ type InstallDestination = {
   configPath: string;
   extensionsDir: string;
   label: string;
-  installKind: "openclaw" | "hermes";
+  installKind: "openclaw" | "hermes" | "workbuddy";
+  workbuddyHome?: string;
 };
 
 export type PromptSelectHost = (
@@ -84,6 +98,11 @@ type OpenClawConfig = {
       accessPolicy?: unknown;
       allowFrom?: unknown;
       sendThinkingMessage?: unknown;
+      detectCreatedFiles?: unknown;
+      fileWorkspaceDirs?: unknown;
+      createdFilesMaxFileBytes?: unknown;
+      createdFilesMaxCount?: unknown;
+      createdFilesExclude?: unknown;
     };
   };
   plugins?: {
@@ -96,16 +115,39 @@ type OpenClawConfig = {
   };
 };
 
+type Hub53AIInstallSettings = {
+  enabled: boolean;
+  botId: string;
+  secret: string;
+  wsUrl: string;
+  accessPolicy?: string;
+  allowFrom?: string[];
+  sendThinkingMessage?: boolean;
+};
+
 const PLUGIN_ID = "claw-control-center";
 const LEGACY_PLUGIN_ID = "53ai-openclaw";
-const COPY_ITEMS = ["dist", "openclaw.plugin.json", "package.json", "bin", "web-dist"] as const;
+const COPY_ITEMS = [
+  "dist",
+  "openclaw.plugin.json",
+  ".codebuddy-plugin",
+  ".mcp.json",
+  "package.json",
+  "bin",
+  "web-dist"
+] as const;
 const HERMES_PLATFORM_ID = "53aihub";
 const HERMES_PLUGIN_KEY = `platforms/${HERMES_PLATFORM_ID}`;
+const WORKBUDDY_MARKETPLACE_ID = "my-experts";
+const WORKBUDDY_PLUGIN_ID = "53aihub-workbuddy";
+const WORKBUDDY_SHARED_SESSION_ID = "53aihub-workbuddy-shared";
+const WORKBUDDY_HISTORY_SCOPE = "all";
 const HERMES_ENV_KEYS = {
   botId: "HUB53AI_BOT_ID",
   secret: "HUB53AI_SECRET",
   wsUrl: "HUB53AI_WS_URL"
 } as const;
+const execFileAsync = promisify(execFile);
 const SUPPORTED_ARGS = new Set([
   "gateway",
   "bot-id",
@@ -119,7 +161,8 @@ const SUPPORTED_ARGS = new Set([
   "extensions-dir",
   "config-path",
   "console-host",
-  "console-port"
+  "console-port",
+  "workbuddy-home"
 ]);
 
 export async function installIntoQClaw(input: InstallInput): Promise<{
@@ -175,6 +218,58 @@ export async function installIntoHermes(input: InstallInput): Promise<{
     destination,
     hub53aiConfigured: true,
     pluginBuild: await readHermesPluginBuildInfo(destination)
+  };
+}
+
+export async function installIntoWorkBuddy(input: WorkBuddyInstallInput): Promise<{
+  marketplacePath: string;
+  destination: string;
+  hub53aiConfigured: boolean;
+  pluginBuild: string;
+}> {
+  const hubWsUrl = input.hubWsUrl?.trim();
+  const hubBotId = input.hubBotId?.trim();
+  const hubSecret = input.hubSecret?.trim();
+  if (!hubWsUrl || !hubBotId || !hubSecret) {
+    throw new Error("WorkBuddy install requires --hub-ws-url, --hub-bot-id, and --hub-secret");
+  }
+
+  const marketplaceRoot = join(input.workbuddyHome, "plugins", "marketplaces", WORKBUDDY_MARKETPLACE_ID);
+  const pluginsRoot = join(marketplaceRoot, "plugins");
+  const destination = join(pluginsRoot, WORKBUDDY_PLUGIN_ID);
+  const channelEntryPath = join(destination, "dist", "codebuddy-channel.cjs");
+  const supervisorEntryPath = join(destination, "dist", "workbuddy-supervisor.cjs");
+  const workspaceDir = join(input.workbuddyHome, "channels", "53aihub-workspace");
+  await mkdir(pluginsRoot, { recursive: true });
+  await mkdir(destination, { recursive: true });
+  await mkdir(workspaceDir, { recursive: true });
+  await copyPublishablePackage(input.packageRoot, destination);
+  await updateWorkBuddyMcpConfig(join(destination, ".mcp.json"), {
+    botId: hubBotId,
+    secret: hubSecret,
+    wsUrl: hubWsUrl,
+    supervisorEntryPath,
+    channelEntryPath,
+    workbuddyHome: input.workbuddyHome,
+    workspaceDir,
+    sessionId: WORKBUDDY_SHARED_SESSION_ID,
+    historyScope: WORKBUDDY_HISTORY_SCOPE
+  });
+  const marketplacePath = await updateWorkBuddyMarketplace(marketplaceRoot);
+  await updateWorkBuddyKnownMarketplaces(input.workbuddyHome, marketplaceRoot);
+  await updateWorkBuddyEnabledPlugins(input.workbuddyHome);
+  await (input.cleanupWorkBuddyChannelProcesses ?? cleanupOrphanedWorkBuddyChannelProcesses)([
+    channelEntryPath,
+    supervisorEntryPath,
+    `--session-id ${WORKBUDDY_SHARED_SESSION_ID}`,
+    `--session-id ${WORKBUDDY_SHARED_SESSION_ID.replace(/ /g, "\\ ")}`
+  ]);
+
+  return {
+    marketplacePath,
+    destination,
+    hub53aiConfigured: true,
+    pluginBuild: await readPluginBuildInfo(destination)
   };
 }
 
@@ -291,6 +386,16 @@ async function installIntoHost(
     previousHub.allowFrom = inferredHub53AI.allowFrom ?? previousHub.allowFrom ?? [];
     previousHub.sendThinkingMessage =
       inferredHub53AI.sendThinkingMessage ?? previousHub.sendThinkingMessage ?? true;
+    previousHub.detectCreatedFiles =
+      typeof previousHub.detectCreatedFiles === "boolean" ? previousHub.detectCreatedFiles : true;
+    previousHub.fileWorkspaceDirs = Array.isArray(previousHub.fileWorkspaceDirs) ? previousHub.fileWorkspaceDirs : [];
+    previousHub.createdFilesMaxFileBytes =
+      typeof previousHub.createdFilesMaxFileBytes === "number" ? previousHub.createdFilesMaxFileBytes : 10 * 1024 * 1024;
+    previousHub.createdFilesMaxCount =
+      typeof previousHub.createdFilesMaxCount === "number" ? previousHub.createdFilesMaxCount : 20;
+    previousHub.createdFilesExclude = Array.isArray(previousHub.createdFilesExclude)
+      ? previousHub.createdFilesExclude
+      : [];
   }
 
   if (consoleHost || consolePort !== undefined) {
@@ -326,11 +431,32 @@ export async function runInstallCommand(input: {
   ttyPath?: string;
 }): Promise<void> {
   const argv = input.argv ?? process.argv.slice(2);
-  if (argv[0] !== "install") {
-    throw new Error("expected subcommand: install");
+  if (argv[0] !== "install" && argv[0] !== "install-workbuddy") {
+    throw new Error("expected subcommand: install or install-workbuddy");
   }
 
   const args = parseArgs(argv.slice(1));
+  if (argv[0] === "install-workbuddy") {
+    const result = await installIntoWorkBuddy({
+      packageRoot: input.packageRoot,
+      workbuddyHome: resolve(args["workbuddy-home"] ?? join(homedir(), ".workbuddy")),
+      hubWsUrl: args["hub-ws-url"],
+      hubBotId: args["hub-bot-id"],
+      hubSecret: args["hub-secret"]
+    });
+    process.stdout.write(
+      [
+        `Installed ${WORKBUDDY_PLUGIN_ID} into WorkBuddy local marketplace.`,
+        `Plugin: ${result.destination}`,
+        `Marketplace: ${result.marketplacePath}`,
+        `53AIHub: ${result.hub53aiConfigured ? "configured" : "not configured"}`,
+        `Plugin build: ${result.pluginBuild}`,
+        "Restart WorkBuddy or refresh local marketplaces to load the channel plugin."
+      ].join("\n") + "\n"
+    );
+    return;
+  }
+
   const destinations = await resolveInstallDestinations(args, {
     hostDefinitions: input.hostDefinitions,
     selectHosts: input.selectHosts,
@@ -340,6 +466,28 @@ export async function runInstallCommand(input: {
   });
 
   for (const destination of destinations) {
+    if (destination.installKind === "workbuddy") {
+      const result = await installIntoWorkBuddy({
+        packageRoot: input.packageRoot,
+        workbuddyHome: destination.workbuddyHome ?? resolve(args["workbuddy-home"] ?? join(homedir(), ".workbuddy")),
+        hubWsUrl: args["hub-ws-url"],
+        hubBotId: args["hub-bot-id"],
+        hubSecret: args["hub-secret"]
+      });
+
+      process.stdout.write(
+        [
+          `Installed ${WORKBUDDY_PLUGIN_ID} into WorkBuddy local marketplace.`,
+          `Plugin: ${result.destination}`,
+          `Marketplace: ${result.marketplacePath}`,
+          `53AIHub: ${result.hub53aiConfigured ? "configured" : "not configured"}`,
+          `Plugin build: ${result.pluginBuild}`,
+          "Restart WorkBuddy or refresh local marketplaces to load the channel plugin."
+        ].join("\n") + "\n"
+      );
+      continue;
+    }
+
     const installInput: InstallInput = {
       packageRoot: input.packageRoot,
       extensionsDir: destination.extensionsDir,
@@ -387,6 +535,14 @@ async function resolveInstallDestinations(
 ): Promise<InstallDestination[]> {
   const explicitConfigPath = args["config-path"] ? resolve(args["config-path"]) : undefined;
   const explicitExtensionsDir = args["extensions-dir"] ? resolve(args["extensions-dir"]) : undefined;
+  const explicitWorkBuddyHome = args["workbuddy-home"] ? resolve(args["workbuddy-home"]) : undefined;
+
+  if (explicitWorkBuddyHome) {
+    if (explicitConfigPath || explicitExtensionsDir) {
+      throw new Error("pass --workbuddy-home by itself, or pass --config-path and --extensions-dir together for Claw-style hosts");
+    }
+    return [toInstallDestination(createWorkBuddyHostDefinition(explicitWorkBuddyHome))];
+  }
 
   if (explicitConfigPath && explicitExtensionsDir) {
     const hermes = isHermesDestination(explicitConfigPath, explicitExtensionsDir);
@@ -399,7 +555,7 @@ async function resolveInstallDestinations(
   }
 
   if (explicitConfigPath || explicitExtensionsDir) {
-    throw new Error("pass --config-path and --extensions-dir together, or omit both to auto-detect Claw");
+    throw new Error("pass --config-path and --extensions-dir together, or omit both to auto-detect compatible agents");
   }
 
   const detected = detectInstallHosts(options.hostDefinitions ?? getDefaultHostDefinitions());
@@ -415,8 +571,9 @@ async function resolveInstallDestinations(
   }
   throw new Error(
     [
-      "could not auto-detect an installed Claw host.",
-      "Pass --config-path and --extensions-dir to install into a specific Claw.",
+      "could not auto-detect an installed compatible agent.",
+      "Pass --config-path and --extensions-dir to install into a specific Claw-style host.",
+      "Pass --workbuddy-home to install into a specific WorkBuddy home.",
       "",
       "Supported default locations:",
       ...formatHostList(options.hostDefinitions ?? getDefaultHostDefinitions())
@@ -429,6 +586,7 @@ function getDefaultHostDefinitions(): HostDefinition[] {
   const qclawHome = resolve(home, ".qclaw");
   const openClawHome = resolve(home, ".openclaw");
   const hermesHome = resolve(home, ".hermes");
+  const workbuddyHome = resolve(home, ".workbuddy");
   return [
     {
       id: "qclaw",
@@ -448,8 +606,20 @@ function getDefaultHostDefinitions(): HostDefinition[] {
       configPath: join(hermesHome, "config.yaml"),
       extensionsDir: resolve(hermesHome, "plugins", "platforms"),
       installKind: "hermes"
-    }
+    },
+    createWorkBuddyHostDefinition(workbuddyHome)
   ];
+}
+
+function createWorkBuddyHostDefinition(workbuddyHome: string): HostDefinition {
+  return {
+    id: "workbuddy",
+    label: "WorkBuddy",
+    configPath: join(workbuddyHome, "settings.json"),
+    extensionsDir: join(workbuddyHome, "plugins", "marketplaces", WORKBUDDY_MARKETPLACE_ID, "plugins"),
+    installKind: "workbuddy",
+    workbuddyHome
+  };
 }
 
 function detectInstallHosts(hosts: HostDefinition[]): HostDefinition[] {
@@ -489,7 +659,7 @@ async function promptForInstallHost(
     ];
 
     return await select<HostDefinition>({
-      message: "Choose the Claw installation to connect with this 53AIHub agent:",
+      message: "Choose the local agent to connect with this 53AIHub agent:",
       choices,
       pageSize: Math.min(Math.max(choices.length, 5), 12),
       loop: true
@@ -497,8 +667,8 @@ async function promptForInstallHost(
   } catch (error) {
     throw new Error(
       [
-        "multiple Claw installations were detected, but no interactive terminal was available.",
-        "Run the installer again in an interactive terminal, or pass --config-path and --extensions-dir.",
+        "multiple compatible agents were detected, but no interactive terminal was available.",
+        "Run the installer again in an interactive terminal, pass --config-path and --extensions-dir, or pass --workbuddy-home.",
         "",
         "Detected locations:",
         ...formatHostList(hosts),
@@ -513,14 +683,15 @@ function toInstallDestination(host: HostDefinition): InstallDestination {
     configPath: resolve(host.configPath),
     extensionsDir: resolve(host.extensionsDir),
     label: host.label,
-    installKind: host.installKind ?? "openclaw"
+    installKind: host.installKind ?? "openclaw",
+    workbuddyHome: host.workbuddyHome ? resolve(host.workbuddyHome) : undefined
   };
 }
 
 function validateSingleSelectedHost(selected: HostDefinition | HostDefinition[], compatible: HostDefinition[]): HostDefinition {
   if (Array.isArray(selected)) {
     if (selected.length !== 1) {
-      throw new Error("select exactly one Claw host for this 53AIHub agent");
+      throw new Error("select exactly one compatible agent for this 53AIHub agent");
     }
     return validateSingleSelectedHost(selected[0]!, compatible);
   }
@@ -549,7 +720,7 @@ function parseArgs(argv: string[]): ParsedArgs {
     }
     const key = entry.slice(2);
     if (key === "target") {
-      throw new Error("--target has been removed; omit it to auto-detect Claw or pass --config-path and --extensions-dir");
+      throw new Error("--target has been removed; omit it to auto-detect compatible agents or pass explicit path options");
     }
     if (!SUPPORTED_ARGS.has(key)) {
       throw new Error(`unknown option: --${key}`);
@@ -591,6 +762,187 @@ async function sanitizeExtensionPackageJson(destination: string): Promise<void> 
   delete packageJson.dependencies;
   delete packageJson.optionalDependencies;
   await writeFile(packageJsonPath, `${JSON.stringify(packageJson, null, 2)}\n`);
+}
+
+async function updateWorkBuddyMcpConfig(
+  mcpPath: string,
+  values: {
+    botId: string;
+    secret: string;
+    wsUrl: string;
+    supervisorEntryPath: string;
+    channelEntryPath: string;
+    workbuddyHome: string;
+    workspaceDir: string;
+    sessionId: string;
+    historyScope: string;
+  }
+): Promise<void> {
+  if (!existsSync(mcpPath)) {
+    throw new Error(`WorkBuddy MCP config does not exist: ${mcpPath}`);
+  }
+  const config = JSON.parse(await readFile(mcpPath, "utf8")) as Record<string, any>;
+  const servers =
+    config.mcpServers && typeof config.mcpServers === "object" && !Array.isArray(config.mcpServers)
+      ? config.mcpServers
+      : (config.mcpServers = {});
+  const server =
+    servers["53aihub-channel"] &&
+    typeof servers["53aihub-channel"] === "object" &&
+    !Array.isArray(servers["53aihub-channel"])
+      ? servers["53aihub-channel"]
+      : (servers["53aihub-channel"] = {});
+  const env = server.env && typeof server.env === "object" && !Array.isArray(server.env) ? server.env : (server.env = {});
+  server.command = typeof server.command === "string" && server.command.trim() ? server.command : "node";
+  server.args = [values.supervisorEntryPath];
+  env.HUB53AI_WS_URL = values.wsUrl;
+  env.HUB53AI_BOT_ID = values.botId;
+  env.HUB53AI_SECRET = values.secret;
+  env.HUB53AI_ACCESS_POLICY = typeof env.HUB53AI_ACCESS_POLICY === "string" ? env.HUB53AI_ACCESS_POLICY : "open";
+  env.HUB53AI_ALLOW_FROM = typeof env.HUB53AI_ALLOW_FROM === "string" ? env.HUB53AI_ALLOW_FROM : "";
+  env.HUB53AI_SEND_THINKING_MESSAGE =
+    typeof env.HUB53AI_SEND_THINKING_MESSAGE === "string" ? env.HUB53AI_SEND_THINKING_MESSAGE : "true";
+  env.HUB53AI_CHANNEL_ENTRY_PATH = values.channelEntryPath;
+  env.HUB53AI_WORKBUDDY_HOME = values.workbuddyHome;
+  env.HUB53AI_WORKBUDDY_WORKSPACE = values.workspaceDir;
+  env.HUB53AI_WORKBUDDY_HISTORY_SCOPE = values.historyScope;
+  env.HUB53AI_WORKBUDDY_SESSION_ID = values.sessionId;
+  await writeFile(mcpPath, `${JSON.stringify(config, null, 2)}\n`);
+}
+
+async function updateWorkBuddyMarketplace(marketplaceRoot: string): Promise<string> {
+  const marketplaceDir = join(marketplaceRoot, ".codebuddy-plugin");
+  const marketplacePath = join(marketplaceDir, "marketplace.json");
+  await mkdir(marketplaceDir, { recursive: true });
+  const manifest = await readWorkBuddyMarketplaceManifest(marketplacePath);
+  const plugins = Array.isArray(manifest.plugins) ? manifest.plugins : [];
+  manifest.name = typeof manifest.name === "string" && manifest.name.trim() ? manifest.name : WORKBUDDY_MARKETPLACE_ID;
+  manifest.description =
+    typeof manifest.description === "string" && manifest.description.trim()
+      ? manifest.description
+      : "Local WorkBuddy plugins";
+  manifest.owner =
+    manifest.owner && typeof manifest.owner === "object" && !Array.isArray(manifest.owner)
+      ? manifest.owner
+      : { name: "Local" };
+  manifest.plugins = [
+    ...plugins.filter((plugin) => !(plugin && typeof plugin === "object" && (plugin as any).name === WORKBUDDY_PLUGIN_ID)),
+    {
+      name: WORKBUDDY_PLUGIN_ID,
+      description: "53AIHub Channel plugin for WorkBuddy and CodeBuddy.",
+      version: "0.1.13",
+      source: `./plugins/${WORKBUDDY_PLUGIN_ID}`,
+      category: "productivity",
+      author: {
+        name: "53AI"
+      },
+      homepage: "https://www.53ai.com",
+      license: "MIT"
+    }
+  ];
+  await writeFile(marketplacePath, `${JSON.stringify(manifest, null, 2)}\n`);
+  return marketplacePath;
+}
+
+async function updateWorkBuddyKnownMarketplaces(workbuddyHome: string, marketplaceRoot: string): Promise<string> {
+  const knownPath = join(workbuddyHome, "plugins", "known_marketplaces.json");
+  await mkdir(dirname(knownPath), { recursive: true });
+  const known = await readJsonObject(knownPath);
+  known[WORKBUDDY_MARKETPLACE_ID] = {
+    type: "directory",
+    source: {
+      source: "directory",
+      path: marketplaceRoot
+    },
+    installLocation: marketplaceRoot,
+    isBuiltIn: false,
+    autoUpdate: false,
+    description: "Local WorkBuddy plugins",
+    lastUpdated: new Date().toISOString()
+  };
+  await writeFile(knownPath, `${JSON.stringify(known, null, 2)}\n`);
+  return knownPath;
+}
+
+async function updateWorkBuddyEnabledPlugins(workbuddyHome: string): Promise<string> {
+  const settingsPath = join(workbuddyHome, "settings.json");
+  await mkdir(dirname(settingsPath), { recursive: true });
+  const settings = await readJsonObject(settingsPath);
+  const enabledPlugins =
+    settings.enabledPlugins && typeof settings.enabledPlugins === "object" && !Array.isArray(settings.enabledPlugins)
+      ? settings.enabledPlugins
+      : (settings.enabledPlugins = {});
+  enabledPlugins[`${WORKBUDDY_PLUGIN_ID}@${WORKBUDDY_MARKETPLACE_ID}`] = true;
+  settings.channelsEnabled = true;
+  await writeFile(settingsPath, `${JSON.stringify(settings, null, 2)}\n`);
+  return settingsPath;
+}
+
+async function cleanupOrphanedWorkBuddyChannelProcesses(targets: string[]): Promise<void> {
+  if (process.platform === "win32") {
+    return;
+  }
+
+  let stdout = "";
+  try {
+    const result = await execFileAsync("/bin/ps", ["-axo", "pid=,ppid=,command="], {
+      maxBuffer: 1024 * 1024
+    });
+    stdout = String(result.stdout);
+  } catch {
+    return;
+  }
+
+  const orphanPids = stdout
+    .split("\n")
+    .map((line) => {
+      const match = line.trim().match(/^(\d+)\s+(\d+)\s+(.+)$/);
+      if (!match) {
+        return undefined;
+      }
+      const [, pid, _ppid, command] = match;
+      const matchesTarget = targets.some((target) => {
+        if (!target) {
+          return false;
+        }
+        if (target.startsWith("--session-id")) {
+          return /(?:^|\/)codebuddy\s+--serve\b/.test(command) && command.includes(target);
+        }
+        return command.includes(target);
+      });
+      const isRelevantRuntime = /\bnode\b/.test(command) || /\bcodebuddy\b/.test(command);
+      if (pid === String(process.pid) || !matchesTarget || !isRelevantRuntime) {
+        return undefined;
+      }
+      return pid;
+    })
+    .filter((pid): pid is string => Boolean(pid));
+
+  await Promise.all(
+    orphanPids.map(async (pid) => {
+      try {
+        await execFileAsync("/bin/kill", [pid]);
+      } catch {
+        // The process may have exited between ps and kill.
+      }
+    })
+  );
+}
+
+async function readWorkBuddyMarketplaceManifest(marketplacePath: string): Promise<Record<string, any>> {
+  return readJsonObject(marketplacePath);
+}
+
+async function readJsonObject(path: string): Promise<Record<string, any>> {
+  if (!existsSync(path)) {
+    return {};
+  }
+  try {
+    const parsed = JSON.parse(await readFile(path, "utf8"));
+    return parsed && typeof parsed === "object" && !Array.isArray(parsed) ? parsed as Record<string, any> : {};
+  } catch {
+    return {};
+  }
 }
 
 async function copyHermesPlatformPackage(packageRoot: string, destination: string) {
@@ -738,15 +1090,12 @@ function inferGatewaySettings(config: OpenClawConfig): { baseUrl: string; secret
   return { baseUrl, secret };
 }
 
-function inferHub53AISettings(config: OpenClawConfig): {
-  enabled: boolean;
-  botId: string;
-  secret: string;
-  wsUrl: string;
-  accessPolicy?: string;
-  allowFrom?: string[];
-  sendThinkingMessage?: boolean;
-} {
+function inferHub53AISettings(config: OpenClawConfig): Hub53AIInstallSettings {
+  const pluginHub = readPluginHub53AISettings(config);
+  if (pluginHub) {
+    return pluginHub;
+  }
+
   const legacy = config.channels?.["53aihub"];
   if (!legacy) {
     return {
@@ -778,6 +1127,41 @@ function inferHub53AISettings(config: OpenClawConfig): {
       : undefined,
     sendThinkingMessage:
       typeof legacy.sendThinkingMessage === "boolean" ? legacy.sendThinkingMessage : undefined
+  };
+}
+
+function readPluginHub53AISettings(config: OpenClawConfig): Hub53AIInstallSettings | undefined {
+  const entry = config.plugins?.entries?.[PLUGIN_ID];
+  if (!entry || typeof entry !== "object" || Array.isArray(entry)) {
+    return undefined;
+  }
+  const entryConfig = (entry as Record<string, unknown>).config;
+  if (!entryConfig || typeof entryConfig !== "object" || Array.isArray(entryConfig)) {
+    return undefined;
+  }
+  const hub = (entryConfig as Record<string, unknown>).hub53ai;
+  if (!hub || typeof hub !== "object" || Array.isArray(hub)) {
+    return undefined;
+  }
+  const record = hub as Record<string, unknown>;
+  return {
+    enabled: record.enabled !== false,
+    botId: typeof record.botId === "string" ? record.botId : "",
+    secret: typeof record.secret === "string" ? record.secret : "",
+    wsUrl:
+      typeof record.wsUrl === "string"
+        ? record.wsUrl
+        : typeof record.WSUrl === "string"
+          ? record.WSUrl
+          : typeof record.websocketUrl === "string"
+            ? record.websocketUrl
+            : "",
+    accessPolicy: typeof record.accessPolicy === "string" ? record.accessPolicy : undefined,
+    allowFrom: Array.isArray(record.allowFrom)
+      ? record.allowFrom.map((entry) => String(entry)).filter(Boolean)
+      : undefined,
+    sendThinkingMessage:
+      typeof record.sendThinkingMessage === "boolean" ? record.sendThinkingMessage : undefined
   };
 }
 

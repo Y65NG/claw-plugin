@@ -10,6 +10,14 @@ import type {
   GatewayRuntimeInfo,
   GatewaySession
 } from "./gateway-client";
+import {
+  collectReferencedLocalOutputFiles,
+  collectCreatedLocalOutputFiles,
+  collectRecentReferencedLocalOutputFiles,
+  extractReferencedLocalOutputPaths,
+  snapshotLocalOutputFiles,
+  type LocalOutputFileSnapshot
+} from "./local-output-files";
 import type { SessionMessage, SessionStatus, TimelineEvent } from "./models";
 
 export type Hub53AIConfig = {
@@ -22,6 +30,11 @@ export type Hub53AIConfig = {
   sendThinkingMessage: boolean;
   reconnectBaseMs: number;
   maxReconnectAttempts: number;
+  detectCreatedFiles?: boolean;
+  fileWorkspaceDirs?: string[];
+  createdFilesMaxFileBytes?: number;
+  createdFilesMaxCount?: number;
+  createdFilesExclude?: string[];
 };
 
 export type Hub53AIStatusSnapshot = {
@@ -84,6 +97,76 @@ export type Hub53AIOutgoingChunk = {
   };
 };
 
+export type Hub53AIOutputFile = {
+  id: string;
+  file_name: string;
+  url?: string;
+  download_url?: string;
+  signed_download_url?: string;
+  mime_type?: string;
+  size?: number;
+  base64?: string;
+  content?: string;
+  message_id?: string;
+  source_kind?: string;
+};
+
+type OpenClawTimelineV2SegmentType =
+  | "answer"
+  | "thinking"
+  | "tool_call"
+  | "tool_result"
+  | "run"
+  | "output_files";
+
+type OpenClawTimelineV2Operation = "append" | "replace" | "close";
+type OpenClawTimelineV2Visibility = "hidden" | "stream" | "final";
+
+type OpenClawTimelineV2Meta = {
+  protocol_version: "openclaw.timeline.v2";
+  turn_id: string;
+  segment_id: string;
+  segment_type: OpenClawTimelineV2SegmentType;
+  segment_index: number;
+  delta_index: number;
+  operation: OpenClawTimelineV2Operation;
+  visibility: OpenClawTimelineV2Visibility;
+  final: boolean;
+};
+
+export type Hub53AIMediaAttachment = Hub53AIOutputFile & {
+  kind: "image" | "audio" | "video" | "text" | "file";
+};
+
+export type Hub53AIOutgoingProcessStep = {
+  req_id: string;
+  action: "chat";
+  status: "streaming";
+  data: {
+    id: string;
+    object: "process.step";
+    created: number;
+    model: "openclaw-agent";
+    status: "streaming";
+    session_id?: string;
+    conversation_id?: string;
+    process_step: {
+      step_code: "output_files";
+      name: string;
+      status: "completed";
+      message: string;
+      data: {
+        files: Hub53AIOutputFile[];
+        contract_version: "v1";
+        openclaw_timeline?: OpenClawTimelineV2Meta;
+        media_attachments: Hub53AIMediaAttachment[];
+        media_contract_version: "v1";
+      };
+      timestamp: number;
+    };
+  };
+};
+
 export type Hub53AIOutgoingRPCFrame = {
   req_id: string;
   action: string;
@@ -91,11 +174,12 @@ export type Hub53AIOutgoingRPCFrame = {
   data: unknown;
 };
 
-export type Hub53AIOutgoingFrame = Hub53AIOutgoingChunk | Hub53AIOutgoingRPCFrame;
+export type Hub53AIQueuedFrame = Hub53AIOutgoingChunk | Hub53AIOutgoingProcessStep;
+export type Hub53AIOutgoingFrame = Hub53AIQueuedFrame | Hub53AIOutgoingRPCFrame;
 
 type StoredHubState = {
   mappings: Record<string, string>;
-  outbox: Hub53AIOutgoingChunk[];
+  outbox: Hub53AIQueuedFrame[];
 };
 
 type HubBridgeCallbacks = {
@@ -112,6 +196,7 @@ type HubBridgeCallbacks = {
 
 type HubBridgeInput = {
   stateDir: string;
+  configPath?: string;
   config: Hub53AIConfig;
   gateway: GatewayClient;
   rpcContext?: {
@@ -181,6 +266,7 @@ export function createHub53AIBridge(input: HubBridgeInput) {
   let sentMessageCount = 0;
   const chatQueues = new Map<string, Promise<void>>();
   const lastReplyByReq = new Map<string, string>();
+  const activeReqIdsBySession = new Map<string, Set<string>>();
   let bridgeEventCounter = 0;
 
   async function start() {
@@ -431,7 +517,12 @@ export function createHub53AIBridge(input: HubBridgeInput) {
       if (action !== "stop") {
         throw new HubRPCError("PARAM_ERROR", "unsupported sessions.control action");
       }
-      await input.gateway.controlSession(sessionId, "stop");
+      void input.gateway.controlSession(sessionId, "stop").catch((error) => {
+        input.logger?.warn?.(
+          `[53aihub] failed to stop session ${sessionId}: ${error instanceof Error ? error.message : String(error)}`
+        );
+      });
+      resolveActiveSessionRequests(sessionId);
       return {
         ok: true,
         action,
@@ -654,6 +745,7 @@ export function createHub53AIBridge(input: HubBridgeInput) {
     try {
       const session = await resolveSession(message);
       sessionId = session.id;
+      trackActiveSessionRequest(sessionId, message.reqId);
       await input.callbacks.onEnsureSessionStream(session.id);
       await input.callbacks.onUserMessage({
         id: `hub53ai-user-${message.msgId}`,
@@ -676,7 +768,19 @@ export function createHub53AIBridge(input: HubBridgeInput) {
 
       const eventScope: GatewayEventScope = {
         eventBoundaryMs: Date.now(),
-        currentActivitySeen: false
+        turnId: buildOpenClawTimelineTurnId(session.id, message.reqId),
+        nextSegmentIndex: 0,
+        nextDeltaIndexBySegment: new Map<string, number>(),
+        segmentIndexById: new Map<string, number>(),
+        currentActivitySeen: false,
+        emittedOutputFileKeys: new Set<string>(),
+        referencedLocalOutputPaths: new Set<string>(),
+        localOutputSnapshot: await snapshotLocalOutputFiles({
+          config: input.config,
+          configPath: input.configPath,
+          stateDir: input.stateDir,
+          logger: input.logger
+        })
       };
       const terminalPromise = waitForTerminalEvent(message.reqId);
       close = input.gateway.subscribe(session.id, input.callbacks.getLastEventSeq(session.id), {
@@ -716,8 +820,35 @@ export function createHub53AIBridge(input: HubBridgeInput) {
       });
     } finally {
       close?.();
+      if (sessionId) {
+        untrackActiveSessionRequest(sessionId, message.reqId);
+      }
       clearTerminalResolver(message.reqId);
       lastReplyByReq.delete(message.reqId);
+    }
+  }
+
+  function trackActiveSessionRequest(sessionId: string, reqId: string) {
+    const reqIds = activeReqIdsBySession.get(sessionId) ?? new Set<string>();
+    reqIds.add(reqId);
+    activeReqIdsBySession.set(sessionId, reqIds);
+  }
+
+  function untrackActiveSessionRequest(sessionId: string, reqId: string) {
+    const reqIds = activeReqIdsBySession.get(sessionId);
+    if (!reqIds) {
+      return;
+    }
+    reqIds.delete(reqId);
+    if (!reqIds.size) {
+      activeReqIdsBySession.delete(sessionId);
+    }
+  }
+
+  function resolveActiveSessionRequests(sessionId: string) {
+    for (const reqId of activeReqIdsBySession.get(sessionId) ?? []) {
+      lastReplyByReq.delete(reqId);
+      resolveTerminalEvent(reqId);
     }
   }
 
@@ -760,7 +891,15 @@ export function createHub53AIBridge(input: HubBridgeInput) {
 
   type GatewayEventScope = {
     eventBoundaryMs: number;
+    turnId: string;
+    nextSegmentIndex: number;
+    nextDeltaIndexBySegment: Map<string, number>;
+    segmentIndexById: Map<string, number>;
     currentActivitySeen: boolean;
+    emittedOutputFileKeys: Set<string>;
+    localOutputSnapshot?: LocalOutputFileSnapshot;
+    referencedLocalOutputPaths: Set<string>;
+    localOutputFilesSent?: boolean;
   };
 
   async function handleGatewayEvent(
@@ -769,12 +908,24 @@ export function createHub53AIBridge(input: HubBridgeInput) {
     sessionId: string,
     eventScope: GatewayEventScope
   ) {
+    if (!(activeReqIdsBySession.get(sessionId)?.has(message.reqId) ?? true)) {
+      return;
+    }
     if (isReplayFromPreviousRun(event, eventScope)) {
       return;
     }
     if (isCurrentRunActivityEvent(event)) {
       eventScope.currentActivitySeen = true;
     }
+    for (const path of extractReferencedLocalOutputPaths(event.payload, eventScope.localOutputSnapshot, {
+      config: input.config,
+      configPath: input.configPath,
+      stateDir: input.stateDir,
+      logger: input.logger
+    })) {
+      eventScope.referencedLocalOutputPaths.add(path);
+    }
+    await sendOutputFilesForEvent(message.reqId, sessionId, event, eventScope);
 
     if (event.kind === "assistant.delta" || event.kind === "assistant.message") {
       const content = String(event.payload?.content ?? "");
@@ -788,8 +939,11 @@ export function createHub53AIBridge(input: HubBridgeInput) {
           mode: readStringMetadata(event.payload, "mode"),
           replace: readBooleanMetadata(event.payload, "replace"),
           eventKind: event.kind,
-          payload: event.payload
+          payload: augmentPayloadWithEventMeta(event, eventScope)
         });
+      }
+      if (event.kind === "assistant.message") {
+        await sendCreatedLocalOutputFiles(message.reqId, sessionId, eventScope);
       }
       return;
     }
@@ -805,7 +959,7 @@ export function createHub53AIBridge(input: HubBridgeInput) {
           mode: readStringMetadata(event.payload, "mode"),
           replace: readBooleanMetadata(event.payload, "replace"),
           eventKind: event.kind,
-          payload: event.payload
+          payload: augmentPayloadWithEventMeta(event, eventScope)
         });
       }
       return;
@@ -827,7 +981,7 @@ export function createHub53AIBridge(input: HubBridgeInput) {
           mode: "append",
           replace: false,
           eventKind: event.kind,
-          payload: event.payload
+          payload: augmentPayloadWithEventMeta(event, eventScope)
         });
       }
       return;
@@ -843,9 +997,11 @@ export function createHub53AIBridge(input: HubBridgeInput) {
           sessionId,
           mode: readStringMetadata(event.payload, "mode"),
           replace: readBooleanMetadata(event.payload, "replace"),
-          eventKind: event.kind
+          eventKind: event.kind,
+          payload: augmentPayloadWithEventMeta(event, eventScope)
         });
       }
+      await sendCreatedLocalOutputFiles(message.reqId, sessionId, eventScope);
       await sendReply({
         reqId: message.reqId,
         text: "",
@@ -1055,6 +1211,242 @@ export function createHub53AIBridge(input: HubBridgeInput) {
     }
   }
 
+  async function sendQueuedFrame(frame: Hub53AIQueuedFrame) {
+    if (!sendRaw(JSON.stringify(frame), true)) {
+      state.outbox.push(frame);
+      state.outbox = state.outbox.slice(-MAX_OUTBOX_FRAMES);
+      await persistState();
+    }
+  }
+
+  function augmentPayloadWithEventMeta(event: GatewayEvent, eventScope: GatewayEventScope) {
+    const timeline = buildOpenClawTimelineMeta(event, eventScope);
+    return {
+      ...(event.payload || {}),
+      ...(typeof event.seq === "number" ? { seq: event.seq, message_seq: event.seq } : {}),
+      turn_id: timeline.turn_id,
+      segment_id: timeline.segment_id,
+      segment_type: timeline.segment_type,
+      segment_index: timeline.segment_index,
+      delta_index: timeline.delta_index,
+      operation: timeline.operation,
+      visibility: timeline.visibility,
+      final: timeline.final,
+      openclaw_timeline: timeline
+    };
+  }
+
+  function buildOpenClawTimelineTurnId(sessionId: string, reqId: string) {
+    return `${sessionId || "openclaw"}:turn:${reqId || randomUUID()}`;
+  }
+
+  function buildOpenClawTimelineMeta(
+    event: GatewayEvent,
+    eventScope: GatewayEventScope
+  ): OpenClawTimelineV2Meta {
+    const payloadTimeline = toRecord(toRecord(event.payload).openclaw_timeline);
+    const payloadSegmentId = stringOr(payloadTimeline.segment_id, toRecord(event.payload).segment_id);
+    const payloadSegmentType = stringOr(payloadTimeline.segment_type, toRecord(event.payload).segment_type);
+    const segmentType = normalizeOpenClawSegmentType(payloadSegmentType) || getDefaultOpenClawSegmentType(event.kind);
+    const segmentId = payloadSegmentId || getDefaultOpenClawSegmentId(event, eventScope.turnId, segmentType);
+    const segmentIndex = getOpenClawSegmentIndex(segmentId, eventScope);
+    const deltaIndex = getNextOpenClawDeltaIndex(segmentId, eventScope);
+    const operation = getDefaultOpenClawOperation(event.kind);
+    const visibility = getDefaultOpenClawVisibility(event.kind);
+    return {
+      protocol_version: "openclaw.timeline.v2",
+      turn_id: stringOr(payloadTimeline.turn_id, toRecord(event.payload).turn_id, eventScope.turnId),
+      segment_id: segmentId,
+      segment_type: segmentType,
+      segment_index: segmentIndex,
+      delta_index: deltaIndex,
+      operation,
+      visibility,
+      final: visibility === "final"
+    };
+  }
+
+  function buildOpenClawOutputFilesTimelineMeta(
+    eventScope: GatewayEventScope,
+    files: Hub53AIOutputFile[]
+  ): OpenClawTimelineV2Meta {
+    const fileKey = files
+      .flatMap((file) => getOutputFileKeys(file))
+      .filter(Boolean)
+      .sort()
+      .join(",");
+    const segmentId = `${eventScope.turnId}:output_files:${fileKey || "generated"}`;
+    return {
+      protocol_version: "openclaw.timeline.v2",
+      turn_id: eventScope.turnId,
+      segment_id: segmentId,
+      segment_type: "output_files",
+      segment_index: getOpenClawSegmentIndex(segmentId, eventScope),
+      delta_index: getNextOpenClawDeltaIndex(segmentId, eventScope),
+      operation: "replace",
+      visibility: "final",
+      final: true
+    };
+  }
+
+  function normalizeOpenClawSegmentType(value: string): OpenClawTimelineV2SegmentType | undefined {
+    if (
+      value === "answer" ||
+      value === "thinking" ||
+      value === "tool_call" ||
+      value === "tool_result" ||
+      value === "run" ||
+      value === "output_files"
+    ) {
+      return value;
+    }
+    return undefined;
+  }
+
+  function getDefaultOpenClawSegmentType(kind: string): OpenClawTimelineV2SegmentType {
+    if (kind === "assistant.delta" || kind === "assistant.message") return "answer";
+    if (kind === "assistant.thinking") return "thinking";
+    if (kind === "tool.call") return "tool_call";
+    if (kind === "tool.result") return "tool_result";
+    return "run";
+  }
+
+  function getDefaultOpenClawSegmentId(
+    event: GatewayEvent,
+    turnId: string,
+    segmentType: OpenClawTimelineV2SegmentType
+  ) {
+    if (segmentType === "answer") {
+      return `${turnId}:answer:0`;
+    }
+    if (segmentType === "tool_call" || segmentType === "tool_result") {
+      const payload = toRecord(event.payload);
+      const data = toRecord(payload.data);
+      const toolIdentity = stringOr(payload.call_id, payload.tool_call_id, data.call_id, data.id, data.name, payload.name);
+      return `${turnId}:${segmentType}:${toolIdentity || event.seq || event.id || randomUUID()}`;
+    }
+    return `${turnId}:${segmentType}:${event.seq ?? event.id ?? randomUUID()}`;
+  }
+
+  function getDefaultOpenClawOperation(kind: string): OpenClawTimelineV2Operation {
+    if (kind === "assistant.delta") return "append";
+    if (kind === "run.completed" || kind === "run.failed" || kind === "run.interrupted") return "close";
+    return "replace";
+  }
+
+  function getDefaultOpenClawVisibility(kind: string): OpenClawTimelineV2Visibility {
+    if (kind === "assistant.delta") return "hidden";
+    return "final";
+  }
+
+  function getOpenClawSegmentIndex(segmentId: string, eventScope: GatewayEventScope) {
+    const existing = eventScope.segmentIndexById.get(segmentId);
+    if (typeof existing === "number") {
+      return existing;
+    }
+    const next = eventScope.nextSegmentIndex;
+    eventScope.segmentIndexById.set(segmentId, next);
+    eventScope.nextSegmentIndex += 1;
+    return next;
+  }
+
+  function getNextOpenClawDeltaIndex(segmentId: string, eventScope: GatewayEventScope) {
+    const next = eventScope.nextDeltaIndexBySegment.get(segmentId) ?? 0;
+    eventScope.nextDeltaIndexBySegment.set(segmentId, next + 1);
+    return next;
+  }
+
+  async function sendOutputFilesForEvent(
+    reqId: string,
+    sessionId: string,
+    event: GatewayEvent,
+    eventScope: GatewayEventScope
+  ) {
+    const files = extractOutputFilesFromPayload(event.payload);
+    await sendOutputFiles(reqId, sessionId, files, eventScope);
+  }
+
+  async function sendCreatedLocalOutputFiles(
+    reqId: string,
+    sessionId: string,
+    eventScope: GatewayEventScope
+  ) {
+    if (eventScope.localOutputFilesSent) {
+      return;
+    }
+    const files = await collectCreatedLocalOutputFiles(eventScope.localOutputSnapshot, {
+      config: input.config,
+      configPath: input.configPath,
+      stateDir: input.stateDir,
+      logger: input.logger
+    });
+    const referencedFiles = await collectReferencedLocalOutputFiles(
+      eventScope.referencedLocalOutputPaths,
+      eventScope.localOutputSnapshot,
+      {
+        config: input.config,
+        configPath: input.configPath,
+        stateDir: input.stateDir,
+        logger: input.logger
+      }
+    );
+    const recentReferencedFiles = await collectRecentReferencedLocalOutputFiles(
+      eventScope.referencedLocalOutputPaths,
+      {
+        config: input.config,
+        configPath: input.configPath,
+        stateDir: input.stateDir,
+        logger: input.logger
+      },
+      eventScope.eventBoundaryMs
+    );
+    const outputFiles = [...files, ...referencedFiles, ...recentReferencedFiles];
+    input.logger?.info?.(
+      `[53aihub] local output scan: changed=${files.length}, referenced=${referencedFiles.length}, recentReferenced=${recentReferencedFiles.length}, refs=${eventScope.referencedLocalOutputPaths.size}, files=${
+        outputFiles.map((file) => file.file_name).join(",") || "none"
+      }`
+    );
+    const sent = await sendOutputFiles(reqId, sessionId, outputFiles, eventScope);
+    if (sent) {
+      eventScope.localOutputFilesSent = true;
+    }
+  }
+
+  async function sendOutputFiles(
+    reqId: string,
+    sessionId: string,
+    files: Hub53AIOutputFile[],
+    eventScope: GatewayEventScope
+  ): Promise<boolean> {
+    if (files.length === 0) {
+      return false;
+    }
+
+    const freshFiles = files.filter((file) => {
+      const keys = getOutputFileKeys(file);
+      if (keys.some((key) => eventScope.emittedOutputFileKeys.has(key))) {
+        return false;
+      }
+      for (const key of keys) {
+        eventScope.emittedOutputFileKeys.add(key);
+      }
+      return true;
+    });
+    if (freshFiles.length === 0) {
+      return false;
+    }
+
+    await sendQueuedFrame(
+      buildOutputFilesProcessStep(
+        reqId,
+        freshFiles,
+        sessionId,
+        buildOpenClawOutputFilesTimelineMeta(eventScope, freshFiles)
+      )
+    );
+    return true;
+  }
+
   function sendRaw(payload: string, countMessage = false): boolean {
     if (!socket || socket.readyState !== WebSocket.OPEN) {
       return false;
@@ -1126,6 +1518,7 @@ export function createHub53AIBridge(input: HubBridgeInput) {
   }
 
   async function persistState() {
+    await mkdir(dirname(statePath), { recursive: true });
     await writeFile(statePath, `${JSON.stringify(state, null, 2)}\n`);
   }
 
@@ -1555,6 +1948,223 @@ function buildOutgoingChunk(
       ...(error ? { error } : {})
     }
   };
+}
+
+function buildOutputFilesProcessStep(
+  reqId: string,
+  files: Hub53AIOutputFile[],
+  sessionId?: string,
+  timeline?: OpenClawTimelineV2Meta
+): Hub53AIOutgoingProcessStep {
+  const mediaAttachments = files.map((file) => ({
+    ...file,
+    kind: resolveMediaKind(file.mime_type, file.file_name)
+  }));
+  return {
+    req_id: reqId,
+    action: "chat",
+    status: "streaming",
+    data: {
+      id: `${reqId}-output-files-${Date.now()}`,
+      object: "process.step",
+      created: Math.floor(Date.now() / 1000),
+      model: "openclaw-agent",
+      status: "streaming",
+      ...(sessionId ? { session_id: sessionId, conversation_id: sessionId } : {}),
+      process_step: {
+        step_code: "output_files",
+        name: "生成文件",
+        status: "completed",
+        message: `生成了 ${files.length} 个文件`,
+        data: {
+          files,
+          contract_version: "v1",
+          ...(timeline ? { openclaw_timeline: timeline } : {}),
+          media_attachments: mediaAttachments,
+          media_contract_version: "v1"
+        },
+        timestamp: Math.floor(Date.now() / 1000)
+      }
+    }
+  };
+}
+
+function extractOutputFilesFromPayload(payload: unknown): Hub53AIOutputFile[] {
+  const candidates = collectOutputFileCandidates(payload);
+  const seen = new Set<string>();
+  const files: Hub53AIOutputFile[] = [];
+  for (const candidate of candidates) {
+    const file = normalizeOutputFile(candidate);
+    if (!file) {
+      continue;
+    }
+    const key = getOutputFileKeys(file)[0] ?? "";
+    if (seen.has(key)) {
+      continue;
+    }
+    seen.add(key);
+    files.push(file);
+  }
+  return files;
+}
+
+function collectOutputFileCandidates(value: unknown, depth = 0): unknown[] {
+  if (value == null || depth > 4) {
+    return [];
+  }
+  if (Array.isArray(value)) {
+    return value.flatMap((entry) => collectOutputFileCandidates(entry, depth + 1));
+  }
+  if (typeof value !== "object") {
+    return [];
+  }
+
+  const record = value as Record<string, unknown>;
+  if (looksLikeOutputFile(record)) {
+    return [record];
+  }
+
+  const candidates: unknown[] = [];
+  for (const key of [
+    "output_files",
+    "outputFiles",
+    "files",
+    "file",
+    "attachments",
+    "attachment",
+    "artifacts",
+    "artifact",
+    "media",
+    "media_attachments",
+    "generated_files",
+    "generatedFiles"
+  ]) {
+    const nested = record[key];
+    if (nested == null) {
+      continue;
+    }
+    if (Array.isArray(nested)) {
+      candidates.push(...nested);
+    } else {
+      candidates.push(nested);
+    }
+  }
+
+  for (const key of ["data", "result", "payload", "message", "content", "output"]) {
+    candidates.push(...collectOutputFileCandidates(record[key], depth + 1));
+  }
+
+  return candidates;
+}
+
+function looksLikeOutputFile(record: Record<string, unknown>): boolean {
+  const url = readFirstString(record, ["url", "href", "download_url", "downloadUrl", "file_url", "fileUrl", "signed_url"]);
+  const base64 = readFirstString(record, ["base64"]);
+  const content = readFirstString(record, ["content", "data"]);
+  const explicitFileName = readFirstString(record, ["file_name", "fileName", "filename", "path", "title"]);
+  const displayName = explicitFileName || readFirstString(record, ["name"]);
+  const type = readFirstString(record, ["type", "kind", "mime_type", "mimeType", "mime"]);
+  const fileLikeType = ["file", "image", "audio", "video", "attachment", "artifact", "media"].includes(type) || type.includes("/");
+  if (url || base64) {
+    return Boolean(displayName || fileLikeType);
+  }
+  return Boolean(content && (explicitFileName || fileLikeType));
+}
+
+function normalizeOutputFile(value: unknown): Hub53AIOutputFile | null {
+  if (!value || typeof value !== "object") {
+    return null;
+  }
+  const record = value as Record<string, unknown>;
+  const url = readFirstString(record, ["url", "href", "download_url", "downloadUrl", "file_url", "fileUrl", "signed_url"]);
+  const base64 = readFirstString(record, ["base64"]);
+  const content = readFirstString(record, ["content", "data"]);
+  if (!url && !base64 && !content) {
+    return null;
+  }
+
+  const fileName =
+    readFirstString(record, ["file_name", "fileName", "filename", "name", "path", "title"]) ||
+    inferFileNameFromUrl(url) ||
+    "file";
+  const id = readFirstString(record, ["id", "file_id", "fileId", "upload_file_id", "uploadFileId"]) || url || fileName;
+  const mimeType = readFirstString(record, ["mime_type", "mimeType", "mime", "content_type", "contentType"]);
+  const size = readFirstNumber(record, ["size", "file_size", "fileSize", "bytes"]);
+  return {
+    id,
+    file_name: fileName,
+    ...(url ? { url } : {}),
+    ...(readFirstString(record, ["download_url", "downloadUrl"]) ? { download_url: readFirstString(record, ["download_url", "downloadUrl"]) } : {}),
+    ...(readFirstString(record, ["signed_download_url", "signedDownloadUrl"]) ? { signed_download_url: readFirstString(record, ["signed_download_url", "signedDownloadUrl"]) } : {}),
+    ...(mimeType ? { mime_type: mimeType } : {}),
+    ...(typeof size === "number" ? { size } : {}),
+    ...(base64 ? { base64 } : {}),
+    ...(content && !base64 ? { content } : {}),
+    ...(readFirstString(record, ["message_id", "messageId"]) ? { message_id: readFirstString(record, ["message_id", "messageId"]) } : {}),
+    ...(readFirstString(record, ["source_kind", "sourceKind"]) ? { source_kind: readFirstString(record, ["source_kind", "sourceKind"]) } : {})
+  };
+}
+
+function getOutputFileKeys(file: Hub53AIOutputFile): string[] {
+  return [
+    file.id ? `id:${file.id}` : "",
+    file.url || file.file_name ? `url-name:${file.url ?? ""}|${file.file_name}` : "",
+    file.file_name ? `name:${file.file_name}` : ""
+  ].filter(Boolean);
+}
+
+function readFirstString(record: Record<string, unknown>, keys: string[]): string {
+  for (const key of keys) {
+    const value = record[key];
+    if (typeof value === "string" && value.trim()) {
+      return value.trim();
+    }
+  }
+  return "";
+}
+
+function readFirstNumber(record: Record<string, unknown>, keys: string[]): number | undefined {
+  for (const key of keys) {
+    const value = record[key];
+    if (typeof value === "number" && Number.isFinite(value)) {
+      return value;
+    }
+    if (typeof value === "string" && value.trim()) {
+      const parsed = Number(value);
+      if (Number.isFinite(parsed)) {
+        return parsed;
+      }
+    }
+  }
+  return undefined;
+}
+
+function inferFileNameFromUrl(url?: string): string {
+  if (!url) {
+    return "";
+  }
+  try {
+    const parsed = new URL(url);
+    const last = parsed.pathname.split("/").filter(Boolean).at(-1);
+    return last ? decodeURIComponent(last) : "";
+  } catch {
+    const last = url.split("?")[0]?.split("/").filter(Boolean).at(-1);
+    return last ? decodeURIComponent(last) : "";
+  }
+}
+
+function resolveMediaKind(mimeType = "", fileName = ""): Hub53AIMediaAttachment["kind"] {
+  const lower = mimeType.toLowerCase();
+  if (lower.startsWith("image/")) return "image";
+  if (lower.startsWith("audio/")) return "audio";
+  if (lower.startsWith("video/")) return "video";
+  if (lower.startsWith("text/")) return "text";
+  const ext = fileName.split(".").pop()?.toLowerCase() ?? "";
+  if (["png", "jpg", "jpeg", "gif", "webp", "svg"].includes(ext)) return "image";
+  if (["mp3", "wav", "m4a", "ogg"].includes(ext)) return "audio";
+  if (["mp4", "mov", "webm"].includes(ext)) return "video";
+  if (["txt", "md", "csv", "json", "log"].includes(ext)) return "text";
+  return "file";
 }
 
 function readStringMetadata(payload: unknown, key: string): string | undefined {

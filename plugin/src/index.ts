@@ -66,7 +66,39 @@ export {
 } from "./53aihub-client";
 export { createConsoleServer } from "./console-server";
 export { createGatewayClient } from "./gateway-client";
-export { installIntoOpenClaw, installIntoQClaw, runInstallCommand } from "./install-qclaw";
+export { installIntoOpenClaw, installIntoQClaw, installIntoWorkBuddy, runInstallCommand } from "./install-qclaw";
+export {
+  createCodeBuddyChannelBridge,
+  loadCodeBuddyChannelConfig,
+  startCodeBuddyChannelServer,
+  type CodeBuddyChannelNotification,
+  type Hub53AIChannelConfig,
+  type Hub53AIChannelStatusSnapshot
+} from "./codebuddy-channel";
+export {
+  buildWorkBuddyWorkerCommand,
+  buildWorkBuddyWorkerMcpConfig,
+  createWorkBuddySupervisor,
+  loadWorkBuddySupervisorConfig,
+  resolveWorkBuddyWorkerMcpConfigPath,
+  startWorkBuddySupervisorServer,
+  writeWorkBuddyWorkerMcpConfig,
+  type WorkBuddySupervisorConfig
+} from "./workbuddy-supervisor";
+export {
+  loadWorkBuddyHistory,
+  type WorkBuddyHistoryMessage,
+  type WorkBuddyHistorySession,
+  type WorkBuddyHistorySnapshot
+} from "./workbuddy-history";
+export {
+  buildHub53AIOutgoingChunk,
+  buildHub53AIPrompt,
+  checkHub53AIAccessPolicy,
+  createHub53AIAuthHeaders,
+  parseIncomingMessage as parseHub53AIProtocolIncomingMessage,
+  type Hub53AIBaseConfig
+} from "./53aihub-protocol";
 
 function resolveConfigPath(ctx: { stateDir: string }): string {
   const candidates = [

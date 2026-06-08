@@ -10,6 +10,8 @@
   "files": [
     "dist",
     "openclaw.plugin.json",
+    ".codebuddy-plugin",
+    ".mcp.json",
     "bin",
     "web-dist",
     "hermes"
@@ -28,6 +30,7 @@
   },
   "devDependencies": {
     "@inquirer/prompts": "^8.5.2",
+    "@modelcontextprotocol/sdk": "^1.29.0",
     "@types/node": "^24.10.1",
     "@types/ws": "^8.18.1",
     "openclaw": "2026.5.18",

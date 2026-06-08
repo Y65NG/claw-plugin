@@ -24,6 +24,11 @@ export type PluginConfig = {
     sendThinkingMessage?: boolean;
     reconnectBaseMs?: number;
     maxReconnectAttempts?: number;
+    detectCreatedFiles?: boolean;
+    fileWorkspaceDirs?: string[];
+    createdFilesMaxFileBytes?: number;
+    createdFilesMaxCount?: number;
+    createdFilesExclude?: string[];
   };
   console?: {
     enabled?: boolean;
@@ -59,6 +64,11 @@ export type ResolvedPluginConfig = {
     sendThinkingMessage: boolean;
     reconnectBaseMs: number;
     maxReconnectAttempts: number;
+    detectCreatedFiles: boolean;
+    fileWorkspaceDirs: string[];
+    createdFilesMaxFileBytes: number;
+    createdFilesMaxCount: number;
+    createdFilesExclude: string[];
   };
   console: {
     enabled: boolean;
@@ -125,7 +135,16 @@ export function resolvePluginConfig(config?: PluginConfig): ResolvedPluginConfig
         : [],
       sendThinkingMessage: config?.hub53ai?.sendThinkingMessage ?? true,
       reconnectBaseMs: config?.hub53ai?.reconnectBaseMs ?? 2_000,
-      maxReconnectAttempts: config?.hub53ai?.maxReconnectAttempts ?? 10
+      maxReconnectAttempts: config?.hub53ai?.maxReconnectAttempts ?? 10,
+      detectCreatedFiles: config?.hub53ai?.detectCreatedFiles ?? true,
+      fileWorkspaceDirs: Array.isArray(config?.hub53ai?.fileWorkspaceDirs)
+        ? config.hub53ai.fileWorkspaceDirs.map((entry) => String(entry).trim()).filter(Boolean)
+        : [],
+      createdFilesMaxFileBytes: config?.hub53ai?.createdFilesMaxFileBytes ?? 10 * 1024 * 1024,
+      createdFilesMaxCount: config?.hub53ai?.createdFilesMaxCount ?? 20,
+      createdFilesExclude: Array.isArray(config?.hub53ai?.createdFilesExclude)
+        ? config.hub53ai.createdFilesExclude.map((entry) => String(entry).trim()).filter(Boolean)
+        : []
     },
     console: {
       enabled: config?.console?.enabled ?? true,

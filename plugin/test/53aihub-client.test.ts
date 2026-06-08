@@ -1,5 +1,5 @@
 import { createServer } from "node:http";
-import { mkdtemp, readFile, rm, writeFile } from "node:fs/promises";
+import { mkdir, mkdtemp, readFile, rm, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 
@@ -304,7 +304,16 @@ describe("53AIHub client", () => {
             status: "streaming",
             mode: "replace",
             replace: true,
-            event_kind: "assistant.delta"
+            event_kind: "assistant.delta",
+            payload: {
+              openclaw_timeline: {
+                protocol_version: "openclaw.timeline.v2",
+                segment_type: "answer",
+                operation: "append",
+                visibility: "hidden",
+                final: false
+              }
+            }
           }
         });
         expect(thinking).toMatchObject({
@@ -317,7 +326,14 @@ describe("53AIHub client", () => {
               content: "正在思考",
               state: "final",
               mode: "replace",
-              replace: true
+              replace: true,
+              openclaw_timeline: {
+                protocol_version: "openclaw.timeline.v2",
+                segment_type: "thinking",
+                operation: "replace",
+                visibility: "final",
+                final: true
+              }
             }
           }
         });
@@ -333,11 +349,598 @@ describe("53AIHub client", () => {
                 args: {
                   query: "OpenClaw 53AI"
                 }
+              },
+              openclaw_timeline: {
+                protocol_version: "openclaw.timeline.v2",
+                segment_type: "tool_call",
+                operation: "replace",
+                visibility: "final",
+                final: true
+              }
+            }
+          }
+        });
+        expect(streaming?.data.payload.openclaw_timeline.turn_id).toBe(
+          thinking?.data.payload.openclaw_timeline.turn_id
+        );
+        expect(thinking?.data.payload.openclaw_timeline.turn_id).toBe(
+          toolCall?.data.payload.openclaw_timeline.turn_id
+        );
+      });
+    } finally {
+      await bridge.stop();
+    }
+  });
+
+  it("emits standard output_files process steps for gateway file events", async () => {
+    const stateDir = await mkdtemp(join(tmpdir(), "claw-53aihub-"));
+    cleanupPaths.push(stateDir);
+    const server = await createFakeHubServer();
+    cleanupServers.push(server.close);
+    const gateway = new FakeGateway();
+    gateway.eventsToEmit = [
+      {
+        id: "evt-tool-result",
+        sessionId: "session-1",
+        seq: 1,
+        kind: "tool.result",
+        payload: {
+          data: {
+            name: "write_file",
+            content: "普通工具文本不应被误判为文件",
+            output_files: [
+              {
+                id: "file-report",
+                file_name: "output/report.md",
+                url: "https://example.com/report.md",
+                mime_type: "text/markdown",
+                size: 128
+              }
+            ]
+          }
+        },
+        createdAt: new Date().toISOString()
+      },
+      {
+        id: "evt-completed",
+        sessionId: "session-1",
+        seq: 2,
+        kind: "run.completed",
+        payload: {
+          output_files: [
+            {
+              id: "file-report",
+              file_name: "output/report.md",
+              url: "https://example.com/report.md",
+              mime_type: "text/markdown",
+              size: 128
+            }
+          ]
+        },
+        createdAt: new Date().toISOString()
+      }
+    ];
+
+    const bridge = createHub53AIBridge({
+      stateDir,
+      config: {
+        enabled: true,
+        botId: "bot-123",
+        secret: "sk-secret",
+        wsUrl: server.url,
+        accessPolicy: "open",
+        allowFrom: [],
+        sendThinkingMessage: false,
+        reconnectBaseMs: 20,
+        maxReconnectAttempts: 2
+      },
+      gateway,
+      callbacks: {
+        onSessionUpsert: async (session) => {
+          gateway.upsertSession(session);
+        },
+        onUserMessage: async () => undefined,
+        onSessionStatus: async () => undefined,
+        onEnsureSessionStream: async () => undefined,
+        getLastEventSeq: () => 0,
+        onStatusChange: () => undefined
+      }
+    });
+
+    await bridge.start();
+    try {
+      const connection = await server.connected;
+      connection.socket.send(
+        JSON.stringify({
+          req_id: "req-output-files",
+          action: "chat",
+          data: {
+            user: "user-a",
+            conversation_id: "chat-files",
+            messages: [{ role: "user", content: "生成报告" }]
+          }
+        })
+      );
+
+      await waitFor(() => {
+        const outputSteps = server.frames.filter(
+          (frame) =>
+            frame.req_id === "req-output-files" &&
+            frame.action === "chat" &&
+            frame.data?.object === "process.step" &&
+            frame.data.process_step?.step_code === "output_files"
+        );
+        expect(outputSteps).toHaveLength(1);
+        expect(outputSteps[0]).toMatchObject({
+          status: "streaming",
+          data: {
+            object: "process.step",
+            process_step: {
+              step_code: "output_files",
+              status: "completed",
+              data: {
+                contract_version: "v1",
+                files: [
+                  {
+                    id: "file-report",
+                    file_name: "output/report.md",
+                    url: "https://example.com/report.md",
+                    mime_type: "text/markdown",
+                    size: 128
+                  }
+                ],
+                media_attachments: [
+                  {
+                    id: "file-report",
+                    file_name: "output/report.md",
+                    url: "https://example.com/report.md",
+                    mime_type: "text/markdown",
+                    size: 128,
+                    kind: "text"
+                  }
+                ],
+                media_contract_version: "v1"
               }
             }
           }
         });
       });
+    } finally {
+      await bridge.stop();
+    }
+  });
+
+  it("emits output_files for files created in the local workspace during a Hub run", async () => {
+    const stateDir = await mkdtemp(join(tmpdir(), "claw-53aihub-"));
+    cleanupPaths.push(stateDir);
+    const workspaceDir = join(stateDir, "workspace");
+    await mkdir(workspaceDir, { recursive: true });
+    await writeFile(join(workspaceDir, "existing.txt"), "already here");
+
+    const server = await createFakeHubServer();
+    cleanupServers.push(server.close);
+    const gateway = new FakeGateway();
+    gateway.eventsToEmit = [
+      {
+        id: "evt-started",
+        sessionId: "session-1",
+        seq: 1,
+        kind: "run.started",
+        payload: { ok: true },
+        createdAt: new Date().toISOString()
+      },
+      {
+        id: "evt-completed",
+        sessionId: "session-1",
+        seq: 2,
+        kind: "run.completed",
+        payload: { ok: true },
+        createdAt: new Date().toISOString()
+      }
+    ];
+    gateway.beforeEmit = async () => {
+      await writeFile(join(workspaceDir, "created.md"), "# created\n");
+      await writeFile(join(workspaceDir, ".hidden.md"), "# hidden\n");
+    };
+
+    const bridge = createHub53AIBridge({
+      stateDir,
+      configPath: join(stateDir, "openclaw.json"),
+      config: {
+        enabled: true,
+        botId: "bot-123",
+        secret: "sk-secret",
+        wsUrl: server.url,
+        accessPolicy: "open",
+        allowFrom: [],
+        sendThinkingMessage: false,
+        reconnectBaseMs: 20,
+        maxReconnectAttempts: 2,
+        detectCreatedFiles: true,
+        fileWorkspaceDirs: [workspaceDir],
+        createdFilesMaxFileBytes: 1024,
+        createdFilesMaxCount: 5
+      },
+      gateway,
+      callbacks: {
+        onSessionUpsert: async (session) => {
+          gateway.upsertSession(session);
+        },
+        onUserMessage: async () => undefined,
+        onSessionStatus: async () => undefined,
+        onEnsureSessionStream: async () => undefined,
+        getLastEventSeq: () => 0,
+        onStatusChange: () => undefined
+      }
+    });
+
+    await bridge.start();
+    try {
+      const connection = await server.connected;
+      connection.socket.send(
+        JSON.stringify({
+          req_id: "req-local-files",
+          action: "chat",
+          data: {
+            user: "user-a",
+            conversation_id: "chat-local-files",
+            messages: [{ role: "user", content: "创建本地文件" }]
+          }
+        })
+      );
+
+      await waitFor(() => {
+        const outputStep = server.frames.find(
+          (frame) =>
+            frame.req_id === "req-local-files" &&
+            frame.action === "chat" &&
+            frame.data?.object === "process.step" &&
+            frame.data.process_step?.step_code === "output_files"
+        );
+        expect(outputStep).toBeTruthy();
+        const files = outputStep!.data.process_step.data.files;
+        expect(files).toHaveLength(1);
+        expect(files[0]).toMatchObject({
+          file_name: "created.md",
+          mime_type: "text/markdown",
+          size: 10,
+          base64: Buffer.from("# created\n").toString("base64")
+        });
+        expect(files[0].url).toBeUndefined();
+        expect(files[0].id).toMatch(/^local-/);
+      });
+    } finally {
+      await bridge.stop();
+    }
+  });
+
+  it("emits local output_files when a final assistant message mentions the created file", async () => {
+    const stateDir = await mkdtemp(join(tmpdir(), "claw-53aihub-"));
+    cleanupPaths.push(stateDir);
+    const workspaceDir = join(stateDir, "workspace");
+    const reportPath = join(workspaceDir, "classics_2026.txt");
+    await mkdir(workspaceDir, { recursive: true });
+
+    const server = await createFakeHubServer();
+    cleanupServers.push(server.close);
+    const gateway = new FakeGateway();
+    gateway.beforeEmit = async () => {
+      await writeFile(reportPath, "created from final assistant message\n");
+    };
+    gateway.eventsToEmit = [
+      {
+        id: "evt-started",
+        sessionId: "session-1",
+        seq: 1,
+        kind: "run.started",
+        payload: { ok: true },
+        createdAt: new Date().toISOString()
+      },
+      {
+        id: "evt-message",
+        sessionId: "session-1",
+        seq: 2,
+        kind: "assistant.message",
+        payload: {
+          content: `已为您保存为 txt 文件：${reportPath}`,
+          state: "final",
+          mode: "replace"
+        },
+        createdAt: new Date().toISOString()
+      },
+      {
+        id: "evt-completed",
+        sessionId: "session-1",
+        seq: 3,
+        kind: "run.completed",
+        payload: { ok: true },
+        createdAt: new Date().toISOString()
+      }
+    ];
+
+    const bridge = createHub53AIBridge({
+      stateDir,
+      configPath: join(stateDir, "openclaw.json"),
+      config: {
+        enabled: true,
+        botId: "bot-123",
+        secret: "sk-secret",
+        wsUrl: server.url,
+        accessPolicy: "open",
+        allowFrom: [],
+        sendThinkingMessage: false,
+        reconnectBaseMs: 20,
+        maxReconnectAttempts: 2,
+        detectCreatedFiles: true,
+        fileWorkspaceDirs: [workspaceDir],
+        createdFilesMaxFileBytes: 1024,
+        createdFilesMaxCount: 5
+      },
+      gateway,
+      callbacks: {
+        onSessionUpsert: async (session) => {
+          gateway.upsertSession(session);
+        },
+        onUserMessage: async () => undefined,
+        onSessionStatus: async () => undefined,
+        onEnsureSessionStream: async () => undefined,
+        getLastEventSeq: () => 0,
+        onStatusChange: () => undefined
+      }
+    });
+
+    await bridge.start();
+    try {
+      const connection = await server.connected;
+      connection.socket.send(
+        JSON.stringify({
+          req_id: "req-final-message-local-files",
+          action: "chat",
+          data: {
+            user: "user-a",
+            conversation_id: "chat-final-message-local-files",
+            messages: [{ role: "user", content: "创建并返回本地文件路径" }]
+          }
+        })
+      );
+
+      await waitFor(() => {
+        const outputStep = server.frames.find(
+          (frame) =>
+            frame.req_id === "req-final-message-local-files" &&
+            frame.action === "chat" &&
+            frame.data?.object === "process.step" &&
+            frame.data.process_step?.step_code === "output_files"
+        );
+        expect(outputStep).toBeTruthy();
+        const files = outputStep!.data.process_step.data.files;
+        expect(files).toHaveLength(1);
+        expect(files[0]).toMatchObject({
+          file_name: "classics_2026.txt",
+          mime_type: "text/plain",
+          size: 37,
+          base64: Buffer.from("created from final assistant message\n").toString("base64")
+        });
+      });
+    } finally {
+      await bridge.stop();
+    }
+  });
+
+  it("emits output_files for referenced local workspace files that were modified during the Hub run", async () => {
+    const stateDir = await mkdtemp(join(tmpdir(), "claw-53aihub-"));
+    cleanupPaths.push(stateDir);
+    const workspaceDir = join(stateDir, "workspace");
+    const reportPath = join(workspaceDir, "novels_2026.txt");
+    await mkdir(workspaceDir, { recursive: true });
+    await writeFile(reportPath, "already generated");
+
+    const server = await createFakeHubServer();
+    cleanupServers.push(server.close);
+    const gateway = new FakeGateway();
+    gateway.beforeEmit = async () => {
+      await writeFile(reportPath, "generated now");
+    };
+    gateway.eventsToEmit = [
+      {
+        id: "evt-started",
+        sessionId: "session-1",
+        seq: 1,
+        kind: "run.started",
+        payload: { ok: true },
+        createdAt: new Date().toISOString()
+      },
+      {
+        id: "evt-message",
+        sessionId: "session-1",
+        seq: 2,
+        kind: "assistant.message",
+        payload: { content: `已保存为 ${reportPath}` },
+        createdAt: new Date().toISOString()
+      },
+      {
+        id: "evt-completed",
+        sessionId: "session-1",
+        seq: 3,
+        kind: "run.completed",
+        payload: { ok: true },
+        createdAt: new Date().toISOString()
+      }
+    ];
+
+    const bridge = createHub53AIBridge({
+      stateDir,
+      configPath: join(stateDir, "openclaw.json"),
+      config: {
+        enabled: true,
+        botId: "bot-123",
+        secret: "sk-secret",
+        wsUrl: server.url,
+        accessPolicy: "open",
+        allowFrom: [],
+        sendThinkingMessage: false,
+        reconnectBaseMs: 20,
+        maxReconnectAttempts: 2,
+        detectCreatedFiles: true,
+        fileWorkspaceDirs: [workspaceDir],
+        createdFilesMaxFileBytes: 1024,
+        createdFilesMaxCount: 5
+      },
+      gateway,
+      callbacks: {
+        onSessionUpsert: async (session) => {
+          gateway.upsertSession(session);
+        },
+        onUserMessage: async () => undefined,
+        onSessionStatus: async () => undefined,
+        onEnsureSessionStream: async () => undefined,
+        getLastEventSeq: () => 0,
+        onStatusChange: () => undefined
+      }
+    });
+
+    await bridge.start();
+    try {
+      const connection = await server.connected;
+      connection.socket.send(
+        JSON.stringify({
+          req_id: "req-referenced-local-files",
+          action: "chat",
+          data: {
+            user: "user-a",
+            conversation_id: "chat-referenced-local-files",
+            messages: [{ role: "user", content: "返回已有本地文件" }]
+          }
+        })
+      );
+
+      await waitFor(() => {
+        const outputStep = server.frames.find(
+          (frame) =>
+            frame.req_id === "req-referenced-local-files" &&
+            frame.action === "chat" &&
+            frame.data?.object === "process.step" &&
+            frame.data.process_step?.step_code === "output_files"
+        );
+        expect(outputStep).toBeTruthy();
+        const files = outputStep!.data.process_step.data.files;
+        expect(files).toHaveLength(1);
+        expect(files[0]).toMatchObject({
+          file_name: "novels_2026.txt",
+          mime_type: "text/plain",
+          size: 13,
+          base64: Buffer.from("generated now").toString("base64")
+        });
+      });
+    } finally {
+      await bridge.stop();
+    }
+  });
+
+  it("does not emit output_files for referenced local workspace files that were unchanged during the Hub run", async () => {
+    const stateDir = await mkdtemp(join(tmpdir(), "claw-53aihub-"));
+    cleanupPaths.push(stateDir);
+    const workspaceDir = join(stateDir, "workspace");
+    const reportPath = join(workspaceDir, "old-report.txt");
+    await mkdir(workspaceDir, { recursive: true });
+    await writeFile(reportPath, "old file");
+
+    const server = await createFakeHubServer();
+    cleanupServers.push(server.close);
+    const gateway = new FakeGateway();
+    gateway.eventsToEmit = [
+      {
+        id: "evt-started",
+        sessionId: "session-1",
+        seq: 1,
+        kind: "run.started",
+        payload: { ok: true },
+        createdAt: new Date().toISOString()
+      },
+      {
+        id: "evt-message",
+        sessionId: "session-1",
+        seq: 2,
+        kind: "assistant.message",
+        payload: { content: `参考文件 ${reportPath}` },
+        createdAt: new Date().toISOString()
+      },
+      {
+        id: "evt-completed",
+        sessionId: "session-1",
+        seq: 3,
+        kind: "run.completed",
+        payload: { ok: true },
+        createdAt: new Date().toISOString()
+      }
+    ];
+
+    const bridge = createHub53AIBridge({
+      stateDir,
+      configPath: join(stateDir, "openclaw.json"),
+      config: {
+        enabled: true,
+        botId: "bot-123",
+        secret: "sk-secret",
+        wsUrl: server.url,
+        accessPolicy: "open",
+        allowFrom: [],
+        sendThinkingMessage: false,
+        reconnectBaseMs: 20,
+        maxReconnectAttempts: 2,
+        detectCreatedFiles: true,
+        fileWorkspaceDirs: [workspaceDir],
+        createdFilesMaxFileBytes: 1024,
+        createdFilesMaxCount: 5
+      },
+      gateway,
+      callbacks: {
+        onSessionUpsert: async (session) => {
+          gateway.upsertSession(session);
+        },
+        onUserMessage: async () => undefined,
+        onSessionStatus: async () => undefined,
+        onEnsureSessionStream: async () => undefined,
+        getLastEventSeq: () => 0,
+        onStatusChange: () => undefined
+      }
+    });
+
+    await bridge.start();
+    try {
+      const connection = await server.connected;
+      connection.socket.send(
+        JSON.stringify({
+          req_id: "req-unchanged-referenced-local-files",
+          action: "chat",
+          data: {
+            user: "user-a",
+            conversation_id: "chat-unchanged-referenced-local-files",
+            messages: [{ role: "user", content: "提到了旧文件" }]
+          }
+        })
+      );
+
+      await waitFor(() => {
+        expect(
+          server.frames.some(
+            (frame) =>
+              frame.req_id === "req-unchanged-referenced-local-files" &&
+              frame.action === "chat" &&
+              frame.data?.object === "chat.completion.chunk" &&
+              frame.status === "done"
+          )
+        ).toBe(true);
+      });
+      expect(
+        server.frames.some(
+          (frame) =>
+            frame.req_id === "req-unchanged-referenced-local-files" &&
+            frame.action === "chat" &&
+            frame.data?.object === "process.step" &&
+            frame.data.process_step?.step_code === "output_files"
+        )
+      ).toBe(false);
     } finally {
       await bridge.stop();
     }
@@ -816,6 +1419,100 @@ describe("53AIHub client", () => {
 
       const errorFrame = server.frames.find((frame) => frame.req_id === "req-after-stop" && frame.status === "error");
       expect(errorFrame).toBeUndefined();
+    } finally {
+      await bridge.stop();
+    }
+  });
+
+  it("releases the 53AIHub chat queue after stop control even when the stopped run has no terminal event", async () => {
+    const stateDir = await mkdtemp(join(tmpdir(), "claw-53aihub-stop-queue-"));
+    cleanupPaths.push(stateDir);
+
+    const server = await createFakeHubServer();
+    cleanupServers.push(server.close);
+
+    const gateway = new FakeGateway();
+    gateway.eventsToEmit = [];
+
+    const bridge = createHub53AIBridge({
+      stateDir,
+      config: {
+        enabled: true,
+        botId: "bot-123",
+        secret: "sk-secret",
+        wsUrl: server.url,
+        accessPolicy: "open",
+        allowFrom: [],
+        sendThinkingMessage: false,
+        reconnectBaseMs: 20,
+        maxReconnectAttempts: 2
+      },
+      gateway,
+      callbacks: {
+        onSessionUpsert: async (session) => {
+          gateway.upsertSession(session);
+        },
+        onUserMessage: async () => undefined,
+        onSessionStatus: async () => undefined,
+        onEnsureSessionStream: async () => undefined,
+        getLastEventSeq: () => 0,
+        onStatusChange: () => undefined
+      }
+    });
+
+    await bridge.start();
+    try {
+      const connection = await server.connected;
+      connection.socket.send(
+        JSON.stringify({
+          req_id: "req-stopped-run",
+          action: "chat",
+          data: {
+            user: "agenthub_u2001",
+            conversation_id: "chat-stop-queue",
+            messages: [{ role: "user", content: "first message" }]
+          }
+        })
+      );
+
+      await waitFor(() => {
+        expect(gateway.sentMessages).toEqual([{ sessionId: "session-1", content: "first message" }]);
+      });
+
+      connection.socket.send(
+        JSON.stringify({
+          req_id: "rpc-stop-stuck-run",
+          action: "sessions.control",
+          status: "request",
+          data: { session_id: "session-1", action: "stop" }
+        })
+      );
+
+      await waitFor(() => {
+        expect(frameByReq(server.frames, "rpc-stop-stuck-run")).toMatchObject({
+          action: "sessions.control",
+          status: "done"
+        });
+      });
+
+      connection.socket.send(
+        JSON.stringify({
+          req_id: "req-after-stopped-run",
+          action: "chat",
+          data: {
+            user: "agenthub_u2001",
+            conversation_id: "chat-stop-queue",
+            messages: [{ role: "user", content: "second message" }]
+          }
+        })
+      );
+
+      await waitFor(() => {
+        expect(gateway.sentMessages).toEqual([
+          { sessionId: "session-1", content: "first message" },
+          { sessionId: "session-1", content: "second message" }
+        ]);
+      });
     } finally {
       await bridge.stop();
     }
@@ -2625,6 +3322,7 @@ class FakeGateway {
   eventsToEmit?: GatewayEvent[];
   disconnectOnNextSend = false;
   disconnectCompletionDelayMs = 0;
+  beforeEmit?: (sessionId: string) => void | Promise<void>;
   createdTitles: string[] = [];
   renames: Array<{ sessionId: string; title: string }> = [];
   controls: Array<{ sessionId: string; action: string }> = [];
@@ -2707,7 +3405,8 @@ class FakeGateway {
 
   async sendMessage(sessionId: string, content: string): Promise<void> {
     this.sentMessages.push({ sessionId, content });
-    setTimeout(() => {
+    setTimeout(async () => {
+      await this.beforeEmit?.(sessionId);
       if (this.disconnectOnNextSend) {
         this.disconnectOnNextSend = false;
         this.emitDisconnect(sessionId, new Error("gateway stream disconnected"));

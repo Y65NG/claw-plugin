@@ -104,6 +104,7 @@ export function createConsoleServer(input: CreateConsoleServerInput) {
   const hub53ai = input.hub53aiConfig
     ? createHub53AIBridge({
         stateDir: input.stateDir,
+        configPath: input.configPath,
         config: input.hub53aiConfig,
         gateway: input.gateway,
         rpcContext: {

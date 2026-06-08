@@ -4,7 +4,7 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { parse as parseYaml } from "yaml";
 
-import { installIntoOpenClaw, installIntoQClaw, runInstallCommand } from "../src/install-qclaw";
+import { installIntoOpenClaw, installIntoQClaw, installIntoWorkBuddy, runInstallCommand } from "../src/install-qclaw";
 import type { HostDefinition } from "../src/install-qclaw";
 
 const cleanupPaths: string[] = [];
@@ -297,7 +297,88 @@ describe("QClaw installer", () => {
       wsUrl: "wss://hub.example.com/api/v1/openclaw/ws/connect",
       accessPolicy: "open",
       allowFrom: [],
-      sendThinkingMessage: true
+      sendThinkingMessage: true,
+      detectCreatedFiles: true,
+      fileWorkspaceDirs: [],
+      createdFilesMaxFileBytes: 10 * 1024 * 1024,
+      createdFilesMaxCount: 20,
+      createdFilesExclude: []
+    });
+  });
+
+  it("preserves existing plugin 53AIHub config and adds created-file detection defaults", async () => {
+    const tempRoot = await mkdtemp(join(tmpdir(), "qclaw-install-"));
+    cleanupPaths.push(tempRoot);
+
+    const configPath = join(tempRoot, "openclaw.json");
+    const extensionsDir = join(tempRoot, "extensions");
+    const packageRoot = join(tempRoot, "package");
+    await mkdir(join(packageRoot, "dist"), { recursive: true });
+    await writeFile(join(packageRoot, "package.json"), JSON.stringify({ name: "@claw-plugin/claw-control-center" }));
+    await writeFile(join(packageRoot, "openclaw.plugin.json"), JSON.stringify({ id: "claw-control-center" }));
+    await writeFile(join(packageRoot, "dist", "index.cjs"), "module.exports = {};\n");
+    await writeFile(
+      configPath,
+      JSON.stringify(
+        {
+          gateway: {
+            host: "127.0.0.1",
+            port: 28789,
+            auth: {
+              mode: "token",
+              token: "local-token"
+            }
+          },
+          plugins: {
+            entries: {
+              "claw-control-center": {
+                enabled: true,
+                config: {
+                  hub53ai: {
+                    enabled: true,
+                    botId: "existing-bot",
+                    secret: "existing-secret",
+                    wsUrl: "wss://existing.example.com/api/v1/openclaw/ws/connect",
+                    accessPolicy: "allowlist",
+                    allowFrom: ["user-a"],
+                    sendThinkingMessage: false
+                  }
+                }
+              }
+            }
+          }
+        },
+        null,
+        2
+      )
+    );
+
+    const result = await installIntoQClaw({
+      packageRoot,
+      extensionsDir,
+      configPath
+    });
+
+    const updated = JSON.parse(await readFile(configPath, "utf8")) as {
+      plugins: {
+        entries: Record<string, { enabled: boolean; config?: Record<string, any> }>;
+      };
+    };
+
+    expect(result.hub53aiConfigured).toBe(true);
+    expect(updated.plugins.entries["claw-control-center"].config?.hub53ai).toEqual({
+      enabled: true,
+      botId: "existing-bot",
+      secret: "existing-secret",
+      wsUrl: "wss://existing.example.com/api/v1/openclaw/ws/connect",
+      accessPolicy: "allowlist",
+      allowFrom: ["user-a"],
+      sendThinkingMessage: false,
+      detectCreatedFiles: true,
+      fileWorkspaceDirs: [],
+      createdFilesMaxFileBytes: 10 * 1024 * 1024,
+      createdFilesMaxCount: 20,
+      createdFilesExclude: []
     });
   });
 
@@ -361,7 +442,12 @@ describe("QClaw installer", () => {
       wsUrl: "wss://legacy.example.com/api/v1/openclaw/ws/connect",
       accessPolicy: "allowlist",
       allowFrom: ["user-a"],
-      sendThinkingMessage: false
+      sendThinkingMessage: false,
+      detectCreatedFiles: true,
+      fileWorkspaceDirs: [],
+      createdFilesMaxFileBytes: 10 * 1024 * 1024,
+      createdFilesMaxCount: 20,
+      createdFilesExclude: []
     });
     expect(updated.channels["53aihub"].botId).toBe("legacy-bot");
     expect((updated as any).gateway.http?.endpoints?.responses).toBeUndefined();
@@ -526,7 +612,12 @@ describe("QClaw installer", () => {
           wsUrl: "wss://hub.example.com/api/v1/openclaw/ws/connect",
           accessPolicy: "open",
           allowFrom: [],
-          sendThinkingMessage: true
+          sendThinkingMessage: true,
+          detectCreatedFiles: true,
+          fileWorkspaceDirs: [],
+          createdFilesMaxFileBytes: 10 * 1024 * 1024,
+          createdFilesMaxCount: 20,
+          createdFilesExclude: []
         }
       }
     });
@@ -765,7 +856,7 @@ describe("QClaw installer", () => {
     expect(chunks.join("")).toContain("Installed claw-control-center into OpenClaw.");
   });
 
-  it("rejects multiple selected Claw hosts when several compatible hosts are detected", async () => {
+  it("rejects multiple selected compatible agents when several hosts are detected", async () => {
     const tempRoot = await mkdtemp(join(tmpdir(), "openclaw-install-"));
     cleanupPaths.push(tempRoot);
 
@@ -804,7 +895,7 @@ describe("QClaw installer", () => {
           return detected;
         }
       })
-    ).rejects.toThrow("select exactly one Claw host");
+    ).rejects.toThrow("select exactly one compatible agent");
   });
 
   it("auto-detects a single Hermes host and installs the native platform plugin", async () => {
@@ -950,6 +1041,231 @@ describe("QClaw installer", () => {
     await expect(access(join(openClawExtensionsDir, "claw-control-center", "dist", "index.cjs"))).rejects.toThrow();
   });
 
+  it("installs the 53AIHub channel plugin into WorkBuddy local marketplace", async () => {
+    const tempRoot = await mkdtemp(join(tmpdir(), "workbuddy-install-"));
+    cleanupPaths.push(tempRoot);
+
+    const packageRoot = await createPackageRoot(tempRoot);
+    const workbuddyHome = join(tempRoot, ".workbuddy");
+    let cleanedTargets: string[] | undefined;
+
+    const result = await installIntoWorkBuddy({
+      packageRoot,
+      workbuddyHome,
+      hubWsUrl: "wss://hub.example.com/api/v1/openclaw/ws/connect",
+      hubBotId: "hub-bot",
+      hubSecret: "hub-secret",
+      cleanupWorkBuddyChannelProcesses: async (targets) => {
+        cleanedTargets = targets;
+      }
+    });
+
+    const destination = join(
+      workbuddyHome,
+      "plugins",
+      "marketplaces",
+      "my-experts",
+      "plugins",
+      "53aihub-workbuddy"
+    );
+    const mcpConfig = JSON.parse(await readFile(join(destination, ".mcp.json"), "utf8")) as any;
+    const marketplace = JSON.parse(
+      await readFile(join(workbuddyHome, "plugins", "marketplaces", "my-experts", ".codebuddy-plugin", "marketplace.json"), "utf8")
+    ) as any;
+    const knownMarketplaces = JSON.parse(
+      await readFile(join(workbuddyHome, "plugins", "known_marketplaces.json"), "utf8")
+    ) as any;
+    const settings = JSON.parse(await readFile(join(workbuddyHome, "settings.json"), "utf8")) as any;
+
+    expect(result.destination).toBe(destination);
+    expect(result.marketplacePath).toBe(
+      join(workbuddyHome, "plugins", "marketplaces", "my-experts", ".codebuddy-plugin", "marketplace.json")
+    );
+    expect(mcpConfig.mcpServers["53aihub-channel"].env).toMatchObject({
+      HUB53AI_WS_URL: "wss://hub.example.com/api/v1/openclaw/ws/connect",
+      HUB53AI_BOT_ID: "hub-bot",
+      HUB53AI_SECRET: "hub-secret",
+      HUB53AI_ACCESS_POLICY: "open",
+      HUB53AI_SEND_THINKING_MESSAGE: "true",
+      HUB53AI_CHANNEL_ENTRY_PATH: join(destination, "dist", "codebuddy-channel.cjs"),
+      HUB53AI_WORKBUDDY_HOME: workbuddyHome,
+      HUB53AI_WORKBUDDY_WORKSPACE: join(workbuddyHome, "channels", "53aihub-workspace"),
+      HUB53AI_WORKBUDDY_HISTORY_SCOPE: "all",
+      HUB53AI_WORKBUDDY_SESSION_ID: "53aihub-workbuddy-shared"
+    });
+    expect(mcpConfig.mcpServers["53aihub-channel"].args).toEqual([
+      join(destination, "dist", "workbuddy-supervisor.cjs")
+    ]);
+    expect(cleanedTargets).toEqual(
+      expect.arrayContaining([
+        join(destination, "dist", "codebuddy-channel.cjs"),
+        join(destination, "dist", "workbuddy-supervisor.cjs"),
+        "--session-id 53aihub-workbuddy-shared"
+      ])
+    );
+    expect(marketplace.plugins).toContainEqual(
+      expect.objectContaining({
+        name: "53aihub-workbuddy",
+        source: "./plugins/53aihub-workbuddy"
+      })
+    );
+    expect(knownMarketplaces["my-experts"]).toMatchObject({
+      type: "directory",
+      source: {
+        source: "directory",
+        path: join(workbuddyHome, "plugins", "marketplaces", "my-experts")
+      },
+      installLocation: join(workbuddyHome, "plugins", "marketplaces", "my-experts"),
+      isBuiltIn: false,
+      autoUpdate: false
+    });
+    expect(settings.enabledPlugins).toMatchObject({
+      "53aihub-workbuddy@my-experts": true
+    });
+    expect(settings.channelsEnabled).toBe(true);
+    await access(join(destination, ".codebuddy-plugin", "plugin.json"));
+    await access(join(destination, "dist", "codebuddy-channel.cjs"));
+    await access(join(destination, "dist", "workbuddy-supervisor.cjs"));
+    await access(join(workbuddyHome, "channels", "53aihub-workspace"));
+  });
+
+  it("supports install-workbuddy as an explicit installer subcommand", async () => {
+    const tempRoot = await mkdtemp(join(tmpdir(), "workbuddy-command-"));
+    cleanupPaths.push(tempRoot);
+
+    const packageRoot = await createPackageRoot(tempRoot);
+    const workbuddyHome = join(tempRoot, ".workbuddy");
+    const chunks: string[] = [];
+    await withCapturedStdout(chunks, async () => {
+      await runInstallCommand({
+        packageRoot,
+        argv: [
+          "install-workbuddy",
+          "--workbuddy-home",
+          workbuddyHome,
+          "--hub-ws-url",
+          "wss://hub.example.com/api/v1/openclaw/ws/connect",
+          "--hub-bot-id",
+          "hub-bot",
+          "--hub-secret",
+          "hub-secret"
+        ]
+      });
+    });
+
+    expect(chunks.join("")).toContain("Installed 53aihub-workbuddy into WorkBuddy local marketplace.");
+    await access(
+      join(
+        workbuddyHome,
+        "plugins",
+        "marketplaces",
+        "my-experts",
+        "plugins",
+        "53aihub-workbuddy",
+        ".mcp.json"
+      )
+    );
+    const settings = JSON.parse(await readFile(join(workbuddyHome, "settings.json"), "utf8")) as any;
+    expect(settings.enabledPlugins?.["53aihub-workbuddy@my-experts"]).toBe(true);
+    expect(settings.channelsEnabled).toBe(true);
+    const mcpConfig = JSON.parse(
+      await readFile(
+        join(
+          workbuddyHome,
+          "plugins",
+          "marketplaces",
+          "my-experts",
+          "plugins",
+          "53aihub-workbuddy",
+          ".mcp.json"
+        ),
+        "utf8"
+      )
+    ) as any;
+    expect(mcpConfig.mcpServers["53aihub-channel"].args).toEqual([
+      join(
+        workbuddyHome,
+        "plugins",
+        "marketplaces",
+        "my-experts",
+        "plugins",
+        "53aihub-workbuddy",
+        "dist",
+        "workbuddy-supervisor.cjs"
+      )
+    ]);
+    expect(mcpConfig.mcpServers["53aihub-channel"].env.HUB53AI_CHANNEL_ENTRY_PATH).toContain(
+      "codebuddy-channel.cjs"
+    );
+  });
+
+  it("offers WorkBuddy through the normal install command", async () => {
+    const tempRoot = await mkdtemp(join(tmpdir(), "workbuddy-auto-command-"));
+    cleanupPaths.push(tempRoot);
+
+    const packageRoot = await createPackageRoot(tempRoot);
+    const workbuddyHome = join(tempRoot, ".workbuddy");
+    const workbuddySettings = join(workbuddyHome, "settings.json");
+    await mkdir(workbuddyHome, { recursive: true });
+    await writeFile(workbuddySettings, JSON.stringify({ claw: { channels: {} } }, null, 2));
+
+    const qclawConfigPath = join(tempRoot, ".qclaw", "openclaw.json");
+    const qclawExtensionsDir = join(tempRoot, "Library/Application Support/QClaw/openclaw/config/extensions");
+    await mkdir(join(tempRoot, ".qclaw"), { recursive: true });
+    await writeGatewayConfig(qclawConfigPath, 28789, "qclaw-token");
+
+    const chunks: string[] = [];
+    await withCapturedStdout(chunks, async () => {
+      await runInstallCommand({
+        packageRoot,
+        argv: [
+          "install",
+          "--hub-ws-url",
+          "wss://hub.example.com/api/v1/openclaw/ws/connect",
+          "--hub-bot-id",
+          "hub-bot",
+          "--hub-secret",
+          "hub-secret"
+        ],
+        hostDefinitions: [
+          {
+            id: "qclaw",
+            label: "QClaw",
+            configPath: qclawConfigPath,
+            extensionsDir: qclawExtensionsDir
+          },
+          {
+            id: "workbuddy",
+            label: "WorkBuddy",
+            configPath: workbuddySettings,
+            extensionsDir: join(workbuddyHome, "plugins", "marketplaces", "my-experts", "plugins"),
+            installKind: "workbuddy",
+            workbuddyHome
+          }
+        ],
+        promptSelectHost: async (detected, incompatible) => {
+          expect(incompatible).toEqual([]);
+          expect(detected.map((host) => host.label)).toEqual(["QClaw", "WorkBuddy"]);
+          return detected[1]!;
+        }
+      });
+    });
+
+    expect(chunks.join("")).toContain("Installed 53aihub-workbuddy into WorkBuddy local marketplace.");
+    await access(
+      join(
+        workbuddyHome,
+        "plugins",
+        "marketplaces",
+        "my-experts",
+        "plugins",
+        "53aihub-workbuddy",
+        ".mcp.json"
+      )
+    );
+    await expect(access(join(qclawExtensionsDir, "claw-control-center", "dist", "index.cjs"))).rejects.toThrow();
+  });
+
   it("rejects multiple detected hosts when no interactive terminal is available", async () => {
     const tempRoot = await mkdtemp(join(tmpdir(), "openclaw-install-"));
     cleanupPaths.push(tempRoot);
@@ -982,10 +1298,10 @@ describe("QClaw installer", () => {
         ],
         ttyPath: join(tempRoot, "missing-tty")
       })
-    ).rejects.toThrow("multiple Claw installations were detected, but no interactive terminal was available");
+    ).rejects.toThrow("multiple compatible agents were detected, but no interactive terminal was available");
   });
 
-  it("rejects installs when no Claw host can be auto-detected", async () => {
+  it("rejects installs when no compatible agent can be auto-detected", async () => {
     const tempRoot = await mkdtemp(join(tmpdir(), "openclaw-install-"));
     cleanupPaths.push(tempRoot);
 
@@ -1010,7 +1326,7 @@ describe("QClaw installer", () => {
           }
         ]
       })
-    ).rejects.toThrow("could not auto-detect an installed Claw host");
+    ).rejects.toThrow("could not auto-detect an installed compatible agent");
   });
 
   it("rejects the removed target option with a clear error", async () => {
@@ -1031,10 +1347,26 @@ describe("QClaw installer", () => {
 async function createPackageRoot(tempRoot: string): Promise<string> {
   const packageRoot = join(tempRoot, "package");
   await mkdir(join(packageRoot, "dist"), { recursive: true });
+  await mkdir(join(packageRoot, ".codebuddy-plugin"), { recursive: true });
   await mkdir(join(packageRoot, "hermes", "platforms", "53aihub"), { recursive: true });
   await writeFile(join(packageRoot, "package.json"), JSON.stringify({ name: "@claw-plugin/claw-control-center" }));
   await writeFile(join(packageRoot, "openclaw.plugin.json"), JSON.stringify({ id: "claw-control-center" }));
+  await writeFile(join(packageRoot, ".codebuddy-plugin", "plugin.json"), JSON.stringify({ name: "53aihub-workbuddy" }));
+  await writeFile(
+    join(packageRoot, ".mcp.json"),
+    JSON.stringify({
+      mcpServers: {
+        "53aihub-channel": {
+          command: "node",
+          args: ["dist/workbuddy-supervisor.cjs"],
+          env: {}
+        }
+      }
+    })
+  );
   await writeFile(join(packageRoot, "dist", "index.cjs"), "module.exports = {};\n");
+  await writeFile(join(packageRoot, "dist", "codebuddy-channel.cjs"), "module.exports = {};\n");
+  await writeFile(join(packageRoot, "dist", "workbuddy-supervisor.cjs"), "module.exports = {};\n");
   await writeFile(join(packageRoot, "hermes", "platforms", "53aihub", "plugin.yaml"), "name: 53aihub\nversion: 0.1.0\nkind: platform\n");
   await writeFile(join(packageRoot, "hermes", "platforms", "53aihub", "__init__.py"), "from .adapter import register\n");
   await writeFile(join(packageRoot, "hermes", "platforms", "53aihub", "adapter.py"), "def register(ctx):\n    pass\n");

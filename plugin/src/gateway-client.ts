@@ -1,6 +1,6 @@
 import { randomUUID } from "node:crypto";
-import { existsSync, readdirSync } from "node:fs";
-import { dirname, join, resolve } from "node:path";
+import { existsSync, lstatSync, readFileSync, readdirSync } from "node:fs";
+import { dirname, join, relative, resolve } from "node:path";
 import { pathToFileURL } from "node:url";
 
 import WebSocket from "ws";
@@ -2218,7 +2218,7 @@ function synthesizeEventsFromHistoryMessages(
       }
 
       if (isToolResultRole(role)) {
-        return [
+        const events: GatewayEvent[] = [
           {
             id: `${sessionId}:history:${rawSeq}:tool-result:${readHistoryToolResultId(entry)}`,
             sessionId,
@@ -2226,8 +2226,13 @@ function synthesizeEventsFromHistoryMessages(
             kind: "tool.result",
             payload: buildHistoryToolResultPayload(entry, rawSeq),
             createdAt
-          } satisfies GatewayEvent
+          }
         ];
+        const outputFilesEvent = buildHistoryOutputFilesEvent(sessionId, rawSeq, createdAt, entry, expandsCompoundHistory);
+        if (outputFilesEvent) {
+          events.push(outputFilesEvent);
+        }
+        return events;
       }
 
       return [];
@@ -2383,6 +2388,127 @@ function buildHistoryToolResultPayload(entry: Record<string, unknown>, rawSeq: n
     },
     rawSeq
   };
+}
+
+function buildHistoryOutputFilesEvent(
+  sessionId: string,
+  rawSeq: number,
+  createdAt: string,
+  entry: Record<string, unknown>,
+  expanded: boolean
+): GatewayEvent | null {
+  const file = readHistoryOutputFileFromToolResult(entry);
+  if (!file) {
+    return null;
+  }
+
+  return {
+    id: `${sessionId}:history:${rawSeq}:output-files:${file.id}`,
+    sessionId,
+    seq: historyEventSeq(rawSeq, 1, expanded),
+    kind: "process.step",
+    payload: {
+      object: "process.step",
+      process_step: {
+        step_code: "output_files",
+        name: "生成文件",
+        status: "completed",
+        message: "生成了 1 个文件",
+        data: {
+          files: [file],
+          contract_version: "v1",
+          media_attachments: [
+            {
+              ...file,
+              kind: resolveHistoryMediaKind(String(file.mime_type ?? ""), String(file.file_name ?? ""))
+            }
+          ],
+          media_contract_version: "v1"
+        },
+        timestamp: Math.floor(new Date(createdAt).getTime() / 1000)
+      },
+      rawSeq
+    },
+    createdAt
+  };
+}
+
+function readHistoryOutputFileFromToolResult(entry: Record<string, unknown>): Record<string, unknown> | null {
+  const content = extractTextContent(entry.content) ?? (typeof entry.content === "string" ? entry.content : "");
+  const match = content.match(/Successfully wrote\s+\d+\s+bytes\s+to\s+([^\s`'"<>]+(?:\.[^\s`'"<>]+)?)/i);
+  if (!match?.[1]) {
+    return null;
+  }
+  const absolutePath = resolve(match[1]);
+  const workspaceDir = findHistoryOutputWorkspaceDir(absolutePath);
+  if (!workspaceDir) {
+    return null;
+  }
+  try {
+    const stat = lstatSync(absolutePath);
+    if (!stat.isFile() || stat.size <= 0 || stat.size > 10 * 1024 * 1024) {
+      return null;
+    }
+    const bytes = readFileSync(absolutePath);
+    const fileName = relative(workspaceDir, absolutePath).split("\\").join("/") || absolutePath.split("/").at(-1) || "file";
+    return {
+      id: `local-history-${createShortHash(`${absolutePath}:${stat.mtimeMs}:${stat.size}`)}`,
+      file_name: fileName,
+      mime_type: inferHistoryMimeType(fileName),
+      size: stat.size,
+      base64: bytes.toString("base64")
+    };
+  } catch {
+    return null;
+  }
+}
+
+function findHistoryOutputWorkspaceDir(filePath: string): string | null {
+  const home = process.env.HOME ? resolve(process.env.HOME) : "";
+  const candidates = [
+    home ? resolve(home, ".qclaw", "workspace") : "",
+    home ? resolve(home, ".openclaw", "workspace") : ""
+  ].filter(Boolean);
+  for (const workspaceDir of candidates) {
+    const rel = relative(workspaceDir, filePath);
+    if (rel && rel !== "." && rel !== ".." && !rel.startsWith("../") && !rel.startsWith("..\\")) {
+      return workspaceDir;
+    }
+  }
+  return null;
+}
+
+function createShortHash(value: string): string {
+  let hash = 0;
+  for (let index = 0; index < value.length; index += 1) {
+    hash = (hash * 31 + value.charCodeAt(index)) >>> 0;
+  }
+  return hash.toString(16);
+}
+
+function inferHistoryMimeType(fileName: string): string {
+  const ext = fileName.split(".").pop()?.toLowerCase() ?? "";
+  if (ext === "txt") return "text/plain";
+  if (ext === "md" || ext === "markdown") return "text/markdown";
+  if (ext === "csv") return "text/csv";
+  if (ext === "json") return "application/json";
+  if (ext === "png") return "image/png";
+  if (ext === "jpg" || ext === "jpeg") return "image/jpeg";
+  if (ext === "gif") return "image/gif";
+  if (ext === "webp") return "image/webp";
+  if (ext === "pdf") return "application/pdf";
+  return "application/octet-stream";
+}
+
+function resolveHistoryMediaKind(mimeType = "", fileName = ""): string {
+  const lower = mimeType.toLowerCase();
+  if (lower.startsWith("image/")) return "image";
+  if (lower.startsWith("audio/")) return "audio";
+  if (lower.startsWith("video/")) return "video";
+  if (lower.startsWith("text/")) return "text";
+  const ext = fileName.split(".").pop()?.toLowerCase() ?? "";
+  if (["txt", "md", "csv", "json", "log"].includes(ext)) return "text";
+  return "file";
 }
 
 function parseJsonObject(value: string): unknown | undefined {

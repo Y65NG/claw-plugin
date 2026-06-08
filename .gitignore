@@ -6,3 +6,5 @@ web/dist
 web/.vite
 plugin/dist
 *.log
+__pycache__/
+*.pyc

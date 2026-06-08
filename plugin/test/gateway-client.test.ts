@@ -1995,6 +1995,114 @@ describe("gateway client", () => {
     await new Promise<void>((resolve) => wss.close(() => resolve()));
   });
 
+  it("synthesizes output_files process steps for QClaw write results in chat history", async () => {
+    const previousHome = process.env.HOME;
+    const tempHome = mkdtempSync(join(tmpdir(), "qclaw-history-home-"));
+    tempDirs.add(tempHome);
+    process.env.HOME = tempHome;
+    const workspace = join(tempHome, ".qclaw", "workspace");
+    mkdirSync(workspace, { recursive: true });
+    const outputPath = join(workspace, "chinese_classics.txt");
+    writeFileSync(outputPath, "history output");
+
+    const now = Date.now();
+    const history = [
+      {
+        role: "user",
+        content: [{ type: "text", text: "write a file" }],
+        timestamp: now,
+        __openclaw: { seq: 1 }
+      },
+      {
+        role: "assistant",
+        content: [
+          {
+            type: "toolCall",
+            id: "call-write",
+            name: "write",
+            arguments: { path: outputPath, content: "history output" }
+          }
+        ],
+        timestamp: now + 1,
+        __openclaw: { seq: 2 }
+      },
+      {
+        role: "toolResult",
+        toolCallId: "call-write",
+        toolName: "write",
+        content: [{ type: "text", text: `Successfully wrote 14 bytes to ${outputPath}` }],
+        timestamp: now + 2,
+        __openclaw: { seq: 3 }
+      },
+      {
+        role: "assistant",
+        content: [{ type: "text", text: `Saved to ${outputPath}` }],
+        timestamp: now + 3,
+        __openclaw: { seq: 4 }
+      }
+    ];
+    const httpServer = createServer();
+    servers.add(httpServer);
+    const wss = new WebSocketServer({ noServer: true });
+
+    httpServer.on("upgrade", (request, socket, head) => {
+      wss.handleUpgrade(request, socket, head, (client) => {
+        client.send(JSON.stringify({ type: "event", event: "connect.challenge", payload: { nonce: "nonce-1" } }));
+        client.on("message", (data) => {
+          const frame = JSON.parse(data.toString()) as { id: string; method: string };
+          if (frame.method === "connect") {
+            client.send(JSON.stringify({ type: "res", id: frame.id, ok: true, payload: { protocol: 4 } }));
+            return;
+          }
+          if (frame.method === "chat.history") {
+            client.send(JSON.stringify({ type: "res", id: frame.id, ok: true, payload: { messages: history, total: history.length, hasMore: false } }));
+            return;
+          }
+          client.send(JSON.stringify({ type: "res", id: frame.id, ok: true, payload: { ok: true } }));
+        });
+      });
+    });
+
+    const address = await listen(httpServer);
+    const client = createGatewayClient({
+      baseUrl: address.replace("http://", "ws://"),
+      secret: "shared-token"
+    });
+
+    try {
+      const events = await client.listEvents("session-1", 0);
+      const outputStep = events.find((event) => event.kind === "process.step");
+      expect(events.map((event) => event.kind)).toEqual([
+        "tool.call",
+        "tool.result",
+        "process.step",
+        "assistant.message"
+      ]);
+      expect(outputStep?.payload.process_step).toMatchObject({
+        step_code: "output_files",
+        status: "completed",
+        data: {
+          files: [
+            {
+              file_name: "chinese_classics.txt",
+              mime_type: "text/plain",
+              size: 14,
+              base64: Buffer.from("history output").toString("base64")
+            }
+          ]
+        }
+      });
+    } finally {
+      if (previousHome === undefined) {
+        delete process.env.HOME;
+      } else {
+        process.env.HOME = previousHome;
+      }
+      await client.stop();
+      await new Promise<void>((resolve) => wss.close(() => resolve()));
+    }
+  });
+
   it("sanitizes thinking signals when raw thinking is disabled", async () => {
     const received: Array<{
       kind: string;

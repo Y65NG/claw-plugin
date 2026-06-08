@@ -87,6 +87,33 @@
           "maxReconnectAttempts": {
             "type": "number",
             "default": 10
+          },
+          "detectCreatedFiles": {
+            "type": "boolean",
+            "default": true,
+            "description": "When true, scan local workspace directories before and after each 53AIHub run and return newly created files as output_files."
+          },
+          "fileWorkspaceDirs": {
+            "type": "array",
+            "items": {
+              "type": "string"
+            },
+            "description": "Optional workspace directories to scan for newly created output files. Inferred QClaw/OpenClaw workspaces are also used when available."
+          },
+          "createdFilesMaxFileBytes": {
+            "type": "number",
+            "default": 10485760
+          },
+          "createdFilesMaxCount": {
+            "type": "number",
+            "default": 20
+          },
+          "createdFilesExclude": {
+            "type": "array",
+            "items": {
+              "type": "string"
+            },
+            "description": "Glob-like path patterns excluded from local output file detection."
           }
         }
       },
