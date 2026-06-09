@@ -1,4 +1,4 @@
-import { randomUUID } from "node:crypto";
+import { createHash, randomUUID } from "node:crypto";
 import { existsSync, lstatSync, readFileSync, readdirSync } from "node:fs";
 import { dirname, join, relative, resolve } from "node:path";
 import { pathToFileURL } from "node:url";
@@ -127,6 +127,7 @@ type SessionSubscription = {
   openedAtMs: number;
   activeRunIds: Set<string>;
   renderedAssistantTextByRun: Map<string, string>;
+  skippedSessionAssistantText: Set<string>;
   renderedThinkingTextByRun: Map<string, string>;
 };
 
@@ -166,14 +167,25 @@ export function createGatewayClient(config: Partial<GatewayConfig>): GatewayClie
   const emitEvents = (sessionId: string, events: GatewayEvent[]) => {
     const subscription = subscriptions.get(sessionId);
     if (!subscription) {
+      logOpenClawDuplicateTrace("gateway.emit.no_subscription", { sessionId, eventCount: events.length });
       return;
     }
 
     for (const event of events) {
       if (event.seq <= subscription.lastSeq) {
+        logOpenClawDuplicateTrace("gateway.emit.skip_old_seq", {
+          sessionId,
+          lastSeq: subscription.lastSeq,
+          event: summarizeGatewayEventForDuplicateTrace(event)
+        });
         continue;
       }
       subscription.lastSeq = Math.max(subscription.lastSeq, event.seq);
+      logOpenClawDuplicateTrace("gateway.emit.forward", {
+        sessionId,
+        lastSeq: subscription.lastSeq,
+        event: summarizeGatewayEventForDuplicateTrace(event)
+      });
       for (const handler of subscription.handlers) {
         handler.onEvent(event);
       }
@@ -194,6 +206,7 @@ export function createGatewayClient(config: Partial<GatewayConfig>): GatewayClie
       openedAtMs: Date.now(),
       activeRunIds: new Set<string>(),
       renderedAssistantTextByRun: new Map<string, string>(),
+      skippedSessionAssistantText: new Set<string>(),
       renderedThinkingTextByRun: new Map<string, string>()
     };
     subscription.lastSeq = Math.max(subscription.lastSeq, afterSeq);
@@ -272,6 +285,16 @@ export function createGatewayClient(config: Partial<GatewayConfig>): GatewayClie
     }
 
     const events = mapGatewayFrameToEvents(frame, subscription.lastSeq, subscription, resolved.exposeRawThinking);
+    logOpenClawDuplicateTrace("gateway.frame.mapped", {
+      sessionId,
+      frameEvent: frame.event,
+      frameSeq: frame.seq,
+      lastSeq: subscription.lastSeq,
+      payloadSeq: toRecord(frame.payload).seq,
+      payloadState: toRecord(frame.payload).state,
+      runId: toRecord(frame.payload).runId,
+      events: events.map(summarizeGatewayEventForDuplicateTrace)
+    });
     updateActiveRunTracking(frame, subscription);
     emitEvents(sessionId, events);
   });
@@ -2642,6 +2665,8 @@ function mapGatewayFrameToEvents(
     if (!content.trim() && !thinking?.trim()) {
       return [];
     }
+    const shouldSkipAssistantContent =
+      role === "assistant" && content.trim() && shouldSkipLiveSessionAssistantMessage(subscription, content);
     const rawSeq = Number(payload.messageSeq ?? messageMeta.seq);
     let seq = Number.isFinite(rawSeq) ? Math.max(lastSeq + 1, rawSeq) : lastSeq + 1;
     const createdAt = toIsoString(message.timestamp ?? Date.now());
@@ -2662,7 +2687,7 @@ function mapGatewayFrameToEvents(
       });
       seq += 1;
     }
-    if (content.trim()) {
+    if (content.trim() && !shouldSkipAssistantContent) {
       events.push({
         id: `${sessionId}:message:${seq}`,
         sessionId,
@@ -2678,7 +2703,8 @@ function mapGatewayFrameToEvents(
   }
 
   if (frame.event === "session.tool") {
-    const seq = Number(payload.seq ?? lastSeq + 1);
+    const rawSeq = Number(payload.seq);
+    const seq = Number.isFinite(rawSeq) ? Math.max(lastSeq + 1, rawSeq) : lastSeq + 1;
     const data = toRecord(payload.data);
     const kind = String(payload.phase ?? data.phase ?? "tool");
     return [
@@ -2687,7 +2713,10 @@ function mapGatewayFrameToEvents(
         sessionId,
         seq,
         kind: ["result", "done", "output"].includes(kind) ? "tool.result" : "tool.call",
-        payload: frame.payload ?? {},
+        payload: {
+          ...(frame.payload ?? {}),
+          ...(Number.isFinite(rawSeq) ? { rawSeq } : {})
+        },
         createdAt: new Date().toISOString()
       }
     ];
@@ -2742,6 +2771,77 @@ function mapGatewayFrameToEvents(
   }
 
   return [];
+}
+
+function shouldSkipLiveSessionAssistantMessage(subscription: SessionSubscription | undefined, content: string): boolean {
+  if (!subscription) {
+    return false;
+  }
+  const normalized = normalizeComparableAssistantText(content);
+  if (!normalized) {
+    return false;
+  }
+  if (subscription.skippedSessionAssistantText.has(normalized)) {
+    return true;
+  }
+  for (const renderedText of subscription.renderedAssistantTextByRun.values()) {
+    const rendered = normalizeComparableAssistantText(renderedText);
+    if (rendered && (rendered === normalized || rendered.endsWith(normalized))) {
+      subscription.skippedSessionAssistantText.add(normalized);
+      return true;
+    }
+  }
+  return false;
+}
+
+function normalizeComparableAssistantText(value: string): string {
+  return value.replace(/\s+/g, " ").trim();
+}
+
+function isOpenClawDuplicateTraceEnabled(): boolean {
+  const value = String(process.env.OPENCLAW_TRACE_DUPLICATES ?? process.env.OPENCLAW_DIAG_LOGS ?? "").toLowerCase();
+  return value === "1" || value === "true" || value === "yes";
+}
+
+function logOpenClawDuplicateTrace(label: string, payload: Record<string, unknown>): void {
+  if (!isOpenClawDuplicateTraceEnabled()) {
+    return;
+  }
+  try {
+    console.info(`[openclaw-dup-trace] ${label} ${JSON.stringify(payload)}`);
+  } catch {
+    console.info(`[openclaw-dup-trace] ${label}`);
+  }
+}
+
+function summarizeGatewayEventForDuplicateTrace(event: GatewayEvent): Record<string, unknown> {
+  const payload = toRecord(event.payload);
+  const content = typeof payload.content === "string" ? payload.content : "";
+  const timeline = toRecord(payload.openclaw_timeline);
+  return {
+    id: event.id,
+    kind: event.kind,
+    seq: event.seq,
+    rawSeq: payload.rawSeq,
+    runId: payload.runId,
+    state: payload.state,
+    mode: payload.mode,
+    replace: payload.replace,
+    segmentId: traceString(timeline.segment_id, payload.segment_id),
+    segmentType: traceString(timeline.segment_type, payload.segment_type),
+    deltaIndex: timeline.delta_index ?? payload.delta_index,
+    contentLength: content.length,
+    contentHash: content ? createHash("sha1").update(content).digest("hex").slice(0, 12) : ""
+  };
+}
+
+function traceString(...values: unknown[]): string {
+  for (const value of values) {
+    if (typeof value === "string" && value.trim()) {
+      return value;
+    }
+  }
+  return "";
 }
 
 function normalizeRunEndStatus(value: unknown): "completed" | "failed" | "interrupted" | "unknown" {

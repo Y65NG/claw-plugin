@@ -1783,6 +1783,109 @@ describe("53AIHub client", () => {
     }
   });
 
+  it("streams full replacement snapshots without appending stale draft text", async () => {
+    const stateDir = await mkdtemp(join(tmpdir(), "claw-53aihub-"));
+    cleanupPaths.push(stateDir);
+
+    const server = await createFakeHubServer();
+    cleanupServers.push(server.close);
+
+    const gateway = new FakeGateway();
+    const draft = "旧草稿：天气未知";
+    const finalText = "上海今日天气总体良好，无雨，傍晚转晴。";
+    gateway.eventsToEmit = [
+      {
+        id: "evt-draft",
+        sessionId: "session-1",
+        seq: 1,
+        kind: "assistant.delta",
+        payload: { content: draft, mode: "append", replace: false },
+        createdAt: new Date().toISOString()
+      },
+      {
+        id: "evt-replace",
+        sessionId: "session-1",
+        seq: 2,
+        kind: "assistant.delta",
+        payload: { content: finalText, mode: "replace", replace: true },
+        createdAt: new Date().toISOString()
+      },
+      {
+        id: "evt-final",
+        sessionId: "session-1",
+        seq: 3,
+        kind: "assistant.message",
+        payload: { content: finalText, mode: "replace", replace: true, state: "final" },
+        createdAt: new Date().toISOString()
+      },
+      {
+        id: "evt-completed",
+        sessionId: "session-1",
+        seq: 4,
+        kind: "run.completed",
+        payload: { content: finalText, mode: "replace", replace: true },
+        createdAt: new Date().toISOString()
+      }
+    ];
+
+    const bridge = createHub53AIBridge({
+      stateDir,
+      config: {
+        enabled: true,
+        botId: "bot-123",
+        secret: "sk-secret",
+        wsUrl: server.url,
+        accessPolicy: "open",
+        allowFrom: [],
+        sendThinkingMessage: false,
+        reconnectBaseMs: 20,
+        maxReconnectAttempts: 2
+      },
+      gateway,
+      callbacks: {
+        onSessionUpsert: async (session) => {
+          gateway.upsertSession(session);
+        },
+        onUserMessage: async () => undefined,
+        onSessionStatus: async () => undefined,
+        onEnsureSessionStream: async () => undefined,
+        getLastEventSeq: () => 0,
+        onStatusChange: () => undefined
+      }
+    });
+
+    await bridge.start();
+    try {
+      const connection = await server.connected;
+      connection.socket.send(
+        JSON.stringify({
+          req_id: "req-replace",
+          action: "chat",
+          data: {
+            user: "user-a",
+            conversation_id: "chat-a",
+            messages: [{ role: "user", content: "weather" }]
+          }
+        })
+      );
+
+      await waitFor(() => {
+        const streamingFrames = server.frames.filter((frame) => frame.action === "chat" && frame.status === "streaming");
+        expect(streamingFrames.map((frame) => frame.data.choices[0]?.delta.content ?? "")).toEqual([draft, finalText]);
+        expect(streamingFrames.map((frame) => frame.data.replace)).toEqual([false, true]);
+        expect(streamingFrames.map((frame) => frame.data.payload?.mode)).toEqual(["append", "replace"]);
+        expect(streamingFrames.map((frame) => frame.data.payload?.replace)).toEqual([false, true]);
+        expect(streamingFrames.map((frame) => frame.data.choices[0]?.delta.content ?? "")).not.toContain(
+          `${draft}${finalText}`
+        );
+        const done = server.frames.find((frame) => frame.action === "chat" && frame.status === "done");
+        expect(done?.data.choices[0]?.delta.content).toBe("");
+      });
+    } finally {
+      await bridge.stop();
+    }
+  });
+
   it("responds to request-response RPC actions without starting a chat run", async () => {
     const stateDir = await mkdtemp(join(tmpdir(), "claw-53aihub-rpc-"));
     cleanupPaths.push(stateDir);
@@ -3305,6 +3408,249 @@ describe("53AIHub client", () => {
               }
             ],
             pagination: { limit: 10, offset: 0, total: 1, hasMore: false }
+          }
+        });
+      });
+    } finally {
+      await bridge.stop();
+    }
+  });
+
+  it("deduplicates assistant message echoes while preserving the richer chat final event", async () => {
+    const stateDir = await mkdtemp(join(tmpdir(), "claw-53aihub-rpc-events-"));
+    cleanupPaths.push(stateDir);
+
+    const server = await createFakeHubServer();
+    cleanupServers.push(server.close);
+
+    const gateway = new FakeGateway();
+    const finalText = "上海今日天气总体良好，无雨。";
+    gateway.eventsBySession.set("session-1", [
+      {
+        id: "run-started",
+        sessionId: "session-1",
+        seq: 1,
+        kind: "run.started",
+        payload: { runId: "run-weather" },
+        createdAt: "2026-06-09T07:15:36.000Z"
+      },
+      {
+        id: "session-message-final",
+        sessionId: "session-1",
+        seq: 2,
+        kind: "assistant.message",
+        payload: { content: finalText },
+        createdAt: "2026-06-09T07:15:52.000Z"
+      },
+      {
+        id: "chat-final",
+        sessionId: "session-1",
+        seq: 3,
+        kind: "assistant.message",
+        payload: {
+          content: finalText,
+          runId: "run-weather",
+          rawSeq: 46,
+          state: "final",
+          mode: "replace"
+        },
+        createdAt: "2026-06-09T07:16:02.000Z"
+      }
+    ]);
+
+    const bridge = createHub53AIBridge({
+      stateDir,
+      config: {
+        enabled: true,
+        botId: "bot-123",
+        secret: "sk-secret",
+        wsUrl: server.url,
+        accessPolicy: "open",
+        allowFrom: [],
+        sendThinkingMessage: false,
+        reconnectBaseMs: 20,
+        maxReconnectAttempts: 2
+      },
+      gateway,
+      callbacks: {
+        onSessionUpsert: async (session) => {
+          gateway.upsertSession(session);
+        },
+        onUserMessage: async () => undefined,
+        onSessionStatus: async () => undefined,
+        onEnsureSessionStream: async () => undefined,
+        getLastEventSeq: () => 0,
+        onStatusChange: () => undefined
+      }
+    });
+
+    await bridge.start();
+    try {
+      const connection = await server.connected;
+      connection.socket.send(
+        JSON.stringify({
+          req_id: "rpc-assistant-echo-dedupe",
+          action: "sessions.events",
+          status: "request",
+          data: { session_id: "session-1", limit: 10, offset: 0 }
+        })
+      );
+
+      await waitFor(() => {
+        expect(frameByReq(server.frames, "rpc-assistant-echo-dedupe")).toMatchObject({
+          action: "sessions.events",
+          status: "done",
+          data: {
+            events: [
+              { id: "run-started", kind: "run.started" },
+              {
+                id: "chat-final",
+                seq: 3,
+                kind: "assistant.message",
+                payload: {
+                  content: finalText,
+                  runId: "run-weather",
+                  rawSeq: 46,
+                  state: "final",
+                  mode: "replace"
+                }
+              }
+            ],
+            pagination: { limit: 10, offset: 0, total: 2, hasMore: false }
+          }
+        });
+      });
+    } finally {
+      await bridge.stop();
+    }
+  });
+
+  it("collapses a provisional session.message answer into the later chat replace final snapshot", async () => {
+    const stateDir = await mkdtemp(join(tmpdir(), "claw-53aihub-rpc-events-"));
+    cleanupPaths.push(stateDir);
+
+    const server = await createFakeHubServer();
+    cleanupServers.push(server.close);
+
+    const gateway = new FakeGateway();
+    const provisionalText = "搜索结果主要是网络小说和新书，让我重新搜索更全面的经典小说推荐。";
+    const finalText = "十部经典小说推荐如下：一、红楼梦。二、百年孤独。三、堂吉诃德。四、战争与和平。";
+    gateway.eventsBySession.set("session-1", [
+      {
+        id: "run-started",
+        sessionId: "session-1",
+        seq: 10,
+        kind: "run.started",
+        payload: { runId: "run-books" },
+        createdAt: "2026-06-09T07:15:36.000Z"
+      },
+      {
+        id: "session-message-final",
+        sessionId: "session-1",
+        seq: 11,
+        kind: "assistant.message",
+        payload: { content: provisionalText },
+        createdAt: "2026-06-09T07:15:52.000Z"
+      },
+      {
+        id: "chat-replace-delta",
+        sessionId: "session-1",
+        seq: 12,
+        kind: "assistant.delta",
+        payload: {
+          content: finalText,
+          runId: "run-books",
+          rawSeq: 926,
+          state: "delta",
+          mode: "replace",
+          replace: true
+        },
+        createdAt: "2026-06-09T07:16:00.000Z"
+      },
+      {
+        id: "chat-final",
+        sessionId: "session-1",
+        seq: 13,
+        kind: "assistant.message",
+        payload: {
+          content: finalText,
+          runId: "run-books",
+          rawSeq: 926,
+          state: "final",
+          mode: "replace"
+        },
+        createdAt: "2026-06-09T07:16:02.000Z"
+      },
+      {
+        id: "run-completed",
+        sessionId: "session-1",
+        seq: 14,
+        kind: "run.completed",
+        payload: { runId: "run-books" },
+        createdAt: "2026-06-09T07:16:03.000Z"
+      }
+    ]);
+
+    const bridge = createHub53AIBridge({
+      stateDir,
+      config: {
+        enabled: true,
+        botId: "bot-123",
+        secret: "sk-secret",
+        wsUrl: server.url,
+        accessPolicy: "open",
+        allowFrom: [],
+        sendThinkingMessage: false,
+        reconnectBaseMs: 20,
+        maxReconnectAttempts: 2
+      },
+      gateway,
+      callbacks: {
+        onSessionUpsert: async (session) => {
+          gateway.upsertSession(session);
+        },
+        onUserMessage: async () => undefined,
+        onSessionStatus: async () => undefined,
+        onEnsureSessionStream: async () => undefined,
+        getLastEventSeq: () => 0,
+        onStatusChange: () => undefined
+      }
+    });
+
+    await bridge.start();
+    try {
+      const connection = await server.connected;
+      connection.socket.send(
+        JSON.stringify({
+          req_id: "rpc-assistant-replace-dedupe",
+          action: "sessions.events",
+          status: "request",
+          data: { session_id: "session-1", limit: 10, offset: 0 }
+        })
+      );
+
+      await waitFor(() => {
+        expect(frameByReq(server.frames, "rpc-assistant-replace-dedupe")).toMatchObject({
+          action: "sessions.events",
+          status: "done",
+          data: {
+            events: [
+              { id: "run-started", kind: "run.started" },
+              {
+                id: "chat-final",
+                seq: 13,
+                kind: "assistant.message",
+                payload: {
+                  content: finalText,
+                  runId: "run-books",
+                  rawSeq: 926,
+                  state: "final",
+                  mode: "replace"
+                }
+              },
+              { id: "run-completed", kind: "run.completed" }
+            ],
+            pagination: { limit: 10, offset: 0, total: 3, hasMore: false }
           }
         });
       });

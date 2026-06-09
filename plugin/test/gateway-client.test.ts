@@ -1586,6 +1586,113 @@ describe("gateway client", () => {
     await new Promise<void>((resolve) => wss.close(() => resolve()));
   });
 
+  it("skips live assistant session.message echoes after chat has rendered the same answer", async () => {
+    const received: Array<{ kind: string; content: string; mode?: unknown }> = [];
+    const finalAnswer = "最终答案：天气总体良好。";
+    const httpServer = createServer();
+    servers.add(httpServer);
+    const wss = new WebSocketServer({ noServer: true });
+
+    httpServer.on("upgrade", (request, socket, head) => {
+      wss.handleUpgrade(request, socket, head, (client) => {
+        client.send(
+          JSON.stringify({
+            type: "event",
+            event: "connect.challenge",
+            payload: { nonce: "nonce-1" }
+          })
+        );
+
+        client.on("message", (data) => {
+          const frame = JSON.parse(data.toString()) as {
+            id: string;
+            method: string;
+          };
+
+          if (frame.method === "connect") {
+            client.send(JSON.stringify({ type: "res", id: frame.id, ok: true, payload: { protocol: 4 } }));
+            return;
+          }
+
+          client.send(JSON.stringify({ type: "res", id: frame.id, ok: true, payload: { ok: true } }));
+
+          if (frame.method === "sessions.messages.subscribe") {
+            const now = Date.now();
+            client.send(
+              JSON.stringify({
+                type: "event",
+                event: "chat",
+                payload: {
+                  sessionKey: "agent:main:test-session",
+                  runId: "run-1",
+                  seq: 1,
+                  state: "delta",
+                  deltaText: "最终答案：",
+                  message: { role: "assistant", content: [{ type: "text", text: "最终答案：" }], timestamp: now }
+                }
+              })
+            );
+            client.send(
+              JSON.stringify({
+                type: "event",
+                event: "chat",
+                payload: {
+                  sessionKey: "agent:main:test-session",
+                  runId: "run-1",
+                  seq: 2,
+                  state: "delta",
+                  deltaText: finalAnswer,
+                  message: { role: "assistant", content: [{ type: "text", text: finalAnswer }], timestamp: now }
+                }
+              })
+            );
+            client.send(
+              JSON.stringify({
+                type: "event",
+                event: "session.message",
+                payload: {
+                  sessionKey: "agent:main:test-session",
+                  messageSeq: 7,
+                  message: {
+                    role: "assistant",
+                    content: [{ type: "text", text: finalAnswer }],
+                    timestamp: now
+                  }
+                }
+              })
+            );
+          }
+        });
+      });
+    });
+
+    const address = await listen(httpServer);
+    const client = createGatewayClient({
+      baseUrl: address.replace("http://", "ws://"),
+      secret: "shared-token"
+    });
+
+    const close = client.subscribe("agent:main:test-session", 0, {
+      onEvent: (event) =>
+        received.push({
+          kind: event.kind,
+          content: String((event.payload as { content?: string }).content ?? ""),
+          mode: (event.payload as { mode?: unknown }).mode
+        }),
+      onDisconnect: () => {}
+    });
+
+    await eventually(() =>
+      expect(received).toEqual([
+        { kind: "assistant.delta", content: "最终答案：", mode: "append" },
+        { kind: "assistant.delta", content: finalAnswer, mode: "replace" }
+      ])
+    );
+    close();
+    await client.stop();
+    await new Promise<void>((resolve) => wss.close(() => resolve()));
+  });
+
   it("strips reasoning-prefixed final snapshots when streamed answer text is already known", async () => {
     const received: Array<{ kind: string; content: string; mode?: unknown }> = [];
     const finalAnswer = "Final visible answer.";
@@ -1762,6 +1869,98 @@ describe("gateway client", () => {
             }
           }
         }
+      ])
+    );
+    close();
+    await client.stop();
+    await new Promise<void>((resolve) => wss.close(() => resolve()));
+  });
+
+  it("renumbers live session.tool events above the subscription cursor while preserving raw seq", async () => {
+    const received: Array<{ kind: string; seq: number; rawSeq?: unknown; name?: unknown }> = [];
+    const httpServer = createServer();
+    servers.add(httpServer);
+    const wss = new WebSocketServer({ noServer: true });
+
+    httpServer.on("upgrade", (request, socket, head) => {
+      wss.handleUpgrade(request, socket, head, (client) => {
+        client.send(
+          JSON.stringify({
+            type: "event",
+            event: "connect.challenge",
+            payload: { nonce: "nonce-1" }
+          })
+        );
+
+        client.on("message", (data) => {
+          const frame = JSON.parse(data.toString()) as {
+            id: string;
+            method: string;
+          };
+
+          if (frame.method === "connect") {
+            client.send(JSON.stringify({ type: "res", id: frame.id, ok: true, payload: { protocol: 4 } }));
+            return;
+          }
+
+          client.send(JSON.stringify({ type: "res", id: frame.id, ok: true, payload: { ok: true } }));
+
+          if (frame.method === "sessions.messages.subscribe") {
+            client.send(
+              JSON.stringify({
+                type: "event",
+                event: "chat",
+                payload: {
+                  sessionKey: "agent:main:test-session",
+                  seq: 100,
+                  state: "delta",
+                  deltaText: "hello",
+                  runId: "run-1",
+                  message: { role: "assistant", content: [{ type: "text", text: "hello" }] }
+                }
+              })
+            );
+            client.send(
+              JSON.stringify({
+                type: "event",
+                event: "session.tool",
+                payload: {
+                  sessionKey: "agent:main:test-session",
+                  seq: 2,
+                  runId: "run-1",
+                  phase: "call",
+                  data: {
+                    name: "write_file"
+                  }
+                }
+              })
+            );
+          }
+        });
+      });
+    });
+
+    const address = await listen(httpServer);
+    const client = createGatewayClient({
+      baseUrl: address.replace("http://", "ws://"),
+      secret: "shared-token"
+    });
+
+    const close = client.subscribe("agent:main:test-session", 100, {
+      onEvent: (event) =>
+        received.push({
+          kind: event.kind,
+          seq: event.seq,
+          rawSeq: (event.payload as { rawSeq?: unknown }).rawSeq,
+          name: (event.payload as { data?: { name?: unknown } }).data?.name
+        }),
+      onDisconnect: () => {}
+    });
+
+    await eventually(() =>
+      expect(received).toEqual([
+        { kind: "assistant.delta", seq: 101, rawSeq: 100, name: undefined },
+        { kind: "tool.call", seq: 102, rawSeq: 2, name: "write_file" }
       ])
     );
     close();

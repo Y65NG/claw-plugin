@@ -1,4 +1,4 @@
-import { randomUUID } from "node:crypto";
+import { createHash, randomUUID } from "node:crypto";
 import { mkdir, readFile, writeFile } from "node:fs/promises";
 import { dirname, join } from "node:path";
 
@@ -556,7 +556,17 @@ export function createHub53AIBridge(input: HubBridgeInput) {
       input.gateway.listEvents(sessionId, 0),
       input.callbacks.listSessionEvents?.(sessionId) ?? []
     ]);
-    return dedupeTimelineEvents([...gatewayEvents, ...storedEvents]);
+    const deduped = dedupeTimelineEvents([...gatewayEvents, ...storedEvents]);
+    traceOpenClawDuplicate(input.logger, "hub.events.list", {
+      sessionId,
+      gatewayCount: gatewayEvents.length,
+      storedCount: storedEvents.length,
+      dedupedCount: deduped.length,
+      gatewayTail: gatewayEvents.slice(-6).map(summarizeTimelineEventForTrace),
+      storedTail: storedEvents.slice(-6).map(summarizeTimelineEventForTrace),
+      dedupedTail: deduped.slice(-6).map(summarizeTimelineEventForTrace)
+    });
+    return deduped;
   }
 
   function dedupeTimelineEvents(events: TimelineEvent[]): TimelineEvent[] {
@@ -566,7 +576,9 @@ export function createHub53AIBridge(input: HubBridgeInput) {
       const previous = byKey.get(key);
       byKey.set(key, previous ? mergeTimelineEvent(previous, event) : event);
     }
-    return [...byKey.values()].sort((left, right) => left.seq - right.seq);
+    return dedupeAssistantAnswerSnapshots(
+      dedupeAssistantMessageEchoes([...byKey.values()].sort((left, right) => left.seq - right.seq))
+    );
   }
 
   function timelineEventDedupeKey(event: TimelineEvent): string {
@@ -601,6 +613,214 @@ export function createHub53AIBridge(input: HubBridgeInput) {
           }
         : {})
     };
+  }
+
+  function dedupeAssistantMessageEchoes(events: TimelineEvent[]): TimelineEvent[] {
+    const output: TimelineEvent[] = [];
+    const assistantMessageByContent = new Map<string, number>();
+    for (const event of events) {
+      if (event.kind === "user.message" || event.kind === "run.started") {
+        assistantMessageByContent.clear();
+        output.push(event);
+        continue;
+      }
+      if (event.kind !== "assistant.message") {
+        output.push(event);
+        continue;
+      }
+
+      const contentKey = normalizeAssistantDedupeContent(String(event.payload?.content ?? ""));
+      if (!contentKey) {
+        output.push(event);
+        continue;
+      }
+
+      const previousIndex = assistantMessageByContent.get(contentKey);
+      if (previousIndex === undefined) {
+        assistantMessageByContent.set(contentKey, output.length);
+        output.push(event);
+        continue;
+      }
+
+      const previous = output[previousIndex];
+      if (shouldPreferAssistantMessageEvent(event, previous)) {
+        output[previousIndex] = {
+          ...event,
+          payload: mergeTimelinePayload(previous.payload, event.payload)
+        };
+      }
+    }
+    return output.sort((left, right) => left.seq - right.seq);
+  }
+
+  function dedupeAssistantAnswerSnapshots(events: TimelineEvent[]): TimelineEvent[] {
+    const output: TimelineEvent[] = [];
+    const candidateIndexes: number[] = [];
+
+    for (const event of events) {
+      if (event.kind === "user.message" || event.kind === "run.started") {
+        candidateIndexes.length = 0;
+        output.push(event);
+        continue;
+      }
+
+      if (!isAssistantAnswerSnapshotEvent(event)) {
+        output.push(event);
+        continue;
+      }
+
+      const replacementIndex = findAssistantAnswerReplacementIndex(output, candidateIndexes, event);
+      if (replacementIndex >= 0) {
+        const previous = output[replacementIndex]!;
+        if (shouldPreferAssistantAnswerSnapshot(event, previous)) {
+          output[replacementIndex] = {
+            ...event,
+            payload: mergeTimelinePayload(previous.payload, event.payload)
+          };
+        }
+        continue;
+      }
+
+      candidateIndexes.push(output.length);
+      output.push(event);
+    }
+
+    return output.sort((left, right) => left.seq - right.seq);
+  }
+
+  function isAssistantAnswerSnapshotEvent(event: TimelineEvent): boolean {
+    if (event.kind !== "assistant.message" && event.kind !== "assistant.delta") {
+      return false;
+    }
+    return normalizeAssistantDedupeContent(String(event.payload?.content ?? "")) !== "";
+  }
+
+  function findAssistantAnswerReplacementIndex(
+    output: TimelineEvent[],
+    candidateIndexes: number[],
+    incoming: TimelineEvent
+  ): number {
+    for (let position = candidateIndexes.length - 1; position >= 0; position -= 1) {
+      const index = candidateIndexes[position]!;
+      const previous = output[index];
+      if (previous && canCollapseAssistantAnswerSnapshot(previous, incoming)) {
+        return index;
+      }
+    }
+    return -1;
+  }
+
+  function canCollapseAssistantAnswerSnapshot(previous: TimelineEvent, incoming: TimelineEvent): boolean {
+    if (previous.sessionId !== incoming.sessionId) {
+      return false;
+    }
+
+    const previousSegmentId = readAssistantAnswerSegmentId(previous);
+    const incomingSegmentId = readAssistantAnswerSegmentId(incoming);
+    if (previousSegmentId && incomingSegmentId) {
+      return previousSegmentId === incomingSegmentId;
+    }
+
+    const previousRunId = readStringMetadata(previous.payload, "runId");
+    const incomingRunId = readStringMetadata(incoming.payload, "runId");
+    if (previousRunId && incomingRunId && previousRunId === incomingRunId) {
+      return true;
+    }
+
+    if (isBareSessionAssistantMessageSnapshot(previous) && isAuthoritativeChatAnswerSnapshot(incoming)) {
+      const distance = Math.abs(Number(incoming.seq || 0) - Number(previous.seq || 0));
+      return distance > 0 && distance <= 20;
+    }
+
+    if (!shouldPreferAssistantAnswerSnapshot(incoming, previous)) {
+      return false;
+    }
+
+    return areAssistantAnswerContentsRelated(
+      String(previous.payload?.content ?? ""),
+      String(incoming.payload?.content ?? "")
+    );
+  }
+
+  function readAssistantAnswerSegmentId(event: TimelineEvent): string {
+    const payload = toRecord(event.payload);
+    const timeline = toRecord(payload.openclaw_timeline);
+    return stringOr(timeline.segment_id, payload.segment_id);
+  }
+
+  function shouldPreferAssistantAnswerSnapshot(incoming: TimelineEvent, previous: TimelineEvent): boolean {
+    return assistantAnswerSnapshotSpecificity(incoming) >= assistantAnswerSnapshotSpecificity(previous);
+  }
+
+  function isBareSessionAssistantMessageSnapshot(event: TimelineEvent): boolean {
+    if (event.kind !== "assistant.message") {
+      return false;
+    }
+    const payload = toRecord(event.payload);
+    return !readStringMetadata(payload, "runId") && payload.rawSeq === undefined && !readAssistantAnswerSegmentId(event);
+  }
+
+  function isAuthoritativeChatAnswerSnapshot(event: TimelineEvent): boolean {
+    const payload = toRecord(event.payload);
+    if (!readStringMetadata(payload, "runId")) {
+      return false;
+    }
+    return event.kind === "assistant.message" || payload.replace === true || readStringMetadata(payload, "mode") === "replace";
+  }
+
+  function assistantAnswerSnapshotSpecificity(event: TimelineEvent): number {
+    const payload = toRecord(event.payload);
+    let score = assistantMessageSpecificity(event);
+    if (event.kind === "assistant.message") score += 8;
+    if (event.kind === "assistant.delta") score += 2;
+    if (payload.replace === true) score += 2;
+    if (payload.final === true) score += 2;
+    if (readStringMetadata(payload, "visibility") === "final") score += 2;
+    return score;
+  }
+
+  function areAssistantAnswerContentsRelated(leftContent: string, rightContent: string): boolean {
+    const left = normalizeAssistantDedupeContent(leftContent);
+    const right = normalizeAssistantDedupeContent(rightContent);
+    if (!left || !right) {
+      return false;
+    }
+    if (left === right || left.includes(right) || right.includes(left)) {
+      return true;
+    }
+    const shorter = Math.min(left.length, right.length);
+    if (shorter < 120) {
+      return false;
+    }
+    const commonPrefix = commonPrefixLength(left, right);
+    return commonPrefix / shorter >= 0.8;
+  }
+
+  function commonPrefixLength(left: string, right: string): number {
+    const limit = Math.min(left.length, right.length);
+    let index = 0;
+    while (index < limit && left[index] === right[index]) {
+      index += 1;
+    }
+    return index;
+  }
+
+  function shouldPreferAssistantMessageEvent(incoming: TimelineEvent, previous: TimelineEvent): boolean {
+    return assistantMessageSpecificity(incoming) >= assistantMessageSpecificity(previous);
+  }
+
+  function assistantMessageSpecificity(event: TimelineEvent): number {
+    const payload = toRecord(event.payload);
+    let score = 0;
+    if (typeof payload.runId === "string" && payload.runId.trim()) score += 4;
+    if (payload.rawSeq !== undefined) score += 2;
+    if (payload.state === "final") score += 1;
+    if (payload.mode === "replace") score += 1;
+    return score;
+  }
+
+  function normalizeAssistantDedupeContent(content: string): string {
+    return content.replace(/\s+/g, " ").trim();
   }
 
   async function resolveRuntimeRPC(payload: unknown): Promise<unknown> {
@@ -909,11 +1129,26 @@ export function createHub53AIBridge(input: HubBridgeInput) {
     eventScope: GatewayEventScope
   ) {
     if (!(activeReqIdsBySession.get(sessionId)?.has(message.reqId) ?? true)) {
+      traceOpenClawDuplicate(input.logger, "hub.event.skip_inactive_req", {
+        reqId: message.reqId,
+        sessionId,
+        event: summarizeTimelineEventForTrace(event)
+      });
       return;
     }
     if (isReplayFromPreviousRun(event, eventScope)) {
+      traceOpenClawDuplicate(input.logger, "hub.event.skip_previous_run", {
+        reqId: message.reqId,
+        sessionId,
+        event: summarizeTimelineEventForTrace(event)
+      });
       return;
     }
+    traceOpenClawDuplicate(input.logger, "hub.event.received", {
+      reqId: message.reqId,
+      sessionId,
+      event: summarizeTimelineEventForTrace(event)
+    });
     if (isCurrentRunActivityEvent(event)) {
       eventScope.currentActivitySeen = true;
     }
@@ -929,7 +1164,17 @@ export function createHub53AIBridge(input: HubBridgeInput) {
 
     if (event.kind === "assistant.delta" || event.kind === "assistant.message") {
       const content = String(event.payload?.content ?? "");
-      const delta = extractReplyDelta(message.reqId, content);
+      const replaceReply = isReplyReplaceEvent(event);
+      const delta = extractReplyDelta(message.reqId, content, replaceReply);
+      traceOpenClawDuplicate(input.logger, "hub.reply.delta_decision", {
+        reqId: message.reqId,
+        sessionId,
+        event: summarizeTimelineEventForTrace(event),
+        replaceReply,
+        inputContentLength: content.length,
+        outputDeltaLength: delta.length,
+        outputDeltaHash: hashTraceText(delta)
+      });
       if (delta) {
         await sendReply({
           reqId: message.reqId,
@@ -988,7 +1233,7 @@ export function createHub53AIBridge(input: HubBridgeInput) {
     }
 
     if (event.kind === "run.completed") {
-      const finalDelta = extractReplyDelta(message.reqId, String(event.payload?.content ?? ""));
+      const finalDelta = extractReplyDelta(message.reqId, String(event.payload?.content ?? ""), isReplyReplaceEvent(event));
       if (finalDelta) {
         await sendReply({
           reqId: message.reqId,
@@ -1081,13 +1326,25 @@ export function createHub53AIBridge(input: HubBridgeInput) {
     });
   }
 
-  function extractReplyDelta(reqId: string, content: string): string {
+  function isReplyReplaceEvent(event: TimelineEvent): boolean {
+    return readBooleanMetadata(event.payload, "replace") === true || readStringMetadata(event.payload, "mode") === "replace";
+  }
+
+  function extractReplyDelta(reqId: string, content: string, replace = false): string {
     if (!content) {
       return "";
     }
 
     const previous = lastReplyByReq.get(reqId) ?? "";
     if (!previous) {
+      lastReplyByReq.set(reqId, content);
+      return content;
+    }
+
+    if (replace) {
+      if (content === previous) {
+        return "";
+      }
       lastReplyByReq.set(reqId, content);
       return content;
     }
@@ -1204,6 +1461,7 @@ export function createHub53AIBridge(input: HubBridgeInput) {
         payload: inputReply.payload
       }
     );
+    traceOpenClawDuplicate(input.logger, "hub.reply.send", summarizeOutgoingFrameForTrace(frame));
     if (!sendRaw(JSON.stringify(frame), true)) {
       state.outbox.push(frame);
       state.outbox = state.outbox.slice(-MAX_OUTBOX_FRAMES);
@@ -1390,8 +1648,11 @@ export function createHub53AIBridge(input: HubBridgeInput) {
         logger: input.logger
       }
     );
+    const recentReferencedPaths = [...eventScope.referencedLocalOutputPaths].filter(
+      (path) => !eventScope.localOutputSnapshot?.files.has(path)
+    );
     const recentReferencedFiles = await collectRecentReferencedLocalOutputFiles(
-      eventScope.referencedLocalOutputPaths,
+      recentReferencedPaths,
       {
         config: input.config,
         configPath: input.configPath,
@@ -1531,6 +1792,96 @@ export function createHub53AIBridge(input: HubBridgeInput) {
     stop,
     getStatus
   };
+}
+
+function isOpenClawDuplicateTraceEnabled(): boolean {
+  const value = String(process.env.OPENCLAW_TRACE_DUPLICATES ?? process.env.OPENCLAW_DIAG_LOGS ?? "").toLowerCase();
+  return value === "1" || value === "true" || value === "yes";
+}
+
+function traceOpenClawDuplicate(
+  logger: HubBridgeInput["logger"] | undefined,
+  label: string,
+  payload: Record<string, unknown>
+): void {
+  if (!isOpenClawDuplicateTraceEnabled()) {
+    return;
+  }
+  const line = `[openclaw-dup-trace] ${label} ${safeTraceJson(payload)}`;
+  if (logger?.info) {
+    logger.info(line);
+    return;
+  }
+  console.info(line);
+}
+
+function summarizeTimelineEventForTrace(event: TimelineEvent): Record<string, unknown> {
+  const payload = toRecord(event.payload);
+  const timeline = toRecord(payload.openclaw_timeline);
+  const content = typeof payload.content === "string" ? payload.content : "";
+  return {
+    id: event.id,
+    kind: event.kind,
+    seq: event.seq,
+    rawSeq: payload.rawSeq,
+    messageSeq: payload.message_seq ?? payload.messageSeq,
+    runId: payload.runId,
+    state: payload.state,
+    mode: payload.mode,
+    replace: payload.replace,
+    segmentId: stringOr(timeline.segment_id, payload.segment_id),
+    segmentType: stringOr(timeline.segment_type, payload.segment_type),
+    deltaIndex: timeline.delta_index ?? payload.delta_index,
+    visibility: timeline.visibility ?? payload.visibility,
+    final: timeline.final ?? payload.final,
+    contentLength: content.length,
+    contentHash: hashTraceText(content)
+  };
+}
+
+function summarizeOutgoingFrameForTrace(frame: Hub53AIOutgoingFrame): Record<string, unknown> {
+  if ("data" in frame && toRecord(frame.data).object === "chat.completion.chunk") {
+    const data = toRecord(frame.data);
+    const choice = toRecord((Array.isArray(data.choices) ? data.choices : [])[0]);
+    const delta = toRecord(choice.delta);
+    const payload = toRecord(data.payload);
+    const timeline = toRecord(payload.openclaw_timeline);
+    const content = typeof delta.content === "string" ? delta.content : "";
+    return {
+      reqId: frame.req_id,
+      status: frame.status,
+      eventKind: data.event_kind,
+      sessionId: data.session_id,
+      finishReason: choice.finish_reason,
+      mode: data.mode,
+      replace: data.replace,
+      payloadSeq: payload.seq,
+      rawSeq: payload.rawSeq,
+      runId: payload.runId,
+      segmentId: stringOr(timeline.segment_id, payload.segment_id),
+      segmentType: stringOr(timeline.segment_type, payload.segment_type),
+      deltaIndex: timeline.delta_index ?? payload.delta_index,
+      contentLength: content.length,
+      contentHash: hashTraceText(content)
+    };
+  }
+  return {
+    reqId: frame.req_id,
+    action: frame.action,
+    status: frame.status
+  };
+}
+
+function hashTraceText(text: string): string {
+  return text ? createHash("sha1").update(text).digest("hex").slice(0, 12) : "";
+}
+
+function safeTraceJson(payload: Record<string, unknown>): string {
+  try {
+    return JSON.stringify(payload);
+  } catch {
+    return "{}";
+  }
 }
 
 export function parseIncomingMessage(rawJson: string): Hub53AIIncomingMessage | null {
