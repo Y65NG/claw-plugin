@@ -1,4 +1,4 @@
-export type HostKind = "openclaw";
+export type HostKind = "openclaw" | "qclaw" | "hermes" | "workbuddy";
 
 import { existsSync, readFileSync } from "node:fs";
 import { homedir } from "node:os";
@@ -108,8 +108,23 @@ export type HostRuntimeInfo = {
 };
 
 const SENSITIVE_KEY_PATTERN = /(token|secret|password|key|credential)/i;
+const HOST_KIND_BY_MARKER: Array<{ marker: string; kind: HostKind }> = [
+  { marker: "/library/application support/qclaw/", kind: "qclaw" },
+  { marker: "/.qclaw/", kind: "qclaw" },
+  { marker: "/.hermes/", kind: "hermes" },
+  { marker: "/.workbuddy/", kind: "workbuddy" },
+  { marker: "/.openclaw/", kind: "openclaw" }
+];
 
 export function detectHostKind(pathHint?: string): HostKind {
+  const normalized = String(pathHint || "")
+    .replace(/\\/g, "/")
+    .toLowerCase();
+  for (const { marker, kind } of HOST_KIND_BY_MARKER) {
+    if (normalized.includes(marker) || normalized.endsWith(marker.slice(0, -1))) {
+      return kind;
+    }
+  }
   return "openclaw";
 }
 

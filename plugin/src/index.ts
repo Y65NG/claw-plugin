@@ -136,7 +136,7 @@ async function createRuntime(input: {
     throw new Error("Missing gateway.secret and no local gateway auth token could be inferred");
   }
 
-  const hostKind = detectHostKind(input.stateDir);
+  const hostKind = detectHostKind(`${input.stateDir}\n${input.configPath}`);
   const gatewayConfig = {
     ...config.gateway,
     hostKind,

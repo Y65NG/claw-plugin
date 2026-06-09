@@ -7,6 +7,7 @@ import { dirname, join, resolve } from "node:path";
 import { promisify } from "node:util";
 import { select } from "@inquirer/prompts";
 import { parse as parseYaml, stringify as stringifyYaml } from "yaml";
+import { detectHostKind } from "./host";
 
 type InstallInput = {
   packageRoot: string;
@@ -546,10 +547,11 @@ async function resolveInstallDestinations(
 
   if (explicitConfigPath && explicitExtensionsDir) {
     const hermes = isHermesDestination(explicitConfigPath, explicitExtensionsDir);
+    const clawLabel = inferDetectedClawLabel(explicitConfigPath, explicitExtensionsDir);
     return [{
       configPath: explicitConfigPath,
       extensionsDir: hermes ? normalizeHermesPlatformsDir(explicitExtensionsDir) : explicitExtensionsDir,
-      label: hermes ? "Hermes" : "Claw",
+      label: hermes ? "Hermes" : clawLabel,
       installKind: hermes ? "hermes" : "openclaw"
     }];
   }
@@ -609,6 +611,14 @@ function getDefaultHostDefinitions(): HostDefinition[] {
     },
     createWorkBuddyHostDefinition(workbuddyHome)
   ];
+}
+
+function inferDetectedClawLabel(configPath: string, extensionsDir: string): "QClaw" | "OpenClaw" | "Hermes" | "WorkBuddy" {
+  const kind = detectHostKind(`${configPath}\n${extensionsDir}`);
+  if (kind === "qclaw") return "QClaw";
+  if (kind === "hermes") return "Hermes";
+  if (kind === "workbuddy") return "WorkBuddy";
+  return "OpenClaw";
 }
 
 function createWorkBuddyHostDefinition(workbuddyHome: string): HostDefinition {

@@ -622,9 +622,9 @@ describe("QClaw installer", () => {
       }
     });
     await access(join(extensionsDir, "claw-control-center", "dist", "index.cjs"));
-    expect(chunks.join("")).toContain("Installed claw-control-center into Claw.");
+    expect(chunks.join("")).toContain("Installed claw-control-center into OpenClaw.");
     expect(chunks.join("")).toContain("Plugin build:");
-    expect(chunks.join("")).toContain("Restart Claw to load the plugin.");
+    expect(chunks.join("")).toContain("Restart OpenClaw to load the plugin.");
   });
 
   it("auto-detects a single QClaw host when explicit paths are omitted", async () => {

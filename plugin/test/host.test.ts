@@ -7,10 +7,16 @@ import { describe, expect, it } from "vitest";
 import { detectHostKind, resolvePluginConfigWithHostDefaults, sanitizePluginConfig } from "../src/host";
 
 describe("host helpers", () => {
-  it("treats all Claw host directories as OpenClaw-compatible", () => {
-    expect(detectHostKind("/Users/demo/.qclaw")).toBe("openclaw");
-    expect(detectHostKind("/Users/demo/.qclow/plugins")).toBe("openclaw");
+  it("detects the compatible host brand from runtime paths", () => {
+    expect(detectHostKind("/Users/demo/.qclaw")).toBe("qclaw");
     expect(detectHostKind("/Users/demo/.openclaw")).toBe("openclaw");
+    expect(detectHostKind("/Users/demo/.hermes/config.yaml")).toBe("hermes");
+    expect(detectHostKind("/Users/demo/.workbuddy/plugins")).toBe("workbuddy");
+  });
+
+  it("falls back to OpenClaw for unsupported paths", () => {
+    expect(detectHostKind("/Users/demo/.qclow/plugins")).toBe("openclaw");
+    expect(detectHostKind("/Users/demo/custom-claw")).toBe("openclaw");
   });
 
   it("sanitizes sensitive gateway values before exposing config", () => {
