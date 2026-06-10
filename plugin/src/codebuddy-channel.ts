@@ -29,6 +29,7 @@ import {
 } from "./53aihub-protocol";
 import {
   loadWorkBuddyHistory,
+  type WorkBuddyHistoryEvent,
   type WorkBuddyHistoryMessage,
   type WorkBuddyHistorySession,
   type WorkBuddyHistorySnapshot
@@ -367,15 +368,13 @@ export function createCodeBuddyChannelBridge(input: CodeBuddyChannelBridgeInput)
     }
 
     if (request.action === "sessions.current") {
-      const chatId = readRPCChatId(request.data);
+      const payload = toRecord(request.data);
+      const chatId = readRPCChatId(payload);
       const sessionId = latestSessionByChat.get(chatId);
       if (sessionId) {
         return toSessionPayload(sessions.get(sessionId));
       }
-      const history = await loadHistorySnapshot();
-      return toHistorySessionPayload(
-        history.sessions.find((session) => session.id === input.config.workbuddySessionId)
-      );
+      return resolveSharedCurrentSessionPayload(payload);
     }
 
     if (request.action === "sessions.messages") {
@@ -391,28 +390,25 @@ export function createCodeBuddyChannelBridge(input: CodeBuddyChannelBridgeInput)
     }
 
     if (request.action === "sessions.events") {
-      const pagination = readRPCPagination(request.data, 100);
+      const payload = toRecord(request.data);
+      const events = await readRPCSessionEvents(payload);
+      const afterSeq = positiveInt(payload.after_seq ?? payload.afterSeq, 0);
+      const filteredEvents = afterSeq > 0 ? events.filter((event) => event.seq > afterSeq) : events;
+      const pagination = readRPCPagination(payload, 100);
+      const page = filteredEvents.slice(pagination.offset, pagination.offset + pagination.limit);
       return {
-        events: [],
-        pagination: buildPagination(pagination.limit, pagination.offset, 0, 0)
+        events: page,
+        pagination: buildPagination(pagination.limit, pagination.offset, filteredEvents.length, page.length)
       };
     }
 
     if (request.action === "sessions.control") {
       const payload = toRecord(request.data);
-      const session = readMutableRPCSession(payload);
       const action = readOptionalString(payload, "action");
       if (action !== "stop") {
         throw new ChannelRPCError("PARAM_ERROR", "unsupported sessions.control action");
       }
-      session.status = "stopped";
-      session.updatedAt = new Date().toISOString();
-      return {
-        ok: true,
-        action,
-        session_id: session.id,
-        conversation_id: session.id
-      };
+      return stopRPCSession(payload, action);
     }
 
     if (request.action === "runtime.get") {
@@ -573,7 +569,7 @@ export function createCodeBuddyChannelBridge(input: CodeBuddyChannelBridgeInput)
 
   async function syncSharedWorkBuddySessionIndex(
     text: string,
-    status: "running" | "completed",
+    status: "running" | "completed" | "stopped",
     options?: { preserveTitleOnUpdate?: boolean }
   ) {
     try {
@@ -599,6 +595,64 @@ export function createCodeBuddyChannelBridge(input: CodeBuddyChannelBridgeInput)
     return summary ? `53AIHub：${summary}` : "53AIHub WorkBuddy";
   }
 
+  async function resolveSharedCurrentSessionPayload(payload: Record<string, unknown>) {
+    const history = await loadHistorySnapshot();
+    const sharedSession = history.sessions.find((session) => session.id === input.config.workbuddySessionId);
+    const displayName =
+      readOptionalString(payload, "userName") ??
+      readOptionalString(payload, "user_name") ??
+      readOptionalString(payload, "chat_id") ??
+      readOptionalString(payload, "chatId") ??
+      input.config.workbuddySessionId;
+    const title = `53AI Hub-${displayName}：WorkBuddy`;
+    if (sharedSession) {
+      return toHistorySessionPayload(sharedSession, title);
+    }
+    const now = new Date().toISOString();
+    return {
+      id: input.config.workbuddySessionId,
+      session_id: input.config.workbuddySessionId,
+      conversation_id: input.config.workbuddySessionId,
+      title,
+      status: "completed",
+      hostKind: "workbuddy",
+      runnerCommand: "workbuddy",
+      createdAt: now,
+      updatedAt: now,
+      lastEventSeq: 0,
+      cwd: join(input.config.workbuddyHome, "channels", "53aihub-workspace")
+    };
+  }
+
+  async function stopRPCSession(payload: Record<string, unknown>, action: string) {
+    const sessionId = readRPCSessionId(payload);
+    const session = sessions.get(sessionId);
+    if (session) {
+      session.status = "stopped";
+      session.updatedAt = new Date().toISOString();
+      return {
+        ok: true,
+        action,
+        session_id: session.id,
+        conversation_id: session.id
+      };
+    }
+
+    const history = await loadHistorySnapshot();
+    const isKnownHistorySession = history.sessions.some((historySession) => historySession.id === sessionId);
+    if (sessionId === input.config.workbuddySessionId || isKnownHistorySession) {
+      await syncSharedWorkBuddySessionIndex("53AIHub WorkBuddy", "stopped", { preserveTitleOnUpdate: true });
+      return {
+        ok: true,
+        action,
+        session_id: sessionId,
+        conversation_id: sessionId
+      };
+    }
+
+    throw new ChannelRPCError("PARAM_ERROR", `unknown session: ${sessionId}`);
+  }
+
   async function loadMergedSessionPayloads() {
     const merged = new Map<string, ReturnType<typeof toSessionPayload> | ReturnType<typeof toHistorySessionPayload>>();
     const history = await loadHistorySnapshot();
@@ -617,7 +671,8 @@ export function createCodeBuddyChannelBridge(input: CodeBuddyChannelBridgeInput)
     if (input.config.workbuddyHistoryScope !== "all") {
       return {
         sessions: [],
-        messagesBySessionId: new Map()
+        messagesBySessionId: new Map(),
+        eventsBySessionId: new Map()
       };
     }
     return input.historyLoader
@@ -643,7 +698,7 @@ export function createCodeBuddyChannelBridge(input: CodeBuddyChannelBridgeInput)
     };
   }
 
-  function toHistorySessionPayload(session?: WorkBuddyHistorySession) {
+  function toHistorySessionPayload(session?: WorkBuddyHistorySession, titleOverride?: string) {
     if (!session) {
       return null;
     }
@@ -651,7 +706,7 @@ export function createCodeBuddyChannelBridge(input: CodeBuddyChannelBridgeInput)
       id: session.id,
       session_id: session.id,
       conversation_id: session.id,
-      title: session.title,
+      title: titleOverride ?? session.title,
       status: session.status,
       hostKind: session.hostKind,
       runnerCommand: session.runnerCommand,
@@ -701,11 +756,16 @@ export function createCodeBuddyChannelBridge(input: CodeBuddyChannelBridgeInput)
     return chatId;
   }
 
-  function readMutableRPCSession(payload: Record<string, unknown>): ChannelSessionRecord {
+  function readRPCSessionId(payload: Record<string, unknown>): string {
     const sessionId = readOptionalString(payload, "session_id") ?? readOptionalString(payload, "conversation_id");
     if (!sessionId) {
       throw new ChannelRPCError("PARAM_ERROR", "session_id or conversation_id is required");
     }
+    return sessionId;
+  }
+
+  function readMutableRPCSession(payload: Record<string, unknown>): ChannelSessionRecord {
+    const sessionId = readRPCSessionId(payload);
     const session = sessions.get(sessionId);
     if (!session) {
       throw new ChannelRPCError("PARAM_ERROR", `unknown session: ${sessionId}`);
@@ -726,6 +786,15 @@ export function createCodeBuddyChannelBridge(input: CodeBuddyChannelBridgeInput)
     }
     const history = await loadHistorySnapshot();
     return history.messagesBySessionId.get(sessionId) ?? [];
+  }
+
+  async function readRPCSessionEvents(payload: Record<string, unknown>): Promise<WorkBuddyHistoryEvent[]> {
+    const sessionId = readOptionalString(payload, "session_id") ?? readOptionalString(payload, "conversation_id");
+    if (!sessionId) {
+      throw new ChannelRPCError("PARAM_ERROR", "session_id or conversation_id is required");
+    }
+    const history = await loadHistorySnapshot();
+    return history.eventsBySessionId.get(sessionId) ?? [];
   }
 
   function positiveInt(value: unknown, fallback: number): number {

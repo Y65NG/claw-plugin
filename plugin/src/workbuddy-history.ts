@@ -15,6 +15,15 @@ export type WorkBuddyHistoryMessage = {
   createdAt: string;
 };
 
+export type WorkBuddyHistoryEvent = {
+  id: string;
+  sessionId: string;
+  seq: number;
+  kind: "assistant.thinking" | "tool.call" | "tool.result" | "run.failed";
+  payload: Record<string, unknown>;
+  createdAt: string;
+};
+
 export type WorkBuddyHistorySession = {
   id: string;
   title: string;
@@ -31,6 +40,7 @@ export type WorkBuddyHistorySession = {
 export type WorkBuddyHistorySnapshot = {
   sessions: WorkBuddyHistorySession[];
   messagesBySessionId: Map<string, WorkBuddyHistoryMessage[]>;
+  eventsBySessionId: Map<string, WorkBuddyHistoryEvent[]>;
 };
 
 export type LoadWorkBuddyHistoryInput = {
@@ -40,6 +50,7 @@ export type LoadWorkBuddyHistoryInput = {
 
 type MutableSession = WorkBuddyHistorySession & {
   messages: WorkBuddyHistoryMessage[];
+  events: WorkBuddyHistoryEvent[];
 };
 
 type SqliteSessionRecord = {
@@ -61,15 +72,18 @@ export async function loadWorkBuddyHistory(input: LoadWorkBuddyHistoryInput = {}
 
   const sortedSessions = [...sessions.values()]
     .sort((left, right) => right.updatedAt.localeCompare(left.updatedAt))
-    .map(({ messages: _messages, ...session }) => session);
+    .map(({ messages: _messages, events: _events, ...session }) => session);
   const messagesBySessionId = new Map<string, WorkBuddyHistoryMessage[]>();
+  const eventsBySessionId = new Map<string, WorkBuddyHistoryEvent[]>();
   for (const session of sessions.values()) {
     messagesBySessionId.set(session.id, session.messages);
+    eventsBySessionId.set(session.id, session.events);
   }
 
   return {
     sessions: sortedSessions,
-    messagesBySessionId
+    messagesBySessionId,
+    eventsBySessionId
   };
 }
 
@@ -132,6 +146,46 @@ async function parseJsonlSession(filePath: string, projectsDir: string, sessions
       return;
     }
 
+    if (type === "reasoning") {
+      const content = extractText(record.rawContent ?? record.raw_content ?? record.content ?? record.text);
+      if (content) {
+        appendHistoryEvent(session, {
+          id: readString(record, "id") || `${sessionId}-reasoning-${index + 1}`,
+          kind: "assistant.thinking",
+          createdAt: timestamp,
+          payload: {
+            content,
+            reasoning: content,
+            reasoning_content: content,
+            summary: content
+          }
+        });
+      } else {
+        session.updatedAt = maxIso(session.updatedAt, timestamp);
+      }
+      return;
+    }
+
+    if (type === "function_call") {
+      const event = buildToolCallEvent(record, sessionId, index, timestamp);
+      if (event) {
+        appendHistoryEvent(session, event);
+      } else {
+        session.updatedAt = maxIso(session.updatedAt, timestamp);
+      }
+      return;
+    }
+
+    if (type === "function_call_result") {
+      const event = buildToolResultEvent(record, sessionId, index, timestamp);
+      if (event) {
+        appendHistoryEvent(session, event);
+      } else {
+        session.updatedAt = maxIso(session.updatedAt, timestamp);
+      }
+      return;
+    }
+
     if (type !== "message") {
       session.updatedAt = maxIso(session.updatedAt, timestamp);
       return;
@@ -155,6 +209,20 @@ async function parseJsonlSession(filePath: string, projectsDir: string, sessions
       createdAt: timestamp
     });
     session.lastEventSeq += 1;
+    if (role === "assistant" && readString(record, "status") === "incomplete") {
+      const providerData = toRecord(record.providerData);
+      const error = toRecord(providerData.error);
+      appendHistoryEvent(session, {
+        id: `${readString(record, "id") || `${sessionId}-${index + 1}`}:failed`,
+        kind: "run.failed",
+        createdAt: timestamp,
+        payload: {
+          content,
+          summary: content,
+          error: Object.keys(error).length ? error : undefined
+        }
+      });
+    }
     session.createdAt = minIso(session.createdAt, timestamp);
     session.updatedAt = maxIso(session.updatedAt, timestamp);
     if (!session.title && role === "user") {
@@ -249,10 +317,90 @@ function ensureSession(
     lastEventSeq: 0,
     cwd: defaults.cwd,
     source: defaults.source,
-    messages: []
+    messages: [],
+    events: []
   };
   sessions.set(id, session);
   return session;
+}
+
+function appendHistoryEvent(
+  session: MutableSession,
+  event: Omit<WorkBuddyHistoryEvent, "sessionId" | "seq">
+): WorkBuddyHistoryEvent {
+  const next: WorkBuddyHistoryEvent = {
+    ...event,
+    sessionId: session.id,
+    seq: session.lastEventSeq + 1
+  };
+  session.lastEventSeq = next.seq;
+  session.events.push(next);
+  session.updatedAt = maxIso(session.updatedAt, next.createdAt);
+  return next;
+}
+
+function buildToolCallEvent(
+  record: Record<string, unknown>,
+  sessionId: string,
+  index: number,
+  timestamp: string
+): Omit<WorkBuddyHistoryEvent, "sessionId" | "seq"> | undefined {
+  const args = parseJsonObject(record.arguments);
+  const requestedTool = readString(args, "toolName") || readString(record, "name");
+  if (!requestedTool) {
+    return undefined;
+  }
+  const params = toRecord(args.params);
+  const input = Object.keys(params).length ? params : args;
+  const callId = readString(record, "callId") || readString(record, "toolCallId") || `${sessionId}-tool-${index + 1}`;
+  return {
+    id: readString(record, "id") || `${callId}:call`,
+    kind: "tool.call",
+    createdAt: timestamp,
+    payload: {
+      summary: `Used ${requestedTool}`,
+      data: {
+        name: requestedTool,
+        toolName: requestedTool,
+        callId,
+        args: input,
+        arguments: input,
+        meta: readString(toRecord(record.providerData), "reasoning")
+      }
+    }
+  };
+}
+
+function buildToolResultEvent(
+  record: Record<string, unknown>,
+  sessionId: string,
+  index: number,
+  timestamp: string
+): Omit<WorkBuddyHistoryEvent, "sessionId" | "seq"> | undefined {
+  const name = readString(record, "name") || "tool";
+  const callId = readString(record, "callId") || readString(record, "toolCallId") || `${sessionId}-tool-${index + 1}`;
+  const output = record.output;
+  const outputText = extractText(output) || stringifyValue(output);
+  const status = readString(record, "status");
+  return {
+    id: readString(record, "id") || `${callId}:result`,
+    kind: "tool.result",
+    createdAt: timestamp,
+    payload: {
+      summary: outputText || `Tool output: ${name}`,
+      data: {
+        name,
+        toolName: name,
+        callId,
+        result: {
+          content: outputText,
+          output: outputText,
+          raw: output,
+          isError: status !== "" && status !== "completed"
+        }
+      }
+    }
+  };
 }
 
 function parseJsonLine(line: string): Record<string, unknown> | undefined {
@@ -312,6 +460,39 @@ function decodeXmlEntities(value: string): string {
 function readString(record: Record<string, unknown>, key: string): string {
   const value = record[key];
   return typeof value === "string" && value.trim() ? value.trim() : "";
+}
+
+function toRecord(value: unknown): Record<string, unknown> {
+  return value && typeof value === "object" && !Array.isArray(value) ? value as Record<string, unknown> : {};
+}
+
+function parseJsonObject(value: unknown): Record<string, unknown> {
+  if (value && typeof value === "object" && !Array.isArray(value)) {
+    return value as Record<string, unknown>;
+  }
+  if (typeof value !== "string" || !value.trim()) {
+    return {};
+  }
+  try {
+    const parsed = JSON.parse(value);
+    return toRecord(parsed);
+  } catch {
+    return {};
+  }
+}
+
+function stringifyValue(value: unknown): string {
+  if (value === undefined || value === null) {
+    return "";
+  }
+  if (typeof value === "string") {
+    return value.trim();
+  }
+  try {
+    return JSON.stringify(value);
+  } catch {
+    return String(value);
+  }
 }
 
 function readRole(value: unknown): WorkBuddyHistoryMessage["role"] | undefined {

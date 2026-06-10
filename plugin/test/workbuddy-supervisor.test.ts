@@ -27,6 +27,14 @@ describe("WorkBuddy supervisor", () => {
         "server:53aihub-channel",
         "--dangerously-load-development-channels",
         "server:53aihub-channel",
+        "--permission-mode",
+        "bypassPermissions",
+        "--permission-mode-before-plan",
+        "bypassPermissions",
+        "--tools",
+        "ToolSearch,DeferExecuteTool",
+        "--allowedTools",
+        "ToolSearch,DeferExecuteTool,mcp__53aihub-channel__reply",
         "--strict-mcp-config"
       ])
     );
@@ -131,6 +139,83 @@ describe("WorkBuddy supervisor", () => {
             "53aihub.ai/sharedSessionId": "53aihub-workbuddy-shared"
           }
         }
+      });
+    } finally {
+      await supervisor.stop();
+      await acp.close();
+    }
+  });
+
+  it("activates the shared ACP session from the current CodeBuddy endpoint banner", async () => {
+    const acp = await createFakeAcpServer();
+    const fakeChild = Object.assign(new EventEmitter(), {
+      stdout: new EventEmitter(),
+      stderr: new EventEmitter(),
+      killed: false,
+      pid: 12348,
+      kill() {
+        this.killed = true;
+      }
+    });
+    const supervisor = createWorkBuddySupervisor({
+      config: buildConfig(),
+      spawnProcess: (() => fakeChild) as never
+    });
+
+    try {
+      await supervisor.start();
+      fakeChild.stdout.emit(
+        "data",
+        `\n  CodeBuddy Code HTTP Server\n\n  Endpoint  http://127.0.0.1:${acp.port}\n  Web UI    http://127.0.0.1:${acp.port}/\n`
+      );
+
+      await waitFor(() => {
+        expect(supervisor.status()).toMatchObject({
+          workerPort: acp.port,
+          sessionActive: true,
+          activeAcpSessionId: "created-session-1"
+        });
+      });
+    } finally {
+      await supervisor.stop();
+      await acp.close();
+    }
+  });
+
+  it("clears transient port discovery errors after the endpoint banner arrives", async () => {
+    const acp = await createFakeAcpServer();
+    const fakeChild = Object.assign(new EventEmitter(), {
+      stdout: new EventEmitter(),
+      stderr: new EventEmitter(),
+      killed: false,
+      pid: 12349,
+      kill() {
+        this.killed = true;
+      }
+    });
+    const supervisor = createWorkBuddySupervisor({
+      config: buildConfig(),
+      spawnProcess: (() => fakeChild) as never,
+      discoverWorkerPorts: async () => {
+        throw new Error("lsof failed");
+      }
+    });
+
+    try {
+      await supervisor.start();
+      await waitFor(() => {
+        expect(supervisor.status().lastError).toContain("lsof failed");
+      });
+
+      fakeChild.stdout.emit("data", `Endpoint  http://127.0.0.1:${acp.port}\n`);
+
+      await waitFor(() => {
+        expect(supervisor.status()).toMatchObject({
+          workerPort: acp.port,
+          sessionActive: true,
+          activeAcpSessionId: "created-session-1",
+          lastError: undefined
+        });
       });
     } finally {
       await supervisor.stop();

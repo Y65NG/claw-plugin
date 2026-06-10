@@ -417,6 +417,21 @@ describe("CodeBuddy 53AIHub channel", () => {
               }
             ]
           ]
+        ]),
+        eventsBySessionId: new Map([
+          [
+            "wb-session-1",
+            [
+              {
+                id: "e1",
+                sessionId: "wb-session-1",
+                seq: 2,
+                kind: "assistant.thinking" as const,
+                payload: { content: "historical thinking" },
+                createdAt: "2026-06-01T00:00:30.000Z"
+              }
+            ]
+          ]
         ])
       })
     });
@@ -440,6 +455,14 @@ describe("CodeBuddy 53AIHub channel", () => {
           data: { session_id: "wb-session-1", limit: 10, offset: 0 }
         })
       );
+      connection.socket.send(
+        JSON.stringify({
+          req_id: "rpc-history-events",
+          action: "sessions.events",
+          status: "request",
+          data: { session_id: "wb-session-1", limit: 10, offset: 0, after_seq: 1 }
+        })
+      );
 
       await waitFor(() => {
         expect(frameByReq(server.frames, "rpc-history-list")).toMatchObject({
@@ -455,6 +478,80 @@ describe("CodeBuddy 53AIHub channel", () => {
               { role: "user", content: "historical question" },
               { role: "assistant", content: "historical answer" }
             ]
+          }
+        });
+        expect(frameByReq(server.frames, "rpc-history-events")).toMatchObject({
+          status: "done",
+          data: {
+            events: [{ kind: "assistant.thinking", payload: { content: "historical thinking" } }]
+          }
+        });
+      });
+    } finally {
+      await bridge.stop();
+    }
+  });
+
+  it("returns the shared WorkBuddy session as current and accepts shared stop control", async () => {
+    const server = await createFakeHubServer();
+    cleanupServers.push(server.close);
+    const bridge = createCodeBuddyChannelBridge({
+      config: buildConfig(server.url),
+      notifyChannel: async () => {},
+      historyLoader: async () => ({
+        sessions: [
+          {
+            id: "53aihub-workbuddy-shared",
+            title: "53AIHub WorkBuddy",
+            status: "completed" as const,
+            hostKind: "workbuddy" as const,
+            runnerCommand: "workbuddy" as const,
+            createdAt: "2026-06-01T00:00:00.000Z",
+            updatedAt: "2026-06-01T00:01:00.000Z",
+            lastEventSeq: 0
+          }
+        ],
+        messagesBySessionId: new Map(),
+        eventsBySessionId: new Map()
+      })
+    });
+
+    await bridge.start();
+    try {
+      const connection = await server.connected;
+      connection.socket.send(
+        JSON.stringify({
+          req_id: "rpc-shared-current",
+          action: "sessions.current",
+          status: "request",
+          data: { chat_id: "agenthub_u1", userName: "test@test.com" }
+        })
+      );
+      connection.socket.send(
+        JSON.stringify({
+          req_id: "rpc-shared-stop",
+          action: "sessions.control",
+          status: "request",
+          data: { session_id: "53aihub-workbuddy-shared", action: "stop" }
+        })
+      );
+
+      await waitFor(() => {
+        expect(frameByReq(server.frames, "rpc-shared-current")).toMatchObject({
+          status: "done",
+          data: {
+            id: "53aihub-workbuddy-shared",
+            title: "53AI Hub-test@test.com：WorkBuddy",
+            hostKind: "workbuddy"
+          }
+        });
+        expect(frameByReq(server.frames, "rpc-shared-stop")).toMatchObject({
+          status: "done",
+          data: {
+            ok: true,
+            action: "stop",
+            session_id: "53aihub-workbuddy-shared",
+            conversation_id: "53aihub-workbuddy-shared"
           }
         });
       });

@@ -126,6 +126,14 @@ export function buildWorkBuddyWorkerCommand(config: WorkBuddySupervisorConfig): 
       "server:53aihub-channel",
       "--dangerously-load-development-channels",
       "server:53aihub-channel",
+      "--permission-mode",
+      "bypassPermissions",
+      "--permission-mode-before-plan",
+      "bypassPermissions",
+      "--tools",
+      "ToolSearch,DeferExecuteTool",
+      "--allowedTools",
+      "ToolSearch,DeferExecuteTool,mcp__53aihub-channel__reply",
       "--mcp-config",
       resolveWorkBuddyWorkerMcpConfigPath(config),
       "--strict-mcp-config"
@@ -229,6 +237,7 @@ export function createWorkBuddySupervisor(input: WorkBuddySupervisorInput) {
       const port = readServePort(text);
       if (port) {
         workerPort = port;
+        lastError = undefined;
         scheduleSessionActivation(0);
       }
     });
@@ -270,6 +279,7 @@ export function createWorkBuddySupervisor(input: WorkBuddySupervisorInput) {
           const port = ports[0];
           if (port) {
             workerPort = port;
+            lastError = undefined;
             input.logger?.info?.(`[53aihub-workbuddy] discovered worker ACP port: ${port}`);
             scheduleSessionActivation(0);
           } else {
@@ -360,6 +370,7 @@ export function createWorkBuddySupervisor(input: WorkBuddySupervisorInput) {
       activeAcpSessionId = readStringProperty(result, "sessionId") || input.config.sessionId;
     });
     sessionActive = true;
+    lastError = undefined;
     lastSessionActivationAt = new Date().toISOString();
     await syncWorkBuddySessionIndex({
       workbuddyHome: input.config.workbuddyHome,
@@ -478,7 +489,9 @@ function validateSupervisorConfig(config: WorkBuddySupervisorConfig) {
 }
 
 function readServePort(output: string): number | undefined {
-  const match = output.match(/\bserve\s+(\d{2,5})\b/);
+  const match =
+    output.match(/\bserve\s+(\d{2,5})\b/) ??
+    output.match(/\bEndpoint\s+https?:\/\/(?:127\.0\.0\.1|localhost|\[[^\]]+\]|[^:\s/]+):(\d{2,5})\b/i);
   if (!match) {
     return undefined;
   }

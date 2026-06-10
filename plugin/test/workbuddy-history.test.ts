@@ -85,6 +85,83 @@ describe("WorkBuddy history adapter", () => {
       });
   });
 
+  it("maps WorkBuddy reasoning and tool records to OpenClaw timeline events", async () => {
+    const tempRoot = await mkdtemp(join(tmpdir(), "workbuddy-history-events-"));
+    cleanupPaths.push(tempRoot);
+    const workbuddyHome = join(tempRoot, ".workbuddy");
+    const projectDir = join(workbuddyHome, "projects", "project");
+    await mkdir(projectDir, { recursive: true });
+    await writeFile(
+      join(projectDir, "session-events.jsonl"),
+      [
+        JSON.stringify({
+          type: "message",
+          role: "user",
+          timestamp: "2026-06-01T02:00:00.000Z",
+          content: "event test"
+        }),
+        JSON.stringify({
+          id: "reasoning-1",
+          type: "reasoning",
+          timestamp: "2026-06-01T02:00:10.000Z",
+          rawContent: [{ type: "reasoning_text", text: "thinking text" }]
+        }),
+        JSON.stringify({
+          id: "tool-call-1",
+          type: "function_call",
+          timestamp: "2026-06-01T02:00:20.000Z",
+          name: "DeferExecuteTool",
+          callId: "call-1",
+          arguments: JSON.stringify({
+            toolName: "mcp__53aihub-channel__reply",
+            params: { chat_id: "chat-a", text: "reply" }
+          })
+        }),
+        JSON.stringify({
+          id: "tool-result-1",
+          type: "function_call_result",
+          timestamp: "2026-06-01T02:00:30.000Z",
+          name: "DeferExecuteTool",
+          callId: "call-1",
+          status: "completed",
+          output: { type: "text", text: "sent" }
+        })
+      ].join("\n") + "\n"
+    );
+
+    const snapshot = await loadWorkBuddyHistory({ workbuddyHome, sqliteCommand: join(tempRoot, "missing-sqlite") });
+
+    expect(snapshot.eventsBySessionId.get("session-events")).toEqual([
+      expect.objectContaining({
+        id: "reasoning-1",
+        seq: 2,
+        kind: "assistant.thinking",
+        payload: expect.objectContaining({ content: "thinking text" })
+      }),
+      expect.objectContaining({
+        id: "tool-call-1",
+        seq: 3,
+        kind: "tool.call",
+        payload: expect.objectContaining({
+          data: expect.objectContaining({
+            name: "mcp__53aihub-channel__reply",
+            args: { chat_id: "chat-a", text: "reply" }
+          })
+        })
+      }),
+      expect.objectContaining({
+        id: "tool-result-1",
+        seq: 4,
+        kind: "tool.result",
+        payload: expect.objectContaining({
+          data: expect.objectContaining({
+            result: expect.objectContaining({ content: "sent" })
+          })
+        })
+      })
+    ]);
+  });
+
   it("extracts the real user query from WorkBuddy system-reminder envelopes", async () => {
     const tempRoot = await mkdtemp(join(tmpdir(), "workbuddy-history-query-"));
     cleanupPaths.push(tempRoot);
