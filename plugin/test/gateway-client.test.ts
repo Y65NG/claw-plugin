@@ -1398,6 +1398,192 @@ describe("gateway client", () => {
     await new Promise<void>((resolve) => wss.close(() => resolve()));
   });
 
+  it("preserves raw history message sequence metadata for downstream turn matching", async () => {
+    const history = [
+      {
+        role: "user",
+        content: [{ type: "text", text: "今天深圳天气怎么样？" }],
+        timestamp: Date.now() - 2_000,
+        __openclaw: { seq: 156 }
+      },
+      {
+        role: "assistant",
+        content: [{ type: "text", text: "深圳今天上午有阵雨，气温炎热，记得带伞+防暑！" }],
+        timestamp: Date.now() - 1_000,
+        __openclaw: { seq: 159 }
+      }
+    ];
+
+    const httpServer = createServer();
+    servers.add(httpServer);
+    const wss = new WebSocketServer({ noServer: true });
+
+    httpServer.on("upgrade", (request, socket, head) => {
+      wss.handleUpgrade(request, socket, head, (client) => {
+        client.send(
+          JSON.stringify({
+            type: "event",
+            event: "connect.challenge",
+            payload: { nonce: "nonce-1" }
+          })
+        );
+
+        client.on("message", (data) => {
+          const frame = JSON.parse(data.toString()) as {
+            id: string;
+            method: string;
+            params?: Record<string, unknown>;
+          };
+
+          if (frame.method === "connect") {
+            client.send(JSON.stringify({ type: "res", id: frame.id, ok: true, payload: { protocol: 4 } }));
+            return;
+          }
+
+          if (frame.method === "chat.history") {
+            client.send(
+              JSON.stringify({
+                type: "res",
+                id: frame.id,
+                ok: true,
+                payload: {
+                  messages: history,
+                  total: history.length,
+                  offset: 0,
+                  hasMore: false
+                }
+              })
+            );
+            return;
+          }
+
+          client.send(JSON.stringify({ type: "res", id: frame.id, ok: true, payload: { ok: true } }));
+        });
+      });
+    });
+
+    const address = await listen(httpServer);
+    const client = createGatewayClient({
+      baseUrl: address.replace("http://", "ws://"),
+      secret: "shared-token"
+    });
+
+    const messages = await client.getSessionMessages("agent:main:dashboard:test");
+    expect(messages).toEqual([
+      expect.objectContaining({
+        id: "agent:main:dashboard:test:user:156",
+        seq: 156,
+        messageSeq: 156,
+        message_seq: 156,
+        __openclaw: expect.objectContaining({ seq: 156 }),
+        payload: expect.objectContaining({ rawSeq: 156, seq: 156, messageSeq: 156, message_seq: 156 }),
+        metadata: expect.objectContaining({ rawSeq: 156, seq: 156, messageSeq: 156, message_seq: 156 }),
+        data: expect.objectContaining({ rawSeq: 156, seq: 156, messageSeq: 156, message_seq: 156 })
+      }),
+      expect.objectContaining({
+        id: "agent:main:dashboard:test:assistant:159",
+        seq: 159,
+        messageSeq: 159,
+        message_seq: 159,
+        __openclaw: expect.objectContaining({ seq: 159 }),
+        payload: expect.objectContaining({ rawSeq: 159, seq: 159, messageSeq: 159, message_seq: 159 }),
+        metadata: expect.objectContaining({ rawSeq: 159, seq: 159, messageSeq: 159, message_seq: 159 }),
+        data: expect.objectContaining({ rawSeq: 159, seq: 159, messageSeq: 159, message_seq: 159 })
+      })
+    ]);
+
+    await client.stop();
+    await new Promise<void>((resolve) => wss.close(() => resolve()));
+  });
+
+  it("keeps history message ids distinct when OpenClaw seq metadata is missing", async () => {
+    const now = Date.now();
+    const history = [
+      {
+        id: "upstream-user-1",
+        role: "user",
+        content: [{ type: "text", text: "没有 seq 的第一条用户消息" }],
+        timestamp: now - 3_000
+      },
+      {
+        message_id: "upstream-assistant-1",
+        role: "assistant",
+        content: [{ type: "text", text: "没有 seq 的第一条回复" }],
+        timestamp: now - 2_000
+      },
+      {
+        role: "assistant",
+        content: [{ type: "text", text: "没有 seq 也没有上游 id 的第二条回复" }],
+        timestamp: now - 1_000
+      }
+    ];
+
+    const httpServer = createServer();
+    servers.add(httpServer);
+    const wss = new WebSocketServer({ noServer: true });
+
+    httpServer.on("upgrade", (request, socket, head) => {
+      wss.handleUpgrade(request, socket, head, (client) => {
+        client.send(
+          JSON.stringify({
+            type: "event",
+            event: "connect.challenge",
+            payload: { nonce: "nonce-1" }
+          })
+        );
+
+        client.on("message", (data) => {
+          const frame = JSON.parse(data.toString()) as {
+            id: string;
+            method: string;
+          };
+
+          if (frame.method === "connect") {
+            client.send(JSON.stringify({ type: "res", id: frame.id, ok: true, payload: { protocol: 4 } }));
+            return;
+          }
+
+          if (frame.method === "chat.history") {
+            client.send(
+              JSON.stringify({
+                type: "res",
+                id: frame.id,
+                ok: true,
+                payload: {
+                  messages: history,
+                  total: history.length,
+                  offset: 0,
+                  hasMore: false
+                }
+              })
+            );
+            return;
+          }
+
+          client.send(JSON.stringify({ type: "res", id: frame.id, ok: true, payload: { ok: true } }));
+        });
+      });
+    });
+
+    const address = await listen(httpServer);
+    const client = createGatewayClient({
+      baseUrl: address.replace("http://", "ws://"),
+      secret: "shared-token"
+    });
+
+    const messages = await client.getSessionMessages("agent:main:dashboard:no-seq");
+    expect(messages.map((message) => message.id)).toEqual([
+      "agent:main:dashboard:no-seq:user:upstream-user-1",
+      "agent:main:dashboard:no-seq:assistant:upstream-assistant-1",
+      expect.stringMatching(/^agent:main:dashboard:no-seq:assistant:[0-9a-f]{16}$/)
+    ]);
+    expect(new Set(messages.map((message) => message.id)).size).toBe(3);
+    expect(messages.some((message) => message.id.endsWith(":0"))).toBe(false);
+
+    await client.stop();
+    await new Promise<void>((resolve) => wss.close(() => resolve()));
+  });
+
   it("uses chat deltaText as append chunks instead of replacing with cumulative message content", async () => {
     const received: Array<{ kind: string; content: string; mode?: unknown }> = [];
     const httpServer = createServer();

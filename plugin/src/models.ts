@@ -23,6 +23,13 @@ export type SessionMessage = {
   role: string;
   content: string;
   createdAt: string;
+  seq?: number;
+  messageSeq?: number;
+  message_seq?: number;
+  payload?: Record<string, unknown>;
+  metadata?: Record<string, unknown>;
+  data?: Record<string, unknown>;
+  __openclaw?: Record<string, unknown>;
 };
 
 export type TimelineEvent = {

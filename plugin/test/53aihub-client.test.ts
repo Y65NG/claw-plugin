@@ -372,6 +372,265 @@ describe("53AIHub client", () => {
     }
   });
 
+  it("uses tool call ids for OpenClaw tool timeline segments", async () => {
+    const stateDir = await mkdtemp(join(tmpdir(), "claw-53aihub-"));
+    cleanupPaths.push(stateDir);
+    const server = await createFakeHubServer();
+    cleanupServers.push(server.close);
+    const gateway = new FakeGateway();
+    gateway.eventsToEmit = [
+      {
+        id: "evt-tool-newyork",
+        sessionId: "session-1",
+        seq: 1,
+        kind: "tool.call",
+        payload: {
+          data: {
+            name: "exec",
+            toolCallId: "chatcmpl-tool-newyork",
+            args: { command: 'curl -s "wttr.in/NewYork?1"' }
+          }
+        },
+        createdAt: new Date().toISOString()
+      },
+      {
+        id: "evt-tool-new-york",
+        sessionId: "session-1",
+        seq: 2,
+        kind: "tool.call",
+        payload: {
+          data: {
+            name: "exec",
+            toolCallId: "chatcmpl-tool-new-york",
+            args: { command: 'curl -s "wttr.in/New_York?1"' }
+          }
+        },
+        createdAt: new Date().toISOString()
+      },
+      {
+        id: "evt-tool-nyc",
+        sessionId: "session-1",
+        seq: 3,
+        kind: "tool.call",
+        payload: {
+          data: {
+            name: "exec",
+            tool_call_id: "call-nyc",
+            args: { command: 'curl -s "wttr.in/NYC?1"' }
+          }
+        },
+        createdAt: new Date().toISOString()
+      },
+      {
+        id: "evt-done",
+        sessionId: "session-1",
+        seq: 4,
+        kind: "run.completed",
+        payload: { ok: true },
+        createdAt: new Date().toISOString()
+      }
+    ];
+
+    const bridge = createHub53AIBridge({
+      stateDir,
+      config: {
+        enabled: true,
+        botId: "bot-123",
+        secret: "sk-secret",
+        wsUrl: server.url,
+        accessPolicy: "open",
+        allowFrom: [],
+        sendThinkingMessage: true,
+        reconnectBaseMs: 20,
+        maxReconnectAttempts: 2
+      },
+      gateway,
+      callbacks: {
+        onSessionUpsert: async (session) => {
+          gateway.upsertSession(session);
+        },
+        onUserMessage: async () => undefined,
+        onSessionStatus: async () => undefined,
+        onEnsureSessionStream: async () => undefined,
+        getLastEventSeq: () => 0,
+        onStatusChange: () => undefined
+      }
+    });
+
+    await bridge.start();
+    try {
+      const connection = await server.connected;
+      connection.socket.send(
+        JSON.stringify({
+          req_id: "req-multi-tool-segments",
+          action: "chat",
+          data: {
+            user: "user-123",
+            conversation_id: "chat-multi-tool-segments",
+            messages: [{ role: "user", content: "今天纽约天气怎么样？" }]
+          }
+        })
+      );
+
+      await waitFor(() => {
+        const toolFrames = server.frames.filter(
+          (frame) =>
+            frame.req_id === "req-multi-tool-segments" &&
+            frame.action === "chat" &&
+            frame.status === "thinking" &&
+            frame.data?.event_kind === "tool.call"
+        );
+        expect(toolFrames).toHaveLength(3);
+        const segmentIds = toolFrames.map((frame) => frame.data.payload.openclaw_timeline.segment_id);
+        expect(segmentIds).toEqual([
+          expect.stringContaining("chatcmpl-tool-newyork"),
+          expect.stringContaining("chatcmpl-tool-new-york"),
+          expect.stringContaining("call-nyc")
+        ]);
+        expect(new Set(segmentIds).size).toBe(3);
+      });
+    } finally {
+      await bridge.stop();
+    }
+  });
+
+  it("keeps repeated same-name OpenClaw tool calls distinct when call ids are missing", async () => {
+    const stateDir = await mkdtemp(join(tmpdir(), "claw-53aihub-"));
+    cleanupPaths.push(stateDir);
+    const server = await createFakeHubServer();
+    cleanupServers.push(server.close);
+    const gateway = new FakeGateway();
+    gateway.eventsToEmit = [
+      {
+        id: "evt-tool-newyork-call",
+        sessionId: "session-1",
+        seq: 21,
+        kind: "tool.call",
+        payload: {
+          rawSeq: 21,
+          data: {
+            name: "exec",
+            args: { command: 'curl -s "wttr.in/NewYork?1"' }
+          }
+        },
+        createdAt: new Date().toISOString()
+      },
+      {
+        id: "evt-tool-newyork-result",
+        sessionId: "session-1",
+        seq: 25,
+        kind: "tool.result",
+        payload: {
+          rawSeq: 25,
+          data: {
+            name: "exec",
+            result: "New York UK weather"
+          }
+        },
+        createdAt: new Date().toISOString()
+      },
+      {
+        id: "evt-tool-new-york-call",
+        sessionId: "session-1",
+        seq: 83,
+        kind: "tool.call",
+        payload: {
+          rawSeq: 83,
+          data: {
+            name: "exec",
+            args: { command: 'curl -s "wttr.in/New_York?1"' }
+          }
+        },
+        createdAt: new Date().toISOString()
+      },
+      {
+        id: "evt-tool-new-york-result",
+        sessionId: "session-1",
+        seq: 87,
+        kind: "tool.result",
+        payload: {
+          rawSeq: 87,
+          data: {
+            name: "exec",
+            result: "New York City weather"
+          }
+        },
+        createdAt: new Date().toISOString()
+      },
+      {
+        id: "evt-done",
+        sessionId: "session-1",
+        seq: 88,
+        kind: "run.completed",
+        payload: { ok: true },
+        createdAt: new Date().toISOString()
+      }
+    ];
+
+    const bridge = createHub53AIBridge({
+      stateDir,
+      config: {
+        enabled: true,
+        botId: "bot-123",
+        secret: "sk-secret",
+        wsUrl: server.url,
+        accessPolicy: "open",
+        allowFrom: [],
+        sendThinkingMessage: true,
+        reconnectBaseMs: 20,
+        maxReconnectAttempts: 2
+      },
+      gateway,
+      callbacks: {
+        onSessionUpsert: async (session) => {
+          gateway.upsertSession(session);
+        },
+        onUserMessage: async () => undefined,
+        onSessionStatus: async () => undefined,
+        onEnsureSessionStream: async () => undefined,
+        getLastEventSeq: () => 0,
+        onStatusChange: () => undefined
+      }
+    });
+
+    await bridge.start();
+    try {
+      const connection = await server.connected;
+      connection.socket.send(
+        JSON.stringify({
+          req_id: "req-repeated-exec-tools",
+          action: "chat",
+          data: {
+            user: "user-123",
+            conversation_id: "chat-repeated-exec-tools",
+            messages: [{ role: "user", content: "今天纽约天气怎么样？" }]
+          }
+        })
+      );
+
+      await waitFor(() => {
+        const toolFrames = server.frames.filter(
+          (frame) =>
+            frame.req_id === "req-repeated-exec-tools" &&
+            frame.action === "chat" &&
+            frame.status === "thinking" &&
+            (frame.data?.event_kind === "tool.call" || frame.data?.event_kind === "tool.result")
+        );
+        expect(toolFrames).toHaveLength(4);
+        const segmentIds = toolFrames.map((frame) => frame.data.payload.openclaw_timeline.segment_id);
+        expect(segmentIds).toEqual([
+          expect.stringContaining("tool_call:exec:21"),
+          expect.stringContaining("tool_result:exec:25"),
+          expect.stringContaining("tool_call:exec:83"),
+          expect.stringContaining("tool_result:exec:87")
+        ]);
+        expect(new Set(segmentIds).size).toBe(4);
+      });
+    } finally {
+      await bridge.stop();
+    }
+  });
+
   it("emits standard output_files process steps for gateway file events", async () => {
     const stateDir = await mkdtemp(join(tmpdir(), "claw-53aihub-"));
     cleanupPaths.push(stateDir);
@@ -2427,7 +2686,7 @@ describe("53AIHub client", () => {
     }
   });
 
-  it("stores bridge tool activity on the resolved 53AIHub session instead of a stale mapped session", async () => {
+  it("does not persist synthetic bridge tool placeholder thinking events for the resolved 53AIHub session", async () => {
     const stateDir = await mkdtemp(join(tmpdir(), "claw-53aihub-tool-control-"));
     cleanupPaths.push(stateDir);
     await writeFile(
@@ -2541,16 +2800,10 @@ describe("53AIHub client", () => {
         })
       );
 
-      await waitFor(() => {
-        expect(
-          bridgeThinkingEvents.some((event) => String(event.payload?.content ?? "").includes("web_search"))
-        ).toBe(true);
-      });
       const toolEvents = bridgeThinkingEvents.filter((event) =>
         String(event.payload?.content ?? "").includes("web_search")
       );
-      expect(toolEvents.map((event) => event.sessionId)).not.toContain("control-session");
-      expect(toolEvents.map((event) => event.sessionId)).toEqual(["hub-latest"]);
+      expect(toolEvents).toHaveLength(0);
     } finally {
       await bridge.stop();
     }
@@ -3410,6 +3663,443 @@ describe("53AIHub client", () => {
             pagination: { limit: 10, offset: 0, total: 1, hasMore: false }
           }
         });
+      });
+    } finally {
+      await bridge.stop();
+    }
+  });
+
+  it("filters synthetic bridge tool placeholder thinking events from sessions.events history", async () => {
+    const stateDir = await mkdtemp(join(tmpdir(), "claw-53aihub-rpc-events-"));
+    cleanupPaths.push(stateDir);
+
+    const server = await createFakeHubServer();
+    cleanupServers.push(server.close);
+
+    const gateway = new FakeGateway();
+    gateway.eventsBySession.set("session-1", [
+      {
+        id: "run-started",
+        sessionId: "session-1",
+        seq: 1,
+        kind: "run.started",
+        payload: { runId: "run-weather" },
+        createdAt: "2026-06-09T07:15:36.000Z"
+      },
+      {
+        id: "tool-call-1",
+        sessionId: "session-1",
+        seq: 2,
+        kind: "tool.call",
+        payload: {
+          data: {
+            name: "exec",
+            args: { command: "curl -s wttr.in/Chongqing?format=j1" }
+          }
+        },
+        createdAt: "2026-06-09T07:15:40.000Z"
+      },
+      {
+        id: "tool-result-1",
+        sessionId: "session-1",
+        seq: 3,
+        kind: "tool.result",
+        payload: {
+          data: {
+            name: "exec",
+            result: { output: "{\"current_condition\":[]}" }
+          }
+        },
+        createdAt: "2026-06-09T07:15:42.000Z"
+      },
+      {
+        id: "assistant-final",
+        sessionId: "session-1",
+        seq: 4,
+        kind: "assistant.message",
+        payload: { content: "重庆明天天气多云。" },
+        createdAt: "2026-06-09T07:15:45.000Z"
+      }
+    ]);
+
+    const storedEvents: GatewayEvent[] = [
+      {
+        id: "session-1:hub-thinking:1",
+        sessionId: "session-1",
+        seq: -8000000000000001,
+        kind: "assistant.thinking",
+        payload: { content: "Used tool exec", source: "hub53ai" },
+        createdAt: "2026-06-09T07:15:41.000Z"
+      },
+      {
+        id: "session-1:hub-thinking:2",
+        sessionId: "session-1",
+        seq: -8000000000000000,
+        kind: "assistant.thinking",
+        payload: { content: "Tool exec returned a result", source: "hub53ai" },
+        createdAt: "2026-06-09T07:15:43.000Z"
+      }
+    ];
+
+    const bridge = createHub53AIBridge({
+      stateDir,
+      config: {
+        enabled: true,
+        botId: "bot-123",
+        secret: "sk-secret",
+        wsUrl: server.url,
+        accessPolicy: "open",
+        allowFrom: [],
+        sendThinkingMessage: true,
+        reconnectBaseMs: 20,
+        maxReconnectAttempts: 2
+      },
+      gateway,
+      callbacks: {
+        onSessionUpsert: async (session) => {
+          gateway.upsertSession(session);
+        },
+        onUserMessage: async () => undefined,
+        onSessionStatus: async () => undefined,
+        onEnsureSessionStream: async () => undefined,
+        listSessionEvents: () => storedEvents,
+        getLastEventSeq: () => 0,
+        onStatusChange: () => undefined
+      }
+    });
+
+    await bridge.start();
+    try {
+      const connection = await server.connected;
+      connection.socket.send(
+        JSON.stringify({
+          req_id: "rpc-events-filter-placeholders",
+          action: "sessions.events",
+          status: "request",
+          data: { session_id: "session-1", limit: 10, offset: 0 }
+        })
+      );
+
+      await waitFor(() => {
+        expect(frameByReq(server.frames, "rpc-events-filter-placeholders")).toMatchObject({
+          action: "sessions.events",
+          status: "done",
+          data: {
+            events: [
+              { id: "run-started", kind: "run.started" },
+              { id: "tool-call-1", kind: "tool.call" },
+              { id: "tool-result-1", kind: "tool.result" },
+              { id: "assistant-final", kind: "assistant.message" }
+            ],
+            pagination: { limit: 10, offset: 0, total: 4, hasMore: false }
+          }
+        });
+        const frame = frameByReq(server.frames, "rpc-events-filter-placeholders");
+        expect(frame.data.events.map((event: any) => event.payload?.content)).not.toContain("Used tool exec");
+        expect(frame.data.events.map((event: any) => event.payload?.content)).not.toContain("Tool exec returned a result");
+      });
+    } finally {
+      await bridge.stop();
+    }
+  });
+
+  it("normalizes mismatched protocol segment types in sessions.events history", async () => {
+    const stateDir = await mkdtemp(join(tmpdir(), "claw-53aihub-rpc-events-"));
+    cleanupPaths.push(stateDir);
+
+    const server = await createFakeHubServer();
+    cleanupServers.push(server.close);
+
+    const gateway = new FakeGateway();
+    gateway.eventsBySession.set("session-1", [
+      {
+        id: "tool-result-1",
+        sessionId: "session-1",
+        seq: 3,
+        kind: "tool.result",
+        payload: {
+          data: {
+            name: "exec",
+            result: { output: "Shenyang: sunny 25C" }
+          },
+          segment_type: "answer",
+          openclaw_timeline: {
+            protocol_version: "openclaw.timeline.v2",
+            turn_id: "session-1:turn:weather",
+            segment_id: "session-1:turn:weather:answer:0",
+            segment_type: "answer",
+            segment_index: 2,
+            delta_index: 0,
+            operation: "replace",
+            visibility: "final",
+            final: true
+          }
+        },
+        createdAt: "2026-06-09T07:15:42.000Z"
+      }
+    ]);
+
+    const bridge = createHub53AIBridge({
+      stateDir,
+      config: {
+        enabled: true,
+        botId: "bot-123",
+        secret: "sk-secret",
+        wsUrl: server.url,
+        accessPolicy: "open",
+        allowFrom: [],
+        sendThinkingMessage: false,
+        reconnectBaseMs: 20,
+        maxReconnectAttempts: 2
+      },
+      gateway,
+      callbacks: {
+        onSessionUpsert: async (session) => {
+          gateway.upsertSession(session);
+        },
+        onUserMessage: async () => undefined,
+        onSessionStatus: async () => undefined,
+        onEnsureSessionStream: async () => undefined,
+        listSessionEvents: () => [],
+        getLastEventSeq: () => 0,
+        onStatusChange: () => undefined
+      }
+    });
+
+    await bridge.start();
+    try {
+      const connection = await server.connected;
+      connection.socket.send(
+        JSON.stringify({
+          req_id: "rpc-events-normalize-segment-type",
+          action: "sessions.events",
+          status: "request",
+          data: { session_id: "session-1", limit: 10, offset: 0 }
+        })
+      );
+
+      await waitFor(() => {
+        expect(frameByReq(server.frames, "rpc-events-normalize-segment-type")).toMatchObject({
+          action: "sessions.events",
+          status: "done",
+          data: {
+            events: [
+              {
+                id: "tool-result-1",
+                kind: "tool.result",
+                payload: {
+                  segment_type: "tool_result",
+                  openclaw_timeline: {
+                    segment_type: "tool_result"
+                  }
+                }
+              }
+            ],
+            pagination: { limit: 10, offset: 0, total: 1, hasMore: false }
+          }
+        });
+      });
+    } finally {
+      await bridge.stop();
+    }
+  });
+
+  it("adds OpenClaw history message seq metadata without replacing stream rawSeq", async () => {
+    const stateDir = await mkdtemp(join(tmpdir(), "claw-53aihub-rpc-events-"));
+    cleanupPaths.push(stateDir);
+
+    const server = await createFakeHubServer();
+    cleanupServers.push(server.close);
+
+    const gateway = new FakeGateway();
+    gateway.eventsBySession.set("session-1", [
+      {
+        id: "session-1:history:163:tool-call:chatcmpl-tool-new-york",
+        sessionId: "session-1",
+        seq: 1631,
+        kind: "tool.call",
+        payload: {
+          rawSeq: 83,
+          data: {
+            phase: "update",
+            name: "exec",
+            toolCallId: "chatcmpl-tool-new-york",
+            args: { command: "curl -s \"wttr.in/New_York?1\"" }
+          }
+        },
+        createdAt: "2026-06-09T13:24:16.000Z"
+      }
+    ]);
+
+    const bridge = createHub53AIBridge({
+      stateDir,
+      config: {
+        enabled: true,
+        botId: "bot-123",
+        secret: "sk-secret",
+        wsUrl: server.url,
+        accessPolicy: "open",
+        allowFrom: [],
+        sendThinkingMessage: false,
+        reconnectBaseMs: 20,
+        maxReconnectAttempts: 2
+      },
+      gateway,
+      callbacks: {
+        onSessionUpsert: async (session) => {
+          gateway.upsertSession(session);
+        },
+        onUserMessage: async () => undefined,
+        onSessionStatus: async () => undefined,
+        onEnsureSessionStream: async () => undefined,
+        listSessionEvents: () => [],
+        getLastEventSeq: () => 0,
+        onStatusChange: () => undefined
+      }
+    });
+
+    await bridge.start();
+    try {
+      const connection = await server.connected;
+      connection.socket.send(
+        JSON.stringify({
+          req_id: "rpc-events-history-message-seq",
+          action: "sessions.events",
+          status: "request",
+          data: { session_id: "session-1", limit: 10, offset: 0 }
+        })
+      );
+
+      await waitFor(() => {
+        expect(frameByReq(server.frames, "rpc-events-history-message-seq")).toMatchObject({
+          action: "sessions.events",
+          status: "done",
+          data: {
+            events: [
+              {
+                id: "session-1:history:163:tool-call:chatcmpl-tool-new-york",
+                kind: "tool.call",
+                payload: {
+                  rawSeq: 83,
+                  messageSeq: 163,
+                  message_seq: 163,
+                  data: {
+                    toolCallId: "chatcmpl-tool-new-york"
+                  }
+                }
+              }
+            ],
+            pagination: { limit: 10, offset: 0, total: 1, hasMore: false }
+          }
+        });
+      });
+    } finally {
+      await bridge.stop();
+    }
+  });
+
+  it("drops live thinking snapshots superseded by OpenClaw history thinking events", async () => {
+    const stateDir = await mkdtemp(join(tmpdir(), "claw-53aihub-rpc-events-"));
+    cleanupPaths.push(stateDir);
+
+    const server = await createFakeHubServer();
+    cleanupServers.push(server.close);
+
+    const gateway = new FakeGateway();
+    gateway.eventsBySession.set("session-1", [
+      {
+        id: "session-1:history:163:thinking",
+        sessionId: "session-1",
+        seq: 1630,
+        kind: "assistant.thinking",
+        payload: {
+          rawSeq: 163,
+          content: "NewYork is ambiguous, try New_York next."
+        },
+        createdAt: "2026-06-09T13:24:15.000Z"
+      },
+      {
+        id: "session-1:thinking:1675",
+        sessionId: "session-1",
+        seq: 1675,
+        kind: "assistant.thinking",
+        payload: {
+          rawSeq: 163,
+          content: "NewYork is ambiguous, try New_York next."
+        },
+        createdAt: "2026-06-09T13:25:12.000Z"
+      },
+      {
+        id: "session-1:history:163:tool-call:chatcmpl-tool-new-york",
+        sessionId: "session-1",
+        seq: 1631,
+        kind: "tool.call",
+        payload: {
+          rawSeq: 83,
+          data: {
+            phase: "update",
+            name: "exec",
+            toolCallId: "chatcmpl-tool-new-york",
+            args: { command: "curl -s \"wttr.in/New_York?1\"" }
+          }
+        },
+        createdAt: "2026-06-09T13:24:16.000Z"
+      }
+    ]);
+
+    const bridge = createHub53AIBridge({
+      stateDir,
+      config: {
+        enabled: true,
+        botId: "bot-123",
+        secret: "sk-secret",
+        wsUrl: server.url,
+        accessPolicy: "open",
+        allowFrom: [],
+        sendThinkingMessage: false,
+        reconnectBaseMs: 20,
+        maxReconnectAttempts: 2
+      },
+      gateway,
+      callbacks: {
+        onSessionUpsert: async (session) => {
+          gateway.upsertSession(session);
+        },
+        onUserMessage: async () => undefined,
+        onSessionStatus: async () => undefined,
+        onEnsureSessionStream: async () => undefined,
+        listSessionEvents: () => [],
+        getLastEventSeq: () => 0,
+        onStatusChange: () => undefined
+      }
+    });
+
+    await bridge.start();
+    try {
+      const connection = await server.connected;
+      connection.socket.send(
+        JSON.stringify({
+          req_id: "rpc-events-history-thinking-dedupe",
+          action: "sessions.events",
+          status: "request",
+          data: { session_id: "session-1", limit: 10, offset: 0 }
+        })
+      );
+
+      await waitFor(() => {
+        const frame = frameByReq(server.frames, "rpc-events-history-thinking-dedupe");
+        expect(frame).toMatchObject({
+          action: "sessions.events",
+          status: "done",
+          data: {
+            events: [
+              { id: "session-1:history:163:thinking", kind: "assistant.thinking" },
+              { id: "session-1:history:163:tool-call:chatcmpl-tool-new-york", kind: "tool.call" }
+            ],
+            pagination: { limit: 10, offset: 0, total: 2, hasMore: false }
+          }
+        });
+        expect(frame.data.events.map((event: any) => event.id)).not.toContain("session-1:thinking:1675");
       });
     } finally {
       await bridge.stop();

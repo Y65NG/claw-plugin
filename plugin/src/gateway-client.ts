@@ -2019,7 +2019,7 @@ function extractMessages(sessionId: string, payload: unknown): SessionMessage[] 
 
 function extractMessagesFromRaw(sessionId: string, rawMessages: unknown[]): SessionMessage[] {
   return rawMessages
-    .map((message) => normalizeMessage(sessionId, message))
+    .map((message, index) => normalizeMessage(sessionId, message, index))
     .filter((message): message is SessionMessage => message !== null);
 }
 
@@ -2133,7 +2133,7 @@ function readableSessionTitle(entry: Record<string, unknown>, fallbackTitle: str
   return fallbackTitle;
 }
 
-function normalizeMessage(sessionId: string, payload: unknown): SessionMessage | null {
+function normalizeMessage(sessionId: string, payload: unknown, index = 0): SessionMessage | null {
   if (!payload || typeof payload !== "object") {
     return null;
   }
@@ -2145,19 +2145,84 @@ function normalizeMessage(sessionId: string, payload: unknown): SessionMessage |
     return null;
   }
 
-  const rawSeq =
+  const rawMeta =
     message.__openclaw && typeof message.__openclaw === "object"
-      ? (message.__openclaw as Record<string, unknown>).seq
-      : undefined;
-  const seq = typeof rawSeq === "number" ? rawSeq : 0;
+      ? { ...(message.__openclaw as Record<string, unknown>) }
+      : {};
+  const seq =
+    numberProperty(rawMeta, ["seq", "messageSeq", "message_seq"]) ??
+    numberProperty(message, ["seq", "messageSeq", "message_seq"]) ??
+    0;
+  const messageIdentity = seq > 0
+    ? String(seq)
+    : stringProperty(message, ["id", "messageId", "message_id"]) ??
+      fallbackMessageIdentity(role, content, message.timestamp, index);
+  const existingPayload = toRecord(message.payload);
+  const existingMetadata = toRecord(message.metadata);
+  const existingData = toRecord(message.data);
+  const seqMeta =
+    seq > 0
+      ? {
+          rawSeq: seq,
+          seq,
+          messageSeq: seq,
+          message_seq: seq
+        }
+      : {};
 
   return {
-    id: `${sessionId}:${role}:${seq}`,
+    id: `${sessionId}:${role}:${messageIdentity}`,
     sessionId,
     role,
     content,
-    createdAt: toIsoString(message.timestamp ?? Date.now())
+    createdAt: toIsoString(message.timestamp ?? Date.now()),
+    ...(seq > 0
+      ? {
+          seq,
+          messageSeq: seq,
+          message_seq: seq
+        }
+      : {}),
+    ...(Object.keys(existingPayload).length > 0 || seq > 0
+      ? {
+          payload: {
+            ...existingPayload,
+            ...seqMeta
+          }
+        }
+      : {}),
+    ...(Object.keys(existingMetadata).length > 0 || seq > 0
+      ? {
+          metadata: {
+            ...existingMetadata,
+            ...seqMeta
+          }
+        }
+      : {}),
+    ...(Object.keys(existingData).length > 0 || seq > 0
+      ? {
+          data: {
+            ...existingData,
+            ...seqMeta
+          }
+        }
+      : {}),
+    ...(Object.keys(rawMeta).length > 0 || seq > 0
+      ? {
+          __openclaw: {
+            ...rawMeta,
+            ...(seq > 0 ? { seq } : {})
+          }
+        }
+      : {})
   };
+}
+
+function fallbackMessageIdentity(role: string, content: string, timestamp: unknown, index: number): string {
+  return createHash("sha1")
+    .update(`${role}\0${String(timestamp ?? "")}\0${index}\0${content}`)
+    .digest("hex")
+    .slice(0, 16);
 }
 
 function synthesizeEventsFromHistory(sessionId: string, payload: unknown, afterSeq: number): GatewayEvent[] {

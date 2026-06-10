@@ -556,7 +556,13 @@ export function createHub53AIBridge(input: HubBridgeInput) {
       input.gateway.listEvents(sessionId, 0),
       input.callbacks.listSessionEvents?.(sessionId) ?? []
     ]);
-    const deduped = dedupeTimelineEvents([...gatewayEvents, ...storedEvents]);
+    const deduped = filterSyntheticToolPlaceholderThinkingEvents(
+      filterSupersededHistoryThinkingEvents(
+        dedupeTimelineEvents([...gatewayEvents, ...storedEvents])
+          .map(normalizeTimelineEventSegmentType)
+          .map(normalizeTimelineEventMessageSeq)
+      )
+    );
     traceOpenClawDuplicate(input.logger, "hub.events.list", {
       sessionId,
       gatewayCount: gatewayEvents.length,
@@ -584,7 +590,16 @@ export function createHub53AIBridge(input: HubBridgeInput) {
   function timelineEventDedupeKey(event: TimelineEvent): string {
     const payload = toRecord(event.payload);
     const data = toRecord(payload.data);
-    const toolCallId = stringOr(data.toolCallId, data.callId, payload.toolCallId, payload.callId);
+    const toolCallId = stringOr(
+      data.toolCallId,
+      data.tool_call_id,
+      data.callId,
+      data.call_id,
+      payload.toolCallId,
+      payload.tool_call_id,
+      payload.callId,
+      payload.call_id
+    );
     if ((event.kind === "tool.call" || event.kind === "tool.result") && toolCallId) {
       return `${event.sessionId}:${event.kind}:${toolCallId}`;
     }
@@ -1217,7 +1232,6 @@ export function createHub53AIBridge(input: HubBridgeInput) {
     if (event.kind === "tool.call" || event.kind === "tool.result") {
       const summary = summarizeVisibleActivity(event);
       if (summary && input.config.sendThinkingMessage) {
-        await recordBridgeThinkingEvent(sessionId, summary);
         await sendReply({
           reqId: message.reqId,
           text: summary,
@@ -1561,6 +1575,115 @@ export function createHub53AIBridge(input: HubBridgeInput) {
     return undefined;
   }
 
+  function getExpectedOpenClawSegmentType(kind: string): OpenClawTimelineV2SegmentType | undefined {
+    if (kind === "assistant.delta" || kind === "assistant.message") return "answer";
+    if (kind === "assistant.thinking") return "thinking";
+    if (kind === "tool.call") return "tool_call";
+    if (kind === "tool.result") return "tool_result";
+    if (kind === "run.completed" || kind === "run.failed" || kind === "run.interrupted") return "run";
+    return undefined;
+  }
+
+  function normalizeTimelineEventSegmentType(event: TimelineEvent): TimelineEvent {
+    const expectedSegmentType = getExpectedOpenClawSegmentType(event.kind);
+    if (!expectedSegmentType) {
+      return event;
+    }
+
+    const payload = toRecord(event.payload);
+    const timeline = toRecord(payload.openclaw_timeline);
+    const currentSegmentType = normalizeOpenClawSegmentType(stringOr(timeline.segment_type, payload.segment_type));
+    if (currentSegmentType === expectedSegmentType) {
+      return event;
+    }
+
+    return {
+      ...event,
+      payload: {
+        ...payload,
+        segment_type: expectedSegmentType,
+        ...(Object.keys(timeline).length > 0
+          ? {
+              openclaw_timeline: {
+                ...timeline,
+                segment_type: expectedSegmentType
+              }
+            }
+          : {})
+      }
+    };
+  }
+
+  function readHistoryMessageSeq(event: TimelineEvent): number {
+    const match = String(event.id || "").match(/:history:(\d+)(?::|$)/);
+    if (!match) return 0;
+    const parsed = Number(match[1]);
+    return Number.isFinite(parsed) && parsed > 0 ? parsed : 0;
+  }
+
+  function normalizeTimelineEventMessageSeq(event: TimelineEvent): TimelineEvent {
+    const historyMessageSeq = readHistoryMessageSeq(event);
+    if (!historyMessageSeq) {
+      return event;
+    }
+
+    const payload = toRecord(event.payload);
+    return {
+      ...event,
+      payload: {
+        ...payload,
+        messageSeq: payload.messageSeq ?? historyMessageSeq,
+        message_seq: payload.message_seq ?? historyMessageSeq
+      }
+    };
+  }
+
+  function readTimelinePayloadSeq(event: TimelineEvent, key: string): number {
+    const payload = toRecord(event.payload);
+    const value = payload[key];
+    const parsed = typeof value === "number" ? value : Number(value);
+    return Number.isFinite(parsed) && parsed > 0 ? parsed : 0;
+  }
+
+  function normalizeThinkingContentForDedupe(event: TimelineEvent): string {
+    if (event.kind !== "assistant.thinking") {
+      return "";
+    }
+    return String(event.payload?.content ?? "").replace(/\s+/g, " ").trim();
+  }
+
+  function filterSupersededHistoryThinkingEvents(events: TimelineEvent[]): TimelineEvent[] {
+    const canonicalHistoryThinking = new Set<string>();
+
+    for (const event of events) {
+      if (event.kind !== "assistant.thinking") continue;
+      const historyMessageSeq = readHistoryMessageSeq(event);
+      const content = normalizeThinkingContentForDedupe(event);
+      if (!historyMessageSeq || !content) continue;
+      canonicalHistoryThinking.add(`${event.sessionId}:${historyMessageSeq}:${content}`);
+    }
+
+    if (canonicalHistoryThinking.size === 0) {
+      return events;
+    }
+
+    return events.filter((event) => {
+      if (event.kind !== "assistant.thinking") return true;
+      if (readHistoryMessageSeq(event)) return true;
+
+      const content = normalizeThinkingContentForDedupe(event);
+      if (!content) return true;
+
+      const messageSeq =
+        readTimelinePayloadSeq(event, "messageSeq") ||
+        readTimelinePayloadSeq(event, "message_seq") ||
+        readTimelinePayloadSeq(event, "rawSeq");
+      if (!messageSeq) return true;
+
+      return !canonicalHistoryThinking.has(`${event.sessionId}:${messageSeq}:${content}`);
+    });
+  }
+
   function getDefaultOpenClawSegmentType(kind: string): OpenClawTimelineV2SegmentType {
     if (kind === "assistant.delta" || kind === "assistant.message") return "answer";
     if (kind === "assistant.thinking") return "thinking";
@@ -1580,8 +1703,33 @@ export function createHub53AIBridge(input: HubBridgeInput) {
     if (segmentType === "tool_call" || segmentType === "tool_result") {
       const payload = toRecord(event.payload);
       const data = toRecord(payload.data);
-      const toolIdentity = stringOr(payload.call_id, payload.tool_call_id, data.call_id, data.id, data.name, payload.name);
-      return `${turnId}:${segmentType}:${toolIdentity || event.seq || event.id || randomUUID()}`;
+      const toolIdentity = stringOr(
+        data.toolCallId,
+        data.tool_call_id,
+        data.callId,
+        data.call_id,
+        data.id,
+        payload.toolCallId,
+        payload.tool_call_id,
+        payload.callId,
+        payload.call_id,
+        payload.id
+      );
+      if (toolIdentity) {
+        return `${turnId}:${segmentType}:${toolIdentity}`;
+      }
+      const toolName = stringOr(data.name, payload.name, data.toolName, payload.toolName, "tool");
+      const eventIdentity = identityStringOr(
+        data.rawSeq,
+        data.raw_seq,
+        payload.rawSeq,
+        payload.raw_seq,
+        data.seq,
+        payload.seq,
+        event.seq,
+        event.id
+      );
+      return `${turnId}:${segmentType}:${toolName}:${eventIdentity || randomUUID()}`;
     }
     return `${turnId}:${segmentType}:${event.seq ?? event.id ?? randomUUID()}`;
   }
@@ -2638,6 +2786,25 @@ function summarizeVisibleActivity(event: TimelineEvent): string | null {
   return message || null;
 }
 
+function isSyntheticToolPlaceholderThinkingEvent(event: TimelineEvent): boolean {
+  if (event.kind !== "assistant.thinking") {
+    return false;
+  }
+  const content = String(event.payload?.content ?? "").replace(/\s+/g, " ").trim();
+  if (!content) {
+    return false;
+  }
+  const normalized = content.toLowerCase();
+  if (normalized === "used a tool" || normalized === "tool returned a result") {
+    return true;
+  }
+  return /^used tool\b/i.test(content) || /^tool .+ returned a result$/i.test(content);
+}
+
+function filterSyntheticToolPlaceholderThinkingEvents(events: TimelineEvent[]): TimelineEvent[] {
+  return events.filter((event) => !isSyntheticToolPlaceholderThinkingEvent(event));
+}
+
 function validateConfig(config: Hub53AIConfig) {
   if (!config.botId) {
     throw new Error("hub53ai.botId is required when hub53ai.enabled is true");
@@ -2702,6 +2869,18 @@ function stringOr(...values: unknown[]): string {
   for (const value of values) {
     if (typeof value === "string" && value.trim()) {
       return value.trim();
+    }
+  }
+  return "";
+}
+
+function identityStringOr(...values: unknown[]): string {
+  for (const value of values) {
+    if (typeof value === "string" && value.trim()) {
+      return value.trim();
+    }
+    if (typeof value === "number" && Number.isFinite(value)) {
+      return String(value);
     }
   }
   return "";
