@@ -1,4 +1,4 @@
-import { createServer } from "node:http";
+import { createServer, type IncomingMessage, type ServerResponse } from "node:http";
 import { mkdtemp, rm } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
@@ -320,6 +320,134 @@ describe("CodeBuddy 53AIHub channel", () => {
     }
   });
 
+  it("returns WorkBuddy runtime skills, workers, model, and cron tasks through RPCs", async () => {
+    const server = await createFakeHubServer();
+    cleanupServers.push(server.close);
+    const bridge = createCodeBuddyChannelBridge({
+      config: { ...buildConfig(server.url), sendThinkingMessage: false },
+      notifyChannel: async () => {},
+      historyLoader: async () => ({
+        sessions: [
+          {
+            id: "53aihub-workbuddy-shared",
+            title: "53AIHub WorkBuddy",
+            status: "completed" as const,
+            hostKind: "workbuddy" as const,
+            runnerCommand: "workbuddy" as const,
+            createdAt: "2026-06-01T00:00:00.000Z",
+            updatedAt: "2026-06-01T00:01:00.000Z",
+            lastEventSeq: 0,
+            model: "auto",
+            expertId: "BrandGuardian",
+            permissionMode: "bypassPermissions"
+          }
+        ],
+        messagesBySessionId: new Map(),
+        eventsBySessionId: new Map()
+      }),
+      runtimeLoader: async () => ({
+        info: { version: "5.0.3" },
+        workers: [
+          {
+            sessionId: "53aihub-workbuddy-shared",
+            endpoint: "http://127.0.0.1:49446",
+            isCurrent: true,
+            healthy: true
+          }
+        ],
+        plugins: [
+          {
+            id: "weixinpay@workbuddy-builtin",
+            name: "weixinpay",
+            title: "weixinpay",
+            status: "enabled",
+            marketplace: "workbuddy-builtin",
+            enabled: true
+          }
+        ],
+        skills: [
+          {
+            id: "weixinpay@workbuddy-builtin:weixinpay-intro",
+            name: "weixinpay-intro",
+            title: "weixinpay-intro",
+            pluginName: "weixinpay",
+            marketplace: "workbuddy-builtin",
+            enabled: true
+          }
+        ],
+        cronTasks: [{ id: "task-1", name: "daily-check", enabled: true }],
+        localSessions: [],
+        apiBaseUrls: ["http://127.0.0.1:49446"],
+        lastLoadedAt: "2026-06-01T00:00:00.000Z",
+        errors: []
+      })
+    });
+
+    await bridge.start();
+    try {
+      const connection = await server.connected;
+      connection.socket.send(
+        JSON.stringify({
+          req_id: "rpc-runtime",
+          action: "runtime.get",
+          status: "request",
+          data: {}
+        })
+      );
+      connection.socket.send(
+        JSON.stringify({
+          req_id: "rpc-cron-runtime",
+          action: "cron.tasks",
+          status: "request",
+          data: { limit: 10, offset: 0 }
+        })
+      );
+
+      await waitFor(() => {
+        expect(frameByReq(server.frames, "rpc-runtime")).toMatchObject({
+          status: "done",
+          data: {
+            status: {
+              hostKind: "workbuddy",
+              workbuddyVersion: "5.0.3",
+              modelPrimary: "auto",
+              expertId: "BrandGuardian",
+              permissionMode: "bypassPermissions",
+              workerStatus: {
+                sharedSessionActive: true,
+                endpoint: "http://127.0.0.1:49446"
+              }
+            },
+            config: {
+              model: { name: "auto" },
+              workbuddy: {
+                version: "5.0.3",
+                expertId: "BrandGuardian",
+                permissionMode: "bypassPermissions"
+              }
+            },
+            enabledSkills: [
+              expect.objectContaining({
+                name: "weixinpay-intro",
+                pluginName: "weixinpay"
+              })
+            ],
+            cronTasks: [{ id: "task-1", name: "daily-check", enabled: true }]
+          }
+        });
+        expect(frameByReq(server.frames, "rpc-cron-runtime")).toMatchObject({
+          status: "done",
+          data: {
+            tasks: [{ id: "task-1", name: "daily-check", enabled: true }],
+            pagination: { limit: 10, offset: 0, total: 1, hasMore: false }
+          }
+        });
+      });
+    } finally {
+      await bridge.stop();
+    }
+  });
+
   it("loads required config from WorkBuddy/CodeBuddy environment aliases", () => {
     expect(
       loadCodeBuddyChannelConfig({
@@ -559,6 +687,78 @@ describe("CodeBuddy 53AIHub channel", () => {
       await bridge.stop();
     }
   });
+
+  it("routes WorkBuddy interaction control actions to ACP", async () => {
+    const server = await createFakeHubServer();
+    cleanupServers.push(server.close);
+    const acp = await createFakeAcpServer();
+    cleanupServers.push(acp.close);
+    const bridge = createCodeBuddyChannelBridge({
+      config: buildConfig(server.url),
+      notifyChannel: async () => {},
+      historyLoader: async () => ({
+        sessions: [
+          {
+            id: "53aihub-workbuddy-shared",
+            title: "53AIHub WorkBuddy",
+            status: "running" as const,
+            hostKind: "workbuddy" as const,
+            runnerCommand: "workbuddy" as const,
+            createdAt: "2026-06-01T00:00:00.000Z",
+            updatedAt: "2026-06-01T00:01:00.000Z",
+            lastEventSeq: 0
+          }
+        ],
+        messagesBySessionId: new Map(),
+        eventsBySessionId: new Map()
+      }),
+      runtimeLoader: async () => ({
+        info: {},
+        workers: [],
+        plugins: [],
+        skills: [],
+        cronTasks: [],
+        localSessions: [],
+        apiBaseUrls: [acp.url],
+        lastLoadedAt: "2026-06-01T00:00:00.000Z",
+        errors: []
+      })
+    });
+
+    await bridge.start();
+    try {
+      const connection = await server.connected;
+      connection.socket.send(
+        JSON.stringify({
+          req_id: "rpc-workbuddy-interaction",
+          action: "sessions.control",
+          status: "request",
+          data: {
+            session_id: "53aihub-workbuddy-shared",
+            action: "respond_interruption",
+            method: "session/request_permission",
+            tool_call_id: "tool-1",
+            decision: "allow"
+          }
+        })
+      );
+
+      await waitFor(() => {
+        expect(frameByReq(server.frames, "rpc-workbuddy-interaction")).toMatchObject({
+          status: "done",
+          data: {
+            ok: true,
+            submitted: true,
+            action: "respond_interruption",
+            session_id: "53aihub-workbuddy-shared"
+          }
+        });
+        expect(acp.calls.map((call) => call.method)).toContain("_codebuddy.ai/resolveInterruption");
+      });
+    } finally {
+      await bridge.stop();
+    }
+  });
 });
 
 function buildConfig(wsUrl: string) {
@@ -631,6 +831,94 @@ async function createFakeHubServer(): Promise<{
       await new Promise<void>((resolve) => httpServer.close(() => resolve()));
     }
   };
+}
+
+async function createFakeAcpServer(): Promise<{
+  url: string;
+  calls: Array<{ method: string; params: Record<string, unknown> }>;
+  close: () => Promise<void>;
+}> {
+  const calls: Array<{ method: string; params: Record<string, unknown> }> = [];
+  const httpServer = createServer(async (request, response) => {
+    if (request.method === "POST" && request.url === "/api/v1/acp/connect") {
+      writeJson(response, {
+        connectionId: "connection-1",
+        sessionToken: "session-token-1"
+      });
+      return;
+    }
+    if (request.method === "POST" && request.url === "/api/v1/acp") {
+      const body = await readJsonBody(request);
+      if (body.method) {
+        calls.push({
+          method: String(body.method),
+          params: toRecord(body.params)
+        });
+        writeSse(response, {
+          jsonrpc: "2.0",
+          id: body.id,
+          result: {}
+        });
+        return;
+      }
+      writeJson(response, {});
+      return;
+    }
+    response.writeHead(404);
+    response.end();
+  });
+
+  await new Promise<void>((resolve, reject) => {
+    httpServer.once("error", reject);
+    httpServer.listen(0, "127.0.0.1", () => {
+      httpServer.off("error", reject);
+      resolve();
+    });
+  });
+  const address = httpServer.address();
+  if (!address || typeof address === "string") {
+    throw new Error("failed to bind fake ACP server");
+  }
+
+  return {
+    url: `http://127.0.0.1:${address.port}`,
+    calls,
+    close: async () => {
+      await new Promise<void>((resolve) => httpServer.close(() => resolve()));
+    }
+  };
+}
+
+function writeJson(response: ServerResponse, value: unknown) {
+  response.writeHead(200, { "Content-Type": "application/json" });
+  response.end(JSON.stringify(value));
+}
+
+function writeSse(response: ServerResponse, value: unknown) {
+  response.writeHead(200, { "Content-Type": "text/event-stream" });
+  response.end(`data: ${JSON.stringify(value)}\n\n`);
+}
+
+function readJsonBody(request: IncomingMessage): Promise<Record<string, unknown>> {
+  return new Promise((resolve, reject) => {
+    let raw = "";
+    request.setEncoding("utf8");
+    request.on("data", (chunk) => {
+      raw += chunk;
+    });
+    request.on("end", () => {
+      try {
+        resolve(toRecord(JSON.parse(raw || "{}")));
+      } catch (error) {
+        reject(error);
+      }
+    });
+    request.on("error", reject);
+  });
+}
+
+function toRecord(value: unknown): Record<string, unknown> {
+  return value && typeof value === "object" && !Array.isArray(value) ? value as Record<string, unknown> : {};
 }
 
 function frameByReq(

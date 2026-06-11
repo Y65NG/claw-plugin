@@ -1,10 +1,10 @@
-import { mkdtemp, mkdir, rm, writeFile } from "node:fs/promises";
+import { mkdtemp, mkdir, readFile, rm, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 
 import { afterEach, describe, expect, it } from "vitest";
 
-import { loadWorkBuddyHistory } from "../src/workbuddy-history";
+import { loadWorkBuddyHistory, sanitizeWorkBuddyChannelHistory } from "../src/workbuddy-history";
 
 const cleanupPaths: string[] = [];
 
@@ -243,5 +243,164 @@ describe("WorkBuddy history adapter", () => {
       id: "session-d",
       title: "请只回复两个字：收到"
     });
+  });
+
+  it("sanitizes only the matching 53AIHub channel record in WorkBuddy JSONL", async () => {
+    const tempRoot = await mkdtemp(join(tmpdir(), "workbuddy-history-sanitize-"));
+    cleanupPaths.push(tempRoot);
+    const workbuddyHome = join(tempRoot, ".workbuddy");
+    const projectDir = join(workbuddyHome, "projects", "project");
+    const jsonlPath = join(projectDir, "session-clean.jsonl");
+    await mkdir(projectDir, { recursive: true });
+    await writeFile(
+      jsonlPath,
+      [
+        JSON.stringify({
+          id: "keep",
+          type: "message",
+          role: "user",
+          content: [
+            {
+              type: "input_text",
+              text: [
+                "<channel source=\"53aihub-channel\" chat_id=\"chat-a\" req_id=\"old-req\">",
+                "旧消息",
+                "<reply_instruction>hidden</reply_instruction>",
+                "</channel>"
+              ].join("\n")
+            }
+          ],
+          providerData: { agent: "cli" }
+        }),
+        JSON.stringify({
+          id: "clean",
+          type: "message",
+          role: "user",
+          content: [
+            {
+              type: "input_text",
+              text: [
+                "<channel source=\"53aihub-channel\" chat_id=\"chat-a\" req_id=\"req-a\" user_name=\"Y65NG\">",
+                "请只回复两个字：收到",
+                "",
+                "<reply_instruction>internal instruction</reply_instruction>",
+                "</channel>"
+              ].join("\n")
+            }
+          ],
+          providerData: { agent: "cli" }
+        })
+      ].join("\n") + "\n"
+    );
+
+    const result = await sanitizeWorkBuddyChannelHistory({
+      workbuddyHome,
+      sessionId: "session-clean",
+      chatId: "chat-a",
+      reqId: "req-a"
+    });
+    const records = (await readFile(jsonlPath, "utf8")).trim().split(/\r?\n/).map((line) => JSON.parse(line));
+
+    expect(result).toMatchObject({
+      updated: true,
+      replacements: 1,
+      scannedFiles: 1
+    });
+    expect(records[0].content[0].text).toContain("<channel");
+    expect(records[1].content[0].text).toBe("请只回复两个字：收到");
+    expect(records[1].providerData.hub53aiChannel).toMatchObject({
+      chat_id: "chat-a",
+      req_id: "req-a",
+      user_name: "Y65NG"
+    });
+  });
+
+  it("cleans channel envelopes from WorkBuddy generated titles", async () => {
+    const tempRoot = await mkdtemp(join(tmpdir(), "workbuddy-history-title-"));
+    cleanupPaths.push(tempRoot);
+    const workbuddyHome = join(tempRoot, ".workbuddy");
+    const projectDir = join(workbuddyHome, "projects", "project");
+    await mkdir(projectDir, { recursive: true });
+    await writeFile(
+      join(projectDir, "session-title.jsonl"),
+      [
+        JSON.stringify({
+          type: "message",
+          role: "user",
+          timestamp: "2026-06-01T04:00:00.000Z",
+          content: "fallback"
+        }),
+        JSON.stringify({
+          type: "ai-title",
+          timestamp: "2026-06-01T04:00:10.000Z",
+          title: [
+            "53AIHub：<channel source=\"53aihub-channel\" chat_id=\"chat-a\">",
+            "真正标题",
+            "<reply_instruction>hidden</reply_instruction>",
+            "</channel>"
+          ].join("\n")
+        })
+      ].join("\n") + "\n"
+    );
+
+    const snapshot = await loadWorkBuddyHistory({ workbuddyHome, sqliteCommand: join(tempRoot, "missing-sqlite") });
+
+    expect(snapshot.sessions[0]).toMatchObject({
+      id: "session-title",
+      title: "53AIHub：真正标题"
+    });
+  });
+
+  it("maps WorkBuddy question requests to interrupted timeline events with options", async () => {
+    const tempRoot = await mkdtemp(join(tmpdir(), "workbuddy-history-question-"));
+    cleanupPaths.push(tempRoot);
+    const workbuddyHome = join(tempRoot, ".workbuddy");
+    const projectDir = join(workbuddyHome, "projects", "project");
+    await mkdir(projectDir, { recursive: true });
+    await writeFile(
+      join(projectDir, "session-question.jsonl"),
+      [
+        JSON.stringify({
+          type: "message",
+          role: "user",
+          timestamp: "2026-06-01T05:00:00.000Z",
+          content: "trigger option"
+        }),
+        JSON.stringify({
+          id: "question-1",
+          type: "question_request",
+          method: "_codebuddy.ai/question",
+          timestamp: "2026-06-01T05:00:10.000Z",
+          params: {
+            requestId: "q-1",
+            question: "请选择下一步",
+            options: [
+              { id: "a", label: "继续执行", value: "continue" },
+              { id: "b", label: "停止", value: "stop" }
+            ]
+          }
+        })
+      ].join("\n") + "\n"
+    );
+
+    const snapshot = await loadWorkBuddyHistory({ workbuddyHome, sqliteCommand: join(tempRoot, "missing-sqlite") });
+
+    expect(snapshot.eventsBySessionId.get("session-question")).toEqual([
+      expect.objectContaining({
+        id: "question-1",
+        kind: "run.interrupted",
+        payload: expect.objectContaining({
+          requiresUserInput: true,
+          interaction: expect.objectContaining({
+            id: "q-1",
+            question: "请选择下一步",
+            options: [
+              expect.objectContaining({ id: "a", label: "继续执行", value: "continue" }),
+              expect.objectContaining({ id: "b", label: "停止", value: "stop" })
+            ]
+          })
+        })
+      })
+    ]);
   });
 });

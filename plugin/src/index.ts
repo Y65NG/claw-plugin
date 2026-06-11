@@ -87,10 +87,27 @@ export {
 } from "./workbuddy-supervisor";
 export {
   loadWorkBuddyHistory,
+  sanitizeWorkBuddyChannelHistory,
+  type SanitizeWorkBuddyChannelHistoryInput,
+  type SanitizeWorkBuddyChannelHistoryResult,
   type WorkBuddyHistoryMessage,
   type WorkBuddyHistorySession,
   type WorkBuddyHistorySnapshot
 } from "./workbuddy-history";
+export {
+  loadWorkBuddyRuntime,
+  pokeWorkBuddySessionRefresh,
+  type WorkBuddyRuntimeCronTask,
+  type WorkBuddyRuntimePlugin,
+  type WorkBuddyRuntimeSkill,
+  type WorkBuddyRuntimeSnapshot,
+  type WorkBuddyRuntimeWorker
+} from "./workbuddy-runtime";
+export {
+  submitWorkBuddyInteraction,
+  type WorkBuddyInteractionControlPayload,
+  type WorkBuddyInteractionControlResult
+} from "./workbuddy-acp-control";
 export {
   buildHub53AIOutgoingChunk,
   buildHub53AIPrompt,

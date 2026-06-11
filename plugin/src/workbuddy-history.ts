@@ -1,6 +1,6 @@
 import { execFile } from "node:child_process";
 import { existsSync } from "node:fs";
-import { readdir, readFile, stat } from "node:fs/promises";
+import { readdir, readFile, stat, writeFile } from "node:fs/promises";
 import { homedir } from "node:os";
 import { basename, dirname, join } from "node:path";
 import { promisify } from "node:util";
@@ -19,7 +19,7 @@ export type WorkBuddyHistoryEvent = {
   id: string;
   sessionId: string;
   seq: number;
-  kind: "assistant.thinking" | "tool.call" | "tool.result" | "run.failed";
+  kind: "assistant.thinking" | "tool.call" | "tool.result" | "run.failed" | "run.interrupted";
   payload: Record<string, unknown>;
   createdAt: string;
 };
@@ -34,6 +34,10 @@ export type WorkBuddyHistorySession = {
   updatedAt: string;
   lastEventSeq: number;
   cwd?: string;
+  model?: string;
+  expertId?: string;
+  expertMarketplace?: string;
+  permissionMode?: string;
   source?: "jsonl" | "sqlite";
 };
 
@@ -46,6 +50,21 @@ export type WorkBuddyHistorySnapshot = {
 export type LoadWorkBuddyHistoryInput = {
   workbuddyHome?: string;
   sqliteCommand?: string;
+};
+
+export type SanitizeWorkBuddyChannelHistoryInput = {
+  workbuddyHome?: string;
+  sessionId: string;
+  chatId?: string;
+  reqId?: string;
+};
+
+export type SanitizeWorkBuddyChannelHistoryResult = {
+  updated: boolean;
+  replacements: number;
+  scannedFiles: number;
+  filePaths: string[];
+  errors: string[];
 };
 
 type MutableSession = WorkBuddyHistorySession & {
@@ -61,6 +80,10 @@ type SqliteSessionRecord = {
   created_at?: unknown;
   updated_at?: unknown;
   last_activity_at?: unknown;
+  model?: unknown;
+  expert_id?: unknown;
+  expert_marketplace?: unknown;
+  permission_mode?: unknown;
 };
 
 export async function loadWorkBuddyHistory(input: LoadWorkBuddyHistoryInput = {}): Promise<WorkBuddyHistorySnapshot> {
@@ -85,6 +108,69 @@ export async function loadWorkBuddyHistory(input: LoadWorkBuddyHistoryInput = {}
     messagesBySessionId,
     eventsBySessionId
   };
+}
+
+export async function sanitizeWorkBuddyChannelHistory(
+  input: SanitizeWorkBuddyChannelHistoryInput
+): Promise<SanitizeWorkBuddyChannelHistoryResult> {
+  const workbuddyHome = input.workbuddyHome || join(homedir(), ".workbuddy");
+  const projectsDir = join(workbuddyHome, "projects");
+  const result: SanitizeWorkBuddyChannelHistoryResult = {
+    updated: false,
+    replacements: 0,
+    scannedFiles: 0,
+    filePaths: [],
+    errors: []
+  };
+  if (!input.sessionId.trim() || !existsSync(projectsDir)) {
+    return result;
+  }
+
+  const files = (await findJsonlFiles(projectsDir)).filter((filePath) => basename(filePath, ".jsonl") === input.sessionId);
+  for (const filePath of files) {
+    result.scannedFiles += 1;
+    let raw = "";
+    try {
+      raw = await readFile(filePath, "utf8");
+    } catch (error) {
+      result.errors.push(error instanceof Error ? error.message : String(error));
+      continue;
+    }
+
+    const hadTrailingNewline = raw.endsWith("\n");
+    const lines = raw.split(/\r?\n/);
+    let fileReplacements = 0;
+    const nextLines = lines.map((line) => {
+      if (!line.trim()) {
+        return line;
+      }
+      const record = parseJsonLine(line);
+      if (!record || readString(record, "type") !== "message" || readString(record, "role") !== "user") {
+        return line;
+      }
+      const sanitized = sanitizeChannelRecord(record, input);
+      if (!sanitized.replaced) {
+        return line;
+      }
+      fileReplacements += sanitized.replaced;
+      return JSON.stringify(sanitized.record);
+    });
+
+    if (!fileReplacements) {
+      continue;
+    }
+
+    try {
+      await writeFile(filePath, normalizeJsonlOutput(nextLines, hadTrailingNewline), "utf8");
+      result.updated = true;
+      result.replacements += fileReplacements;
+      result.filePaths.push(filePath);
+    } catch (error) {
+      result.errors.push(error instanceof Error ? error.message : String(error));
+    }
+  }
+
+  return result;
 }
 
 async function loadJsonlSessions(workbuddyHome: string, sessions: Map<string, MutableSession>) {
@@ -138,11 +224,17 @@ async function parseJsonlSession(filePath: string, projectsDir: string, sessions
     minRecordTime = minRecordTime ? minIso(minRecordTime, timestamp) : timestamp;
     maxRecordTime = maxRecordTime ? maxIso(maxRecordTime, timestamp) : timestamp;
     if (type === "ai-title") {
-      const title = extractText(record.title ?? record.message ?? record.content);
+      const title = normalizeWorkBuddySessionTitle(extractText(record.title ?? record.message ?? record.content));
       if (title) {
         session.title = title;
       }
       session.updatedAt = maxIso(session.updatedAt, timestamp);
+      return;
+    }
+
+    const interruptionEvent = buildInterruptionEvent(record, sessionId, index, timestamp);
+    if (interruptionEvent) {
+      appendHistoryEvent(session, interruptionEvent);
       return;
     }
 
@@ -257,7 +349,7 @@ async function enrichSqliteSessions(
     const result = await execFileAsync(sqliteCommand, [
       "-json",
       dbPath,
-      "select id,cwd,title,status,created_at,updated_at,last_activity_at from sessions"
+      "select id,cwd,title,status,created_at,updated_at,last_activity_at,model,expert_id,expert_marketplace,permission_mode from sessions"
     ], { maxBuffer: 1024 * 1024 * 8 });
     const parsed = JSON.parse(String(result.stdout || "[]"));
     rows = Array.isArray(parsed) ? parsed : [];
@@ -277,13 +369,29 @@ async function enrichSqliteSessions(
       updatedAt,
       source: "sqlite"
     });
-    const title = typeof row.title === "string" && row.title.trim() ? row.title.trim() : "";
+    const title = normalizeWorkBuddySessionTitle(typeof row.title === "string" && row.title.trim() ? row.title.trim() : "");
     if (title) {
       session.title = title;
     }
     const cwd = typeof row.cwd === "string" && row.cwd.trim() ? row.cwd.trim() : "";
     if (cwd) {
       session.cwd = cwd;
+    }
+    const model = readSqliteString(row.model);
+    const expertId = readSqliteString(row.expert_id);
+    const expertMarketplace = readSqliteString(row.expert_marketplace);
+    const permissionMode = readSqliteString(row.permission_mode);
+    if (model) {
+      session.model = model;
+    }
+    if (expertId) {
+      session.expertId = expertId;
+    }
+    if (expertMarketplace) {
+      session.expertMarketplace = expertMarketplace;
+    }
+    if (permissionMode) {
+      session.permissionMode = permissionMode;
     }
     session.status = normalizeSessionStatus(row.status) ?? session.status;
     session.createdAt = minIso(session.createdAt, createdAt);
@@ -403,6 +511,129 @@ function buildToolResultEvent(
   };
 }
 
+function buildInterruptionEvent(
+  record: Record<string, unknown>,
+  sessionId: string,
+  index: number,
+  timestamp: string
+): Omit<WorkBuddyHistoryEvent, "sessionId" | "seq"> | undefined {
+  const type = readString(record, "type");
+  const method = readString(record, "method") ||
+    readString(toRecord(record.message), "method") ||
+    readString(toRecord(record.data), "method") ||
+    readString(toRecord(record.payload), "method");
+  const normalizedMethod = method.toLowerCase();
+  const normalizedType = type.toLowerCase();
+  const isQuestion =
+    normalizedMethod === "_codebuddy.ai/question" ||
+    normalizedMethod === "session/request_permission" ||
+    normalizedType === "question" ||
+    normalizedType === "question_request" ||
+    normalizedType === "permission_request" ||
+    normalizedType === "request_permission";
+  if (!isQuestion) {
+    return undefined;
+  }
+
+  const data = toRecord(record.data);
+  const message = toRecord(record.message);
+  const params = firstRecord(record.params, data.params, record.payload, message.params, record.data, record);
+  const requestId =
+    readString(params, "requestId") ||
+    readString(params, "request_id") ||
+    readString(params, "questionId") ||
+    readString(params, "question_id") ||
+    readString(params, "permissionId") ||
+    readString(params, "permission_id") ||
+    readString(record, "id") ||
+    `${sessionId}-question-${index + 1}`;
+  const toolCallId = readString(params, "toolCallId") || readString(params, "tool_call_id") || readString(params, "callId");
+  const question =
+    extractText(params.question) ||
+    extractText(params.prompt) ||
+    extractText(params.message) ||
+    extractText(params.content) ||
+    (normalizedMethod === "session/request_permission" ? "WorkBuddy 请求权限确认" : "WorkBuddy 等待用户选择");
+  const options = normalizeQuestionOptions(
+    params.options ?? params.choices ?? params.answers ?? params.actions,
+    normalizedMethod === "session/request_permission"
+  );
+  const interactionType = normalizedMethod === "session/request_permission" ||
+    normalizedType.includes("permission")
+    ? "permission"
+    : "question";
+
+  return {
+    id: readString(record, "id") || `${requestId}:interrupted`,
+    kind: "run.interrupted",
+    createdAt: timestamp,
+    payload: {
+      reason: "workbuddy.input_required",
+      summary: question,
+      message: question,
+      requiresUserInput: true,
+      interaction: {
+        id: requestId,
+        requestId,
+        type: interactionType,
+        method: method || type,
+        question,
+        options,
+        toolCallId
+      },
+      questions: [
+        {
+          id: requestId,
+          requestId,
+          type: interactionType,
+          method: method || type,
+          question,
+          options,
+          toolCallId
+        }
+      ]
+    }
+  };
+}
+
+function normalizeQuestionOptions(value: unknown, permissionFallback: boolean): Array<Record<string, unknown>> {
+  const rawOptions = Array.isArray(value) ? value : [];
+  const options = rawOptions
+    .map((option, index) => {
+      if (typeof option === "string" && option.trim()) {
+        return {
+          id: option.trim(),
+          label: option.trim(),
+          value: option.trim()
+        };
+      }
+      const record = toRecord(option);
+      const label =
+        readString(record, "label") ||
+        readString(record, "title") ||
+        readString(record, "name") ||
+        readString(record, "value") ||
+        readString(record, "id") ||
+        `选项 ${index + 1}`;
+      return {
+        ...record,
+        id: readString(record, "id") || readString(record, "value") || label,
+        label,
+        value: record.value ?? (readString(record, "id") || label),
+        description: readString(record, "description") || undefined
+      };
+    })
+    .filter((option) => readString(option, "label"));
+
+  if (options.length || !permissionFallback) {
+    return options;
+  }
+  return [
+    { id: "allow", label: "允许", value: "allow" },
+    { id: "deny", label: "拒绝", value: "deny" }
+  ];
+}
+
 function parseJsonLine(line: string): Record<string, unknown> | undefined {
   try {
     const parsed = JSON.parse(line);
@@ -432,10 +663,9 @@ function extractText(value: unknown): string {
 
 export function normalizeWorkBuddyUserMessage(content: string): string {
   const trimmed = content.trim();
-  if (trimmed.startsWith("<channel ") && trimmed.includes("</channel>")) {
-    const inner = trimmed
-      .replace(/^<channel\b[^>]*>\s*/, "")
-      .replace(/\s*<\/channel>\s*$/, "")
+  const channelMatch = trimmed.match(/<channel\b[^>]*>([\s\S]*?)(?:<\/channel>|$)/);
+  if (channelMatch) {
+    const inner = channelMatch[1]
       .replace(/<reply_instruction>[\s\S]*?<\/reply_instruction>/g, "")
       .trim();
     return decodeXmlEntities(inner || trimmed);
@@ -445,6 +675,119 @@ export function normalizeWorkBuddyUserMessage(content: string): string {
   }
   const match = trimmed.match(new RegExp("<user_query>([\\s\\S]*?)</user_query>"));
   return decodeXmlEntities(match?.[1]?.trim() || trimmed);
+}
+
+export function normalizeWorkBuddySessionTitle(title: string): string {
+  const trimmed = title.trim();
+  if (!trimmed) {
+    return "";
+  }
+  const prefixMatch = trimmed.match(/^(53AIHub|53AI Hub)\s*[：:]\s*/i);
+  const body = prefixMatch ? trimmed.slice(prefixMatch[0].length).trim() : trimmed;
+  const normalized = normalizeWorkBuddyUserMessage(body).replace(/\s+/g, " ").trim();
+  if (!normalized) {
+    return "";
+  }
+  if (prefixMatch && normalized !== body) {
+    return `53AIHub：${normalized.slice(0, 48)}`;
+  }
+  return normalized;
+}
+
+function sanitizeChannelRecord(
+  record: Record<string, unknown>,
+  input: SanitizeWorkBuddyChannelHistoryInput
+): { record: Record<string, unknown>; replaced: number } {
+  const content = record.content;
+  let replaced = 0;
+  let channelMeta: Record<string, string> | undefined;
+  const replaceText = (value: string) => {
+    const parsed = parse53AIHubChannelEnvelope(value);
+    if (!parsed || !matchesChannelTarget(parsed.meta, input)) {
+      return value;
+    }
+    replaced += 1;
+    channelMeta = parsed.meta;
+    return parsed.text;
+  };
+
+  if (typeof content === "string") {
+    const text = replaceText(content);
+    if (text !== content) {
+      record = { ...record, content: text };
+    }
+  } else if (Array.isArray(content)) {
+    const nextContent = content.map((item) => {
+      if (!item || typeof item !== "object" || Array.isArray(item)) {
+        return item;
+      }
+      const entry = item as Record<string, unknown>;
+      if (typeof entry.text !== "string") {
+        return item;
+      }
+      const text = replaceText(entry.text);
+      return text === entry.text ? item : { ...entry, text };
+    });
+    if (replaced > 0) {
+      record = { ...record, content: nextContent };
+    }
+  }
+
+  if (replaced > 0 && channelMeta) {
+    const providerData = toRecord(record.providerData);
+    record.providerData = {
+      ...providerData,
+      hub53aiChannel: {
+        ...toRecord(providerData.hub53aiChannel),
+        ...channelMeta,
+        sanitizedAt: new Date().toISOString()
+      }
+    };
+  }
+
+  return { record, replaced };
+}
+
+function parse53AIHubChannelEnvelope(value: string): { text: string; meta: Record<string, string> } | undefined {
+  const trimmed = value.trim();
+  const match = trimmed.match(/<channel\b([^>]*)>([\s\S]*?)(?:<\/channel>|$)/);
+  if (!match) {
+    return undefined;
+  }
+  const meta = parseChannelAttributes(match[1] || "");
+  const source = meta.source || "";
+  if (!/53aihub/i.test(source) && !/53aihub/i.test(trimmed)) {
+    return undefined;
+  }
+  return {
+    text: normalizeWorkBuddyUserMessage(trimmed),
+    meta
+  };
+}
+
+function parseChannelAttributes(value: string): Record<string, string> {
+  const meta: Record<string, string> = {};
+  const pattern = /([A-Za-z0-9_]+)="([^"]*)"/g;
+  let match: RegExpExecArray | null;
+  while ((match = pattern.exec(value))) {
+    meta[match[1]] = decodeXmlEntities(match[2]);
+  }
+  return meta;
+}
+
+function matchesChannelTarget(meta: Record<string, string>, input: SanitizeWorkBuddyChannelHistoryInput): boolean {
+  if (input.reqId?.trim() && meta.req_id !== input.reqId.trim()) {
+    return false;
+  }
+  if (input.chatId?.trim() && meta.chat_id !== input.chatId.trim()) {
+    return false;
+  }
+  return true;
+}
+
+function normalizeJsonlOutput(lines: string[], hadTrailingNewline: boolean): string {
+  const body = hadTrailingNewline && lines[lines.length - 1] === "" ? lines.slice(0, -1).join("\n") : lines.join("\n");
+  return hadTrailingNewline ? `${body}\n` : body;
 }
 
 function decodeXmlEntities(value: string): string {
@@ -462,8 +805,22 @@ function readString(record: Record<string, unknown>, key: string): string {
   return typeof value === "string" && value.trim() ? value.trim() : "";
 }
 
+function readSqliteString(value: unknown): string {
+  return typeof value === "string" && value.trim() ? value.trim() : "";
+}
+
 function toRecord(value: unknown): Record<string, unknown> {
   return value && typeof value === "object" && !Array.isArray(value) ? value as Record<string, unknown> : {};
+}
+
+function firstRecord(...values: unknown[]): Record<string, unknown> {
+  for (const value of values) {
+    const record = toRecord(value);
+    if (Object.keys(record).length) {
+      return record;
+    }
+  }
+  return {};
 }
 
 function parseJsonObject(value: unknown): Record<string, unknown> {

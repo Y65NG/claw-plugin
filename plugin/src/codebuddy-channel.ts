@@ -29,11 +29,21 @@ import {
 } from "./53aihub-protocol";
 import {
   loadWorkBuddyHistory,
+  sanitizeWorkBuddyChannelHistory,
   type WorkBuddyHistoryEvent,
   type WorkBuddyHistoryMessage,
   type WorkBuddyHistorySession,
   type WorkBuddyHistorySnapshot
 } from "./workbuddy-history";
+import {
+  loadWorkBuddyRuntime,
+  pokeWorkBuddySessionRefresh,
+  type WorkBuddyRuntimeSnapshot
+} from "./workbuddy-runtime";
+import {
+  submitWorkBuddyInteraction,
+  type WorkBuddyInteractionControlPayload
+} from "./workbuddy-acp-control";
 import { syncWorkBuddySessionIndex } from "./workbuddy-session-index";
 
 export type Hub53AIChannelConfig = Hub53AIBaseConfig & {
@@ -67,6 +77,7 @@ export type CodeBuddyChannelBridgeInput = {
   config: Hub53AIChannelConfig;
   notifyChannel(notification: CodeBuddyChannelNotification): Promise<void>;
   historyLoader?: () => Promise<WorkBuddyHistorySnapshot>;
+  runtimeLoader?: () => Promise<WorkBuddyRuntimeSnapshot>;
   logger?: {
     info?(message: string): void;
     warn?(message: string): void;
@@ -101,7 +112,8 @@ type ChannelSessionRecord = {
   messages: ChannelMessageRecord[];
 };
 
-type ChannelRPCErrorCode = "FEATURE_NOT_AVAILABLE" | "PARAM_ERROR" | "INTERNAL_ERROR";
+type ChannelRPCErrorCode = "FEATURE_NOT_AVAILABLE" | "PARAM_ERROR" | "INTERNAL_ERROR" | "NETWORK_ERROR";
+type WorkBuddyInteractionControlAction = "respond_interruption" | "submit_answer" | "resolve_interruption";
 
 class ChannelRPCError extends Error {
   constructor(
@@ -193,7 +205,8 @@ export function createCodeBuddyChannelBridge(input: CodeBuddyChannelBridgeInput)
       status: inputReply.status ?? "done"
     });
     appendAssistantMessage(chatId, inputReply.text);
-      await syncSharedWorkBuddySessionIndex(inputReply.text, "completed", { preserveTitleOnUpdate: true });
+    scheduleSharedWorkBuddyChannelHistoryCleanup(chatId, reqId);
+    await syncSharedWorkBuddySessionIndex(inputReply.text, "completed", { preserveTitleOnUpdate: true });
   }
 
   function connect() {
@@ -405,10 +418,16 @@ export function createCodeBuddyChannelBridge(input: CodeBuddyChannelBridgeInput)
     if (request.action === "sessions.control") {
       const payload = toRecord(request.data);
       const action = readOptionalString(payload, "action");
-      if (action !== "stop") {
+      if (action === "stop") {
+        return stopRPCSession(payload, action);
+      }
+      if (isWorkBuddyInteractionControlAction(action)) {
+        return respondWorkBuddyInteraction(payload, action);
+      }
+      if (!action) {
         throw new ChannelRPCError("PARAM_ERROR", "unsupported sessions.control action");
       }
-      return stopRPCSession(payload, action);
+      throw new ChannelRPCError("PARAM_ERROR", "unsupported sessions.control action");
     }
 
     if (request.action === "runtime.get") {
@@ -416,27 +435,83 @@ export function createCodeBuddyChannelBridge(input: CodeBuddyChannelBridgeInput)
     }
 
     if (request.action === "cron.tasks") {
+      const runtime = await loadRuntimeSnapshot();
+      const allTasks = runtime.cronTasks;
       const pagination = readRPCPagination(request.data, 100);
+      const page = allTasks.slice(pagination.offset, pagination.offset + pagination.limit);
       return {
-        tasks: [],
-        cronTasks: [],
-        pagination: buildPagination(pagination.limit, pagination.offset, 0, 0)
+        tasks: page,
+        cronTasks: page,
+        pagination: buildPagination(pagination.limit, pagination.offset, allTasks.length, page.length)
       };
     }
 
     throw new ChannelRPCError("FEATURE_NOT_AVAILABLE", `Unsupported RPC action: ${request.action}`);
   }
 
-  function resolveRuntimeRPC(payload: unknown): unknown {
+  async function resolveRuntimeRPC(payload: unknown): Promise<unknown> {
     const include = (readOptionalString(toRecord(payload), "include") ?? "all").toLowerCase();
+    const runtime = await loadRuntimeSnapshot();
+    const history = await loadHistorySnapshot();
+    const sharedSession = history.sessions.find((session) => session.id === input.config.workbuddySessionId);
+    const sharedWorker = runtime.workers.find((worker) => worker.sessionId === input.config.workbuddySessionId);
+    const mainWorker = runtime.workers.find((worker) => worker.isCurrent) ?? runtime.workers[0];
+    const workbuddyVersion =
+      readOptionalString(runtime.info, "version") ??
+      readOptionalString(sharedWorker ?? {}, "version") ??
+      readOptionalString(mainWorker ?? {}, "version");
+    const modelName = sharedSession?.model || readOptionalString(runtime.info, "requestModelName") || "auto";
+    const expertId = sharedSession?.expertId || readOptionalString(runtime.info, "expertId");
+    const expertMarketplace = sharedSession?.expertMarketplace || readOptionalString(runtime.info, "expertMarketplace");
+    const permissionMode = sharedSession?.permissionMode || readOptionalString(runtime.info, "permissionMode");
     const status = {
       ...getStatus(),
       healthy: connectionStatus === "connected",
       connectionHealthy: connectionStatus === "connected",
       hostKind: "workbuddy",
-      runnerCommand: "codebuddy-channel"
+      runnerCommand: "codebuddy-channel",
+      serviceVersion: workbuddyVersion,
+      workbuddyVersion,
+      modelPrimary: modelName,
+      requestModelName: modelName,
+      expertId,
+      expertMarketplace,
+      permissionMode,
+      workers: runtime.workers,
+      workerCount: runtime.workers.length,
+      workerStatus: {
+        running: Boolean(sharedWorker || mainWorker),
+        sharedSessionActive: Boolean(sharedWorker),
+        sharedSessionId: input.config.workbuddySessionId,
+        endpoint: sharedWorker?.endpoint || sharedWorker?.url,
+        mainEndpoint: mainWorker?.endpoint || mainWorker?.url
+      },
+      cronScheduler: {
+        jobCount: runtime.cronTasks.length
+      },
+      runtimeErrors: runtime.errors
     };
     const config = {
+      gateway: {
+        hostKind: "workbuddy",
+        runnerCommand: "codebuddy-channel"
+      },
+      model: {
+        name: modelName,
+        requestModelName: modelName
+      },
+      workbuddy: {
+        home: input.config.workbuddyHome,
+        version: workbuddyVersion,
+        sessionId: input.config.workbuddySessionId,
+        workerEndpoint: sharedWorker?.endpoint || sharedWorker?.url,
+        mainEndpoint: mainWorker?.endpoint || mainWorker?.url,
+        expertId,
+        expertMarketplace,
+        permissionMode,
+        plugins: runtime.plugins,
+        workers: runtime.workers
+      },
       hub53ai: {
         enabled: true,
         botId: maskHub53AIBotId(input.config.botId),
@@ -449,8 +524,9 @@ export function createCodeBuddyChannelBridge(input: CodeBuddyChannelBridgeInput)
       }
     };
     const skills = {
-      skills: [],
-      enabledSkills: [],
+      skills: runtime.skills,
+      enabledSkills: runtime.skills.filter((skill) => skill.enabled !== false),
+      plugins: runtime.plugins,
       hostKind: "workbuddy"
     };
 
@@ -467,7 +543,7 @@ export function createCodeBuddyChannelBridge(input: CodeBuddyChannelBridgeInput)
       status,
       config,
       ...skills,
-      cronTasks: []
+      cronTasks: runtime.cronTasks
     };
   }
 
@@ -581,6 +657,16 @@ export function createCodeBuddyChannelBridge(input: CodeBuddyChannelBridgeInput)
         status,
         preserveTitleOnUpdate: options?.preserveTitleOnUpdate
       });
+      void pokeWorkBuddySessionRefresh({
+        workbuddyHome: input.config.workbuddyHome,
+        sessionId: input.config.workbuddySessionId
+      }).catch((error) => {
+        input.logger?.warn?.(
+          `[53aihub-channel] failed to poke WorkBuddy refresh: ${
+            error instanceof Error ? error.message : String(error)
+          }`
+        );
+      });
     } catch (error) {
       input.logger?.warn?.(
         `[53aihub-channel] failed to sync WorkBuddy session index: ${
@@ -588,6 +674,35 @@ export function createCodeBuddyChannelBridge(input: CodeBuddyChannelBridgeInput)
         }`
       );
     }
+  }
+
+  function scheduleSharedWorkBuddyChannelHistoryCleanup(chatId: string, reqId: string) {
+    const timer = setTimeout(() => {
+      void sanitizeWorkBuddyChannelHistory({
+        workbuddyHome: input.config.workbuddyHome,
+        sessionId: input.config.workbuddySessionId,
+        chatId,
+        reqId
+      }).then((result) => {
+        if (!result.updated) {
+          return;
+        }
+        input.logger?.info?.(
+          `[53aihub-channel] sanitized WorkBuddy channel history: replacements=${result.replacements}`
+        );
+        return pokeWorkBuddySessionRefresh({
+          workbuddyHome: input.config.workbuddyHome,
+          sessionId: input.config.workbuddySessionId
+        });
+      }).catch((error) => {
+        input.logger?.warn?.(
+          `[53aihub-channel] failed to sanitize WorkBuddy channel history: ${
+            error instanceof Error ? error.message : String(error)
+          }`
+        );
+      });
+    }, 1_500);
+    timer.unref?.();
   }
 
   function buildSharedWorkBuddySessionTitle(text: string): string {
@@ -653,6 +768,46 @@ export function createCodeBuddyChannelBridge(input: CodeBuddyChannelBridgeInput)
     throw new ChannelRPCError("PARAM_ERROR", `unknown session: ${sessionId}`);
   }
 
+  async function respondWorkBuddyInteraction(payload: Record<string, unknown>, action: string) {
+    const sessionId = readRPCSessionId(payload);
+    const history = await loadHistorySnapshot();
+    const isKnownHistorySession = history.sessions.some((historySession) => historySession.id === sessionId);
+    if (sessionId !== input.config.workbuddySessionId && !isKnownHistorySession && !sessions.has(sessionId)) {
+      throw new ChannelRPCError("PARAM_ERROR", `unknown session: ${sessionId}`);
+    }
+
+    const runtime = await loadRuntimeSnapshot();
+    try {
+      const result = await submitWorkBuddyInteraction({
+        sessionId,
+        payload: {
+          ...payload,
+          action,
+          session_id: sessionId,
+          conversation_id: sessionId
+        } as WorkBuddyInteractionControlPayload,
+        apiBaseUrls: runtime.apiBaseUrls,
+        timeoutMs: 5_000
+      });
+      await syncSharedWorkBuddySessionIndex("53AIHub WorkBuddy", "running", { preserveTitleOnUpdate: true });
+      await pokeWorkBuddySessionRefresh({
+        workbuddyHome: input.config.workbuddyHome,
+        sessionId,
+        apiBaseUrls: runtime.apiBaseUrls,
+        timeoutMs: 500
+      }).catch(() => undefined);
+      return result;
+    } catch (error) {
+      throw new ChannelRPCError("NETWORK_ERROR", error instanceof Error ? error.message : String(error));
+    }
+  }
+
+  function isWorkBuddyInteractionControlAction(action?: string): action is WorkBuddyInteractionControlAction {
+    return action === "respond_interruption" ||
+      action === "submit_answer" ||
+      action === "resolve_interruption";
+  }
+
   async function loadMergedSessionPayloads() {
     const merged = new Map<string, ReturnType<typeof toSessionPayload> | ReturnType<typeof toHistorySessionPayload>>();
     const history = await loadHistorySnapshot();
@@ -713,8 +868,38 @@ export function createCodeBuddyChannelBridge(input: CodeBuddyChannelBridgeInput)
       createdAt: session.createdAt,
       updatedAt: session.updatedAt,
       lastEventSeq: session.lastEventSeq,
-      ...(session.cwd ? { cwd: session.cwd } : {})
+      ...(session.cwd ? { cwd: session.cwd } : {}),
+      ...(session.model ? { model: session.model } : {}),
+      ...(session.expertId ? { expertId: session.expertId, expert_id: session.expertId } : {}),
+      ...(session.expertMarketplace ? {
+        expertMarketplace: session.expertMarketplace,
+        expert_marketplace: session.expertMarketplace
+      } : {}),
+      ...(session.permissionMode ? { permissionMode: session.permissionMode, permission_mode: session.permissionMode } : {})
     };
+  }
+
+  async function loadRuntimeSnapshot(): Promise<WorkBuddyRuntimeSnapshot> {
+    try {
+      return input.runtimeLoader
+        ? input.runtimeLoader()
+        : loadWorkBuddyRuntime({
+          workbuddyHome: input.config.workbuddyHome,
+          sessionId: input.config.workbuddySessionId
+        });
+    } catch (error) {
+      return {
+        info: {},
+        workers: [],
+        plugins: [],
+        skills: [],
+        cronTasks: [],
+        localSessions: [],
+        apiBaseUrls: [],
+        lastLoadedAt: new Date().toISOString(),
+        errors: [error instanceof Error ? error.message : String(error)]
+      };
+    }
   }
 
   function readRPCPagination(payload: unknown, defaultLimit: number) {
