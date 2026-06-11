@@ -4,7 +4,7 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 
 import type { GatewayEvent, GatewaySession } from "../src/gateway-client";
-import { createConsoleServer } from "../src/console-server";
+import { createConsoleServer, deriveDerivedAssistantMessage } from "../src/console-server";
 
 const cleanupPaths: string[] = [];
 
@@ -13,6 +13,104 @@ afterEach(async () => {
 });
 
 describe("console server", () => {
+  it("does not derive assistant text from a previous OpenClaw run after a newer user message", () => {
+    const sessionId = "agent:main:dashboard:test";
+    const derived = deriveDerivedAssistantMessage(
+      [
+        {
+          id: "user-old",
+          sessionId,
+          role: "user",
+          content: "介绍一下53AI的产品",
+          createdAt: "2026-06-10T10:00:00.000Z",
+        },
+        {
+          id: "assistant-old",
+          sessionId,
+          role: "assistant",
+          content: "旧的 53AI 搜索结果",
+          createdAt: "2026-06-10T10:01:00.000Z",
+        },
+        {
+          id: "user-new",
+          sessionId,
+          role: "user",
+          content: "回归测试 请只回复收到",
+          createdAt: "2026-06-10T10:02:00.000Z",
+        },
+        {
+          id: "assistant-new",
+          sessionId,
+          role: "assistant",
+          content: "收到",
+          createdAt: "2026-06-10T10:03:00.000Z",
+        },
+      ],
+      [
+        {
+          id: "old-delta",
+          sessionId,
+          seq: 100,
+          kind: "assistant.delta",
+          payload: { content: "旧的 53AI 搜索结果", runId: "run-old", mode: "replace" },
+          createdAt: "2026-06-10T10:01:00.000Z",
+        },
+        {
+          id: "old-completed",
+          sessionId,
+          seq: 101,
+          kind: "run.completed",
+          payload: { runId: "run-old" },
+          createdAt: "2026-06-10T10:01:01.000Z",
+        },
+        {
+          id: "new-user",
+          sessionId,
+          seq: 102,
+          kind: "user.message",
+          payload: { content: "回归测试 请只回复收到" },
+          createdAt: "2026-06-10T10:02:00.000Z",
+        },
+        {
+          id: "new-started",
+          sessionId,
+          seq: 103,
+          kind: "run.started",
+          payload: { runId: "run-new" },
+          createdAt: "2026-06-10T10:02:01.000Z",
+        },
+        {
+          id: "new-delta",
+          sessionId,
+          seq: 104,
+          kind: "assistant.delta",
+          payload: { content: "收到", runId: "run-new", mode: "append" },
+          createdAt: "2026-06-10T10:02:02.000Z",
+        },
+        {
+          id: "new-message",
+          sessionId,
+          seq: 105,
+          kind: "assistant.message",
+          payload: { content: "收到", runId: "run-new" },
+          createdAt: "2026-06-10T10:02:03.000Z",
+        },
+        {
+          id: "new-completed",
+          sessionId,
+          seq: 106,
+          kind: "run.completed",
+          payload: { runId: "run-new" },
+          createdAt: "2026-06-10T10:02:04.000Z",
+        },
+      ],
+      "completed",
+      sessionId
+    );
+
+    expect(derived).toBeNull();
+  });
+
   it("keeps the current REST contract while persisting gateway-backed sessions", async () => {
     const stateDir = await mkdtemp(join(tmpdir(), "claw-control-center-"));
     cleanupPaths.push(stateDir);

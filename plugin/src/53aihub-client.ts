@@ -84,7 +84,8 @@ export type Hub53AIOutgoingChunk = {
     choices: Array<{
       index: number;
       delta: {
-        content: string;
+        content?: string;
+        reasoning_content?: string;
         role: "assistant";
       };
       finish_reason: "stop" | "error" | null;
@@ -212,7 +213,6 @@ type HubBridgeInput = {
 };
 
 const HEARTBEAT_INTERVAL_MS = 30_000;
-const DEFAULT_THINKING_MESSAGE = "正在处理您的请求...";
 const MAX_OUTBOX_FRAMES = 200;
 const RUN_WAIT_TIMEOUT_MS = 30 * 60 * 1000;
 const HUB_SESSION_TITLE_PREFIX = "53AI Hub-";
@@ -267,7 +267,6 @@ export function createHub53AIBridge(input: HubBridgeInput) {
   const chatQueues = new Map<string, Promise<void>>();
   const lastReplyByReq = new Map<string, string>();
   const activeReqIdsBySession = new Map<string, Set<string>>();
-  let bridgeEventCounter = 0;
 
   async function start() {
     await loadState();
@@ -556,13 +555,13 @@ export function createHub53AIBridge(input: HubBridgeInput) {
       input.gateway.listEvents(sessionId, 0),
       input.callbacks.listSessionEvents?.(sessionId) ?? []
     ]);
-    const deduped = filterSyntheticToolPlaceholderThinkingEvents(
+    const deduped = normalizeTimelineEventsWithProtocol(sessionId, filterSyntheticToolPlaceholderThinkingEvents(
       filterSupersededHistoryThinkingEvents(
         dedupeTimelineEvents([...gatewayEvents, ...storedEvents])
           .map(normalizeTimelineEventSegmentType)
           .map(normalizeTimelineEventMessageSeq)
       )
-    );
+    ));
     traceOpenClawDuplicate(input.logger, "hub.events.list", {
       sessionId,
       gatewayCount: gatewayEvents.length,
@@ -991,22 +990,13 @@ export function createHub53AIBridge(input: HubBridgeInput) {
       });
       await input.callbacks.onSessionStatus(session.id, "running");
 
-      if (input.config.sendThinkingMessage) {
-        await recordBridgeThinkingEvent(session.id, DEFAULT_THINKING_MESSAGE);
-        await sendReply({
-          reqId: message.reqId,
-          text: DEFAULT_THINKING_MESSAGE,
-          status: "thinking",
-          sessionId
-        });
-      }
-
       const eventScope: GatewayEventScope = {
         eventBoundaryMs: Date.now(),
         turnId: buildOpenClawTimelineTurnId(session.id, message.reqId),
         nextSegmentIndex: 0,
         nextDeltaIndexBySegment: new Map<string, number>(),
         segmentIndexById: new Map<string, number>(),
+        timelineMetaByEventKey: new Map<string, OpenClawTimelineV2Meta>(),
         currentActivitySeen: false,
         emittedOutputFileKeys: new Set<string>(),
         referencedLocalOutputPaths: new Set<string>(),
@@ -1127,9 +1117,12 @@ export function createHub53AIBridge(input: HubBridgeInput) {
   type GatewayEventScope = {
     eventBoundaryMs: number;
     turnId: string;
+    currentTurnId?: string;
+    currentRunId?: string;
     nextSegmentIndex: number;
     nextDeltaIndexBySegment: Map<string, number>;
     segmentIndexById: Map<string, number>;
+    timelineMetaByEventKey: Map<string, OpenClawTimelineV2Meta>;
     currentActivitySeen: boolean;
     emittedOutputFileKeys: Set<string>;
     localOutputSnapshot?: LocalOutputFileSnapshot;
@@ -1166,6 +1159,9 @@ export function createHub53AIBridge(input: HubBridgeInput) {
     });
     if (isCurrentRunActivityEvent(event)) {
       eventScope.currentActivitySeen = true;
+    }
+    if (shouldAttachOpenClawTimeline(event)) {
+      buildOpenClawTimelineMeta(event, eventScope);
     }
     for (const path of extractReferencedLocalOutputPaths(event.payload, eventScope.localOutputSnapshot, {
       config: input.config,
@@ -1265,7 +1261,9 @@ export function createHub53AIBridge(input: HubBridgeInput) {
         reqId: message.reqId,
         text: "",
         status: "done",
-        sessionId
+        sessionId,
+        eventKind: event.kind,
+        payload: augmentPayloadWithEventMeta(event, eventScope)
       });
       lastReplyByReq.delete(message.reqId);
       resolveTerminalEvent(message.reqId);
@@ -1282,7 +1280,9 @@ export function createHub53AIBridge(input: HubBridgeInput) {
         error: {
           code: inferErrorCode(errorText),
           message: errorText
-        }
+        },
+        eventKind: event.kind,
+        payload: augmentPayloadWithEventMeta(event, eventScope)
       });
       lastReplyByReq.delete(message.reqId);
       resolveTerminalEvent(message.reqId);
@@ -1316,28 +1316,6 @@ export function createHub53AIBridge(input: HubBridgeInput) {
     }
     const payload = toRecord(event.payload);
     return event.kind === "status.update" && String(payload.phase ?? payload.status ?? "") === "running";
-  }
-
-  async function recordBridgeThinkingEvent(sessionId: string, content: string) {
-    const normalized = content.trim();
-    if (!normalized || !input.callbacks.onBridgeThinkingEvent) {
-      return;
-    }
-
-    bridgeEventCounter = (bridgeEventCounter + 1) % 1000;
-    const createdAt = new Date().toISOString();
-    const seq = -8_000_000_000_000_000 + Date.now() * 1000 + bridgeEventCounter;
-    await input.callbacks.onBridgeThinkingEvent({
-      id: `${sessionId}:hub-thinking:${Math.abs(seq)}`,
-      sessionId,
-      seq,
-      kind: "assistant.thinking",
-      payload: {
-        content: normalized,
-        source: "hub53ai"
-      },
-      createdAt
-    });
   }
 
   function isReplyReplaceEvent(event: TimelineEvent): boolean {
@@ -1493,9 +1471,21 @@ export function createHub53AIBridge(input: HubBridgeInput) {
 
   function augmentPayloadWithEventMeta(event: GatewayEvent, eventScope: GatewayEventScope) {
     const timeline = buildOpenClawTimelineMeta(event, eventScope);
-    return {
-      ...(event.payload || {}),
-      ...(typeof event.seq === "number" ? { seq: event.seq, message_seq: event.seq } : {}),
+    const payload = toRecord(event.payload);
+    const runIdentity = identityStringOr(
+      payload.runId,
+      payload.run_id,
+      payload.responseId,
+      payload.response_id,
+      eventScope.currentRunId
+    );
+    const payloadWithMeta = {
+      ...payload,
+      event_id: event.id,
+      event_kind: event.kind,
+      event_created_at: event.createdAt,
+      ...(typeof event.seq === "number" ? { seq: event.seq, message_seq: payload.message_seq ?? event.seq } : {}),
+      ...(runIdentity ? { runId: payload.runId ?? runIdentity, run_id: payload.run_id ?? runIdentity } : {}),
       turn_id: timeline.turn_id,
       segment_id: timeline.segment_id,
       segment_type: timeline.segment_type,
@@ -1506,28 +1496,151 @@ export function createHub53AIBridge(input: HubBridgeInput) {
       final: timeline.final,
       openclaw_timeline: timeline
     };
+    return attachOpenClawTimelineToPayload(event, payloadWithMeta, timeline);
   }
 
   function buildOpenClawTimelineTurnId(sessionId: string, reqId: string) {
     return `${sessionId || "openclaw"}:turn:${reqId || randomUUID()}`;
   }
 
+  function normalizeTimelineEventsWithProtocol(sessionId: string, events: TimelineEvent[]): TimelineEvent[] {
+    const eventScope: GatewayEventScope = {
+      eventBoundaryMs: 0,
+      turnId: buildOpenClawTimelineTurnId(sessionId, "events"),
+      nextSegmentIndex: 0,
+      nextDeltaIndexBySegment: new Map<string, number>(),
+      segmentIndexById: new Map<string, number>(),
+      timelineMetaByEventKey: new Map<string, OpenClawTimelineV2Meta>(),
+      currentActivitySeen: false,
+      emittedOutputFileKeys: new Set<string>(),
+      referencedLocalOutputPaths: new Set<string>()
+    };
+    return events.map((event) => {
+      if (!shouldAttachOpenClawTimeline(event)) {
+        return event;
+      }
+      return {
+        ...event,
+        payload: augmentPayloadWithEventMeta(event, eventScope)
+      };
+    });
+  }
+
+  function shouldAttachOpenClawTimeline(event: TimelineEvent): boolean {
+    return Boolean(getExpectedOpenClawSegmentType(event));
+  }
+
+  function readOpenClawTimelineFromEvent(event: TimelineEvent): Record<string, unknown> {
+    const payload = toRecord(event.payload);
+    const direct = toRecord(payload.openclaw_timeline);
+    if (Object.keys(direct).length > 0) {
+      return direct;
+    }
+    const processStep = toRecord(payload.process_step);
+    const processData = toRecord(processStep.data);
+    return toRecord(processData.openclaw_timeline);
+  }
+
+  function attachOpenClawTimelineToPayload(
+    event: TimelineEvent,
+    payload: Record<string, unknown>,
+    timeline: OpenClawTimelineV2Meta
+  ): Record<string, unknown> {
+    if (event.kind !== "process.step" || timeline.segment_type !== "output_files") {
+      return payload;
+    }
+
+    const processStep = toRecord(payload.process_step);
+    if (Object.keys(processStep).length === 0) {
+      return payload;
+    }
+    const processData = toRecord(processStep.data);
+    return {
+      ...payload,
+      process_step: {
+        ...processStep,
+        data: {
+          ...processData,
+          openclaw_timeline: timeline
+        }
+      }
+    };
+  }
+
+  function getTimelineEventCacheKey(event: TimelineEvent): string {
+    return event.id || `${event.sessionId}:${event.seq}:${event.kind}`;
+  }
+
+  function resolveOpenClawTimelineTurnId(
+    event: TimelineEvent,
+    eventScope: GatewayEventScope,
+    payloadTimeline: Record<string, unknown>
+  ): string {
+    const payload = toRecord(event.payload);
+    const runIdentity = identityStringOr(
+      payload.runId,
+      payload.run_id,
+      payload.responseId,
+      payload.response_id
+    );
+    const explicitTurnId = stringOr(payloadTimeline.turn_id, payload.turn_id);
+    if (explicitTurnId) {
+      if (runIdentity) {
+        eventScope.currentRunId = runIdentity;
+      }
+      eventScope.currentTurnId = explicitTurnId;
+      return explicitTurnId;
+    }
+
+    if (runIdentity) {
+      eventScope.currentRunId = runIdentity;
+      const turnId = buildOpenClawTimelineTurnId(event.sessionId || "", runIdentity);
+      eventScope.currentTurnId = turnId;
+      return turnId;
+    }
+
+    if (eventScope.currentTurnId) {
+      return eventScope.currentTurnId;
+    }
+
+    const historyIdentity = identityStringOr(
+      payload.messageSeq,
+      payload.message_seq,
+      payload.rawSeq,
+      payload.raw_seq,
+      readHistoryMessageSeq(event)
+    );
+    const turnId = historyIdentity
+      ? buildOpenClawTimelineTurnId(event.sessionId || "", historyIdentity)
+      : eventScope.currentTurnId || eventScope.turnId;
+    eventScope.currentTurnId = turnId;
+    return turnId;
+  }
+
   function buildOpenClawTimelineMeta(
     event: GatewayEvent,
     eventScope: GatewayEventScope
   ): OpenClawTimelineV2Meta {
-    const payloadTimeline = toRecord(toRecord(event.payload).openclaw_timeline);
-    const payloadSegmentId = stringOr(payloadTimeline.segment_id, toRecord(event.payload).segment_id);
-    const payloadSegmentType = stringOr(payloadTimeline.segment_type, toRecord(event.payload).segment_type);
-    const segmentType = normalizeOpenClawSegmentType(payloadSegmentType) || getDefaultOpenClawSegmentType(event.kind);
-    const segmentId = payloadSegmentId || getDefaultOpenClawSegmentId(event, eventScope.turnId, segmentType);
+    const cacheKey = getTimelineEventCacheKey(event);
+    const cached = eventScope.timelineMetaByEventKey.get(cacheKey);
+    if (cached) {
+      return cached;
+    }
+
+    const payload = toRecord(event.payload);
+    const payloadTimeline = readOpenClawTimelineFromEvent(event);
+    const turnId = resolveOpenClawTimelineTurnId(event, eventScope, payloadTimeline);
+    const payloadSegmentId = stringOr(payloadTimeline.segment_id, payload.segment_id);
+    const payloadSegmentType = stringOr(payloadTimeline.segment_type, payload.segment_type);
+    const segmentType = normalizeOpenClawSegmentType(payloadSegmentType) || getDefaultOpenClawSegmentType(event);
+    const segmentId = payloadSegmentId || getDefaultOpenClawSegmentId(event, turnId, segmentType);
     const segmentIndex = getOpenClawSegmentIndex(segmentId, eventScope);
     const deltaIndex = getNextOpenClawDeltaIndex(segmentId, eventScope);
-    const operation = getDefaultOpenClawOperation(event.kind);
-    const visibility = getDefaultOpenClawVisibility(event.kind);
-    return {
+    const operation = getDefaultOpenClawOperation(event);
+    const visibility = getDefaultOpenClawVisibility(event);
+    const timeline: OpenClawTimelineV2Meta = {
       protocol_version: "openclaw.timeline.v2",
-      turn_id: stringOr(payloadTimeline.turn_id, toRecord(event.payload).turn_id, eventScope.turnId),
+      turn_id: turnId,
       segment_id: segmentId,
       segment_type: segmentType,
       segment_index: segmentIndex,
@@ -1536,6 +1649,8 @@ export function createHub53AIBridge(input: HubBridgeInput) {
       visibility,
       final: visibility === "final"
     };
+    eventScope.timelineMetaByEventKey.set(cacheKey, timeline);
+    return timeline;
   }
 
   function buildOpenClawOutputFilesTimelineMeta(
@@ -1547,10 +1662,11 @@ export function createHub53AIBridge(input: HubBridgeInput) {
       .filter(Boolean)
       .sort()
       .join(",");
-    const segmentId = `${eventScope.turnId}:output_files:${fileKey || "generated"}`;
+    const turnId = eventScope.currentTurnId || eventScope.turnId;
+    const segmentId = `${turnId}:output_files:${fileKey || "generated"}`;
     return {
       protocol_version: "openclaw.timeline.v2",
-      turn_id: eventScope.turnId,
+      turn_id: turnId,
       segment_id: segmentId,
       segment_type: "output_files",
       segment_index: getOpenClawSegmentIndex(segmentId, eventScope),
@@ -1575,23 +1691,34 @@ export function createHub53AIBridge(input: HubBridgeInput) {
     return undefined;
   }
 
-  function getExpectedOpenClawSegmentType(kind: string): OpenClawTimelineV2SegmentType | undefined {
+  function getExpectedOpenClawSegmentType(event: TimelineEvent): OpenClawTimelineV2SegmentType | undefined {
+    const kind = event.kind;
     if (kind === "assistant.delta" || kind === "assistant.message") return "answer";
     if (kind === "assistant.thinking") return "thinking";
     if (kind === "tool.call") return "tool_call";
     if (kind === "tool.result") return "tool_result";
-    if (kind === "run.completed" || kind === "run.failed" || kind === "run.interrupted") return "run";
+    if (kind === "run.started" || kind === "run.completed" || kind === "run.failed" || kind === "run.interrupted") return "run";
+    if (kind === "process.step" && isOutputFilesProcessStepEvent(event)) return "output_files";
     return undefined;
   }
 
+  function isOutputFilesProcessStepEvent(event: TimelineEvent): boolean {
+    if (event.kind !== "process.step") {
+      return false;
+    }
+    const payload = toRecord(event.payload);
+    const processStep = toRecord(payload.process_step);
+    return processStep.step_code === "output_files" && processStep.status === "completed";
+  }
+
   function normalizeTimelineEventSegmentType(event: TimelineEvent): TimelineEvent {
-    const expectedSegmentType = getExpectedOpenClawSegmentType(event.kind);
+    const expectedSegmentType = getExpectedOpenClawSegmentType(event);
     if (!expectedSegmentType) {
       return event;
     }
 
     const payload = toRecord(event.payload);
-    const timeline = toRecord(payload.openclaw_timeline);
+    const timeline = readOpenClawTimelineFromEvent(event);
     const currentSegmentType = normalizeOpenClawSegmentType(stringOr(timeline.segment_type, payload.segment_type));
     if (currentSegmentType === expectedSegmentType) {
       return event;
@@ -1684,11 +1811,13 @@ export function createHub53AIBridge(input: HubBridgeInput) {
     });
   }
 
-  function getDefaultOpenClawSegmentType(kind: string): OpenClawTimelineV2SegmentType {
+  function getDefaultOpenClawSegmentType(event: TimelineEvent): OpenClawTimelineV2SegmentType {
+    const kind = event.kind;
     if (kind === "assistant.delta" || kind === "assistant.message") return "answer";
     if (kind === "assistant.thinking") return "thinking";
     if (kind === "tool.call") return "tool_call";
     if (kind === "tool.result") return "tool_result";
+    if (kind === "process.step" && isOutputFilesProcessStepEvent(event)) return "output_files";
     return "run";
   }
 
@@ -1699,6 +1828,14 @@ export function createHub53AIBridge(input: HubBridgeInput) {
   ) {
     if (segmentType === "answer") {
       return `${turnId}:answer:0`;
+    }
+    if (segmentType === "output_files") {
+      const fileKey = extractOutputFilesFromPayload(event.payload)
+        .flatMap((file) => getOutputFileKeys(file))
+        .filter(Boolean)
+        .sort()
+        .join(",");
+      return `${turnId}:output_files:${fileKey || event.seq || event.id || "generated"}`;
     }
     if (segmentType === "tool_call" || segmentType === "tool_result") {
       const payload = toRecord(event.payload);
@@ -1734,14 +1871,16 @@ export function createHub53AIBridge(input: HubBridgeInput) {
     return `${turnId}:${segmentType}:${event.seq ?? event.id ?? randomUUID()}`;
   }
 
-  function getDefaultOpenClawOperation(kind: string): OpenClawTimelineV2Operation {
-    if (kind === "assistant.delta") return "append";
-    if (kind === "run.completed" || kind === "run.failed" || kind === "run.interrupted") return "close";
+  function getDefaultOpenClawOperation(event: GatewayEvent): OpenClawTimelineV2Operation {
+    if (event.kind === "assistant.delta") {
+      return isReplyReplaceEvent(event) ? "replace" : "append";
+    }
+    if (event.kind === "run.completed" || event.kind === "run.failed" || event.kind === "run.interrupted") return "close";
     return "replace";
   }
 
-  function getDefaultOpenClawVisibility(kind: string): OpenClawTimelineV2Visibility {
-    if (kind === "assistant.delta") return "hidden";
+  function getDefaultOpenClawVisibility(event: GatewayEvent): OpenClawTimelineV2Visibility {
+    if (event.kind === "assistant.delta") return "stream";
     return "final";
   }
 
@@ -1769,7 +1908,11 @@ export function createHub53AIBridge(input: HubBridgeInput) {
     eventScope: GatewayEventScope
   ) {
     const files = extractOutputFilesFromPayload(event.payload);
-    await sendOutputFiles(reqId, sessionId, files, eventScope);
+    const timeline =
+      getExpectedOpenClawSegmentType(event) === "output_files"
+        ? buildOpenClawTimelineMeta(event, eventScope)
+        : undefined;
+    await sendOutputFiles(reqId, sessionId, files, eventScope, timeline);
   }
 
   async function sendCreatedLocalOutputFiles(
@@ -1825,18 +1968,19 @@ export function createHub53AIBridge(input: HubBridgeInput) {
     reqId: string,
     sessionId: string,
     files: Hub53AIOutputFile[],
-    eventScope: GatewayEventScope
+    eventScope: GatewayEventScope,
+    timeline?: OpenClawTimelineV2Meta
   ): Promise<boolean> {
     if (files.length === 0) {
       return false;
     }
 
     const freshFiles = files.filter((file) => {
-      const keys = getOutputFileKeys(file);
-      if (keys.some((key) => eventScope.emittedOutputFileKeys.has(key))) {
+      const key = getOutputFileEmissionKey(file);
+      if (key && eventScope.emittedOutputFileKeys.has(key)) {
         return false;
       }
-      for (const key of keys) {
+      if (key) {
         eventScope.emittedOutputFileKeys.add(key);
       }
       return true;
@@ -1850,7 +1994,7 @@ export function createHub53AIBridge(input: HubBridgeInput) {
         reqId,
         freshFiles,
         sessionId,
-        buildOpenClawOutputFilesTimelineMeta(eventScope, freshFiles)
+        timeline ?? buildOpenClawOutputFilesTimelineMeta(eventScope, freshFiles)
       )
     );
     return true;
@@ -1994,7 +2138,12 @@ function summarizeOutgoingFrameForTrace(frame: Hub53AIOutgoingFrame): Record<str
     const delta = toRecord(choice.delta);
     const payload = toRecord(data.payload);
     const timeline = toRecord(payload.openclaw_timeline);
-    const content = typeof delta.content === "string" ? delta.content : "";
+    const content =
+      typeof delta.content === "string"
+        ? delta.content
+        : typeof delta.reasoning_content === "string"
+          ? delta.reasoning_content
+          : "";
     return {
       reqId: frame.req_id,
       status: frame.status,
@@ -2419,6 +2568,16 @@ function buildOutgoingChunk(
     payload?: Record<string, unknown>;
   }
 ): Hub53AIOutgoingChunk {
+  const delta =
+    status === "thinking"
+      ? {
+          reasoning_content: text,
+          role: "assistant" as const
+        }
+      : {
+          content: text,
+          role: "assistant" as const
+        };
   return {
     req_id: reqId,
     action: "chat",
@@ -2437,10 +2596,7 @@ function buildOutgoingChunk(
       choices: [
         {
           index: 0,
-          delta: {
-            content: text,
-            role: "assistant"
-          },
+          delta,
           finish_reason: status === "done" ? "stop" : status === "error" ? "error" : null
         }
       ],
@@ -2536,7 +2692,9 @@ function collectOutputFileCandidates(value: unknown, depth = 0): unknown[] {
     "media",
     "media_attachments",
     "generated_files",
-    "generatedFiles"
+    "generatedFiles",
+    "process_step",
+    "processStep"
   ]) {
     const nested = record[key];
     if (nested == null) {
@@ -2549,7 +2707,7 @@ function collectOutputFileCandidates(value: unknown, depth = 0): unknown[] {
     }
   }
 
-  for (const key of ["data", "result", "payload", "message", "content", "output"]) {
+  for (const key of ["data", "result", "payload", "message", "content", "output", "process_step", "processStep"]) {
     candidates.push(...collectOutputFileCandidates(record[key], depth + 1));
   }
 
@@ -2605,11 +2763,47 @@ function normalizeOutputFile(value: unknown): Hub53AIOutputFile | null {
 }
 
 function getOutputFileKeys(file: Hub53AIOutputFile): string[] {
+  const address = file.signed_download_url || file.download_url || file.url || "";
+  const contentFingerprint = getOutputFileContentFingerprint(file);
   return [
     file.id ? `id:${file.id}` : "",
-    file.url || file.file_name ? `url-name:${file.url ?? ""}|${file.file_name}` : "",
+    contentFingerprint ? `content:${file.file_name}:${contentFingerprint}` : "",
+    address || file.file_name ? `url-name:${address}|${file.file_name}` : "",
     file.file_name ? `name:${file.file_name}` : ""
   ].filter(Boolean);
+}
+
+function getOutputFileEmissionKey(file: Hub53AIOutputFile): string {
+  const fields = [
+    ["id", file.id || ""],
+    ["name", file.file_name || ""],
+    ["url", file.url || ""],
+    ["download", file.download_url || ""],
+    ["signed", file.signed_download_url || ""],
+    ["mime", file.mime_type || ""],
+    ["size", typeof file.size === "number" ? String(file.size) : ""],
+    ["content", getOutputFileContentFingerprint(file)],
+    ["message", file.message_id || ""],
+    ["source", file.source_kind || ""]
+  ];
+  const hasIdentity = fields.some(([, value]) => value);
+  if (!hasIdentity) {
+    return "";
+  }
+  const parts = fields.map(([name, value]) => `${name}:${value}`);
+  return `snapshot:${createHash("sha256").update(parts.join("\0")).digest("hex").slice(0, 24)}`;
+}
+
+function getOutputFileContentFingerprint(file: Hub53AIOutputFile): string {
+  const base64 = typeof file.base64 === "string" ? file.base64 : "";
+  if (base64) {
+    return createHash("sha256").update("base64\0").update(base64).digest("hex").slice(0, 24);
+  }
+  const content = typeof file.content === "string" ? file.content : "";
+  if (content) {
+    return createHash("sha256").update("content\0").update(content).digest("hex").slice(0, 24);
+  }
+  return "";
 }
 
 function readFirstString(record: Record<string, unknown>, keys: string[]): string {

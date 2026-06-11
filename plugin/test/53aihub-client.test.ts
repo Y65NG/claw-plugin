@@ -290,7 +290,7 @@ describe("53AIHub client", () => {
           (frame) =>
             frame.action === "chat" &&
             frame.status === "thinking" &&
-            frame.data.choices[0]?.delta.content === "正在思考"
+            frame.data.choices[0]?.delta.reasoning_content === "正在思考"
         );
         const toolCall = server.frames.find(
           (frame) =>
@@ -309,8 +309,8 @@ describe("53AIHub client", () => {
               openclaw_timeline: {
                 protocol_version: "openclaw.timeline.v2",
                 segment_type: "answer",
-                operation: "append",
-                visibility: "hidden",
+                operation: "replace",
+                visibility: "stream",
                 final: false
               }
             }
@@ -366,6 +366,231 @@ describe("53AIHub client", () => {
         expect(thinking?.data.payload.openclaw_timeline.turn_id).toBe(
           toolCall?.data.payload.openclaw_timeline.turn_id
         );
+        const done = server.frames.find(
+          (frame) =>
+            frame.action === "chat" &&
+            frame.status === "done" &&
+            frame.data.event_kind === "run.completed"
+        );
+        expect(done).toMatchObject({
+          data: {
+            event_kind: "run.completed",
+            payload: {
+              event_id: "evt-done",
+              event_kind: "run.completed",
+              openclaw_timeline: {
+                protocol_version: "openclaw.timeline.v2",
+                segment_type: "run",
+                operation: "close",
+                visibility: "final",
+                final: true
+              }
+            }
+          }
+        });
+      });
+    } finally {
+      await bridge.stop();
+    }
+  });
+
+  it("returns the same OpenClaw timeline contract from realtime stream and sessions.events", async () => {
+    const stateDir = await mkdtemp(join(tmpdir(), "claw-53aihub-contract-"));
+    cleanupPaths.push(stateDir);
+    const server = await createFakeHubServer();
+    cleanupServers.push(server.close);
+    const gateway = new FakeGateway();
+    const createdAt = "2026-06-09T13:24:16.000Z";
+    const events: GatewayEvent[] = [
+      {
+        id: "evt-run-start",
+        sessionId: "session-1",
+        seq: 1,
+        kind: "run.started",
+        payload: { runId: "run-doc-15", phase: "start" },
+        createdAt
+      },
+      {
+        id: "evt-thinking",
+        sessionId: "session-1",
+        seq: 2,
+        kind: "assistant.thinking",
+          payload: {
+            content: "Need create a short file and report the path.",
+            rawSeq: 21,
+            state: "final",
+            mode: "replace",
+            replace: true
+        },
+        createdAt
+      },
+      {
+        id: "evt-tool-call",
+        sessionId: "session-1",
+        seq: 3,
+        kind: "tool.call",
+        payload: {
+          runId: "run-doc-15",
+          data: {
+            name: "exec",
+            toolCallId: "tool-write-doc",
+            args: { command: "printf 这是十五字文档 > /tmp/十五字文档.txt" }
+          }
+        },
+        createdAt
+      },
+      {
+        id: "evt-answer",
+        sessionId: "session-1",
+        seq: 4,
+        kind: "assistant.message",
+          payload: {
+            content: "已创建一个15字的文档：/tmp/十五字文档.txt",
+            rawSeq: 26,
+            state: "final",
+            mode: "replace",
+            replace: true
+        },
+        createdAt
+      },
+      {
+        id: "evt-files",
+        sessionId: "session-1",
+        seq: 5,
+        kind: "process.step",
+        payload: {
+          runId: "run-doc-15",
+          object: "process.step",
+          process_step: {
+            step_code: "output_files",
+            name: "生成文件",
+            status: "completed",
+            message: "生成了 1 个文件",
+            data: {
+              files: [
+                {
+                  id: "file-doc-15",
+                  file_name: "十五字文档.txt",
+                  url: "file:///tmp/十五字文档.txt",
+                  mime_type: "text/plain"
+                }
+              ],
+              contract_version: "v1"
+            },
+            timestamp: 1_780_000_000
+          }
+        },
+        createdAt
+      },
+      {
+        id: "evt-done",
+        sessionId: "session-1",
+        seq: 6,
+        kind: "run.completed",
+        payload: { runId: "run-doc-15", phase: "end", status: "completed" },
+        createdAt
+      }
+    ];
+    gateway.eventsToEmit = events;
+    gateway.eventsBySession.set("session-1", events);
+
+    const bridge = createHub53AIBridge({
+      stateDir,
+      config: {
+        enabled: true,
+        botId: "bot-123",
+        secret: "sk-secret",
+        wsUrl: server.url,
+        accessPolicy: "open",
+        allowFrom: [],
+        sendThinkingMessage: true,
+        reconnectBaseMs: 20,
+        maxReconnectAttempts: 2
+      },
+      gateway,
+      callbacks: {
+        onSessionUpsert: async (session) => {
+          gateway.upsertSession(session);
+        },
+        onUserMessage: async () => undefined,
+        onSessionStatus: async () => undefined,
+        onEnsureSessionStream: async () => undefined,
+        listSessionEvents: () => [],
+        getLastEventSeq: () => 0,
+        onStatusChange: () => undefined
+      }
+    });
+
+    const readTimeline = (frameOrEvent: any) =>
+      frameOrEvent?.data?.payload?.openclaw_timeline ??
+      frameOrEvent?.data?.process_step?.data?.openclaw_timeline ??
+      frameOrEvent?.payload?.openclaw_timeline ??
+      frameOrEvent?.payload?.process_step?.data?.openclaw_timeline;
+    const contractOf = (value: any) => {
+      const timeline = readTimeline(value);
+      return timeline
+        ? {
+            turn_id: timeline.turn_id,
+            segment_id: timeline.segment_id,
+            segment_type: timeline.segment_type,
+            operation: timeline.operation,
+            visibility: timeline.visibility,
+            final: timeline.final
+          }
+        : null;
+    };
+
+    await bridge.start();
+    try {
+      const connection = await server.connected;
+      connection.socket.send(
+        JSON.stringify({
+          req_id: "req-contract",
+          action: "chat",
+          data: {
+            user: "user-123",
+            conversation_id: "chat-contract",
+            messages: [{ role: "user", content: "给我一个15字的文档" }]
+          }
+        })
+      );
+
+      await waitFor(() => {
+        expect(server.frames.some((frame: any) => frame.action === "chat" && frame.status === "done")).toBe(true);
+      });
+
+      connection.socket.send(
+        JSON.stringify({
+          req_id: "rpc-contract-events",
+          action: "sessions.events",
+          status: "request",
+          data: { session_id: "session-1", limit: 20, offset: 0 }
+        })
+      );
+
+      await waitFor(() => {
+        const rpcFrame = frameByReq(server.frames, "rpc-contract-events");
+        expect(rpcFrame).toMatchObject({ action: "sessions.events", status: "done" });
+
+        const streamByKind = new Map<string, any>();
+        for (const frame of server.frames as any[]) {
+          if (frame.action !== "chat") continue;
+          const kind = frame.data?.event_kind || (frame.data?.object === "process.step" ? "process.step" : "");
+          if (!kind || streamByKind.has(kind)) continue;
+          streamByKind.set(kind, frame);
+        }
+        const eventsByKind = new Map<string, any>(rpcFrame.data.events.map((event: any) => [event.kind, event]));
+
+        for (const kind of ["assistant.thinking", "tool.call", "assistant.message", "process.step", "run.completed"]) {
+          expect(contractOf(streamByKind.get(kind))).toEqual(contractOf(eventsByKind.get(kind)));
+        }
+        expect(contractOf(streamByKind.get("assistant.message"))?.segment_type).toBe("answer");
+        expect(contractOf(streamByKind.get("assistant.thinking"))?.segment_type).toBe("thinking");
+        expect(contractOf(streamByKind.get("process.step"))?.segment_type).toBe("output_files");
+        expect(streamByKind.get("assistant.thinking")?.data?.payload?.runId).toBe("run-doc-15");
+        expect(streamByKind.get("assistant.message")?.data?.payload?.runId).toBe("run-doc-15");
+        expect(eventsByKind.get("assistant.thinking")?.payload?.runId).toBe("run-doc-15");
+        expect(eventsByKind.get("assistant.message")?.payload?.runId).toBe("run-doc-15");
       });
     } finally {
       await bridge.stop();
@@ -763,6 +988,133 @@ describe("53AIHub client", () => {
             }
           }
         });
+      });
+    } finally {
+      await bridge.stop();
+    }
+  });
+
+  it("emits same-name output_file revisions when the file snapshot changes", async () => {
+    const stateDir = await mkdtemp(join(tmpdir(), "claw-53aihub-"));
+    cleanupPaths.push(stateDir);
+    const server = await createFakeHubServer();
+    cleanupServers.push(server.close);
+    const gateway = new FakeGateway();
+    gateway.eventsToEmit = [
+      {
+        id: "evt-draft-file",
+        sessionId: "session-1",
+        seq: 1,
+        kind: "tool.result",
+        payload: {
+          data: {
+            name: "write_file",
+            output_files: [
+              {
+                id: "local-draft",
+                file_name: "report.txt",
+                mime_type: "text/plain",
+                size: 5,
+                base64: Buffer.from("wrong").toString("base64")
+              }
+            ]
+          }
+        },
+        createdAt: new Date().toISOString()
+      },
+      {
+        id: "evt-final-file",
+        sessionId: "session-1",
+        seq: 2,
+        kind: "tool.result",
+        payload: {
+          data: {
+            name: "write_file",
+            output_files: [
+              {
+                id: "local-final",
+                file_name: "report.txt",
+                mime_type: "text/plain",
+                size: 7,
+                base64: Buffer.from("correct").toString("base64")
+              }
+            ]
+          }
+        },
+        createdAt: new Date().toISOString()
+      },
+      {
+        id: "evt-completed",
+        sessionId: "session-1",
+        seq: 3,
+        kind: "run.completed",
+        payload: { ok: true },
+        createdAt: new Date().toISOString()
+      }
+    ];
+
+    const bridge = createHub53AIBridge({
+      stateDir,
+      config: {
+        enabled: true,
+        botId: "bot-123",
+        secret: "sk-secret",
+        wsUrl: server.url,
+        accessPolicy: "open",
+        allowFrom: [],
+        sendThinkingMessage: false,
+        reconnectBaseMs: 20,
+        maxReconnectAttempts: 2
+      },
+      gateway,
+      callbacks: {
+        onSessionUpsert: async (session) => {
+          gateway.upsertSession(session);
+        },
+        onUserMessage: async () => undefined,
+        onSessionStatus: async () => undefined,
+        onEnsureSessionStream: async () => undefined,
+        getLastEventSeq: () => 0,
+        onStatusChange: () => undefined
+      }
+    });
+
+    await bridge.start();
+    try {
+      const connection = await server.connected;
+      connection.socket.send(
+        JSON.stringify({
+          req_id: "req-output-file-revisions",
+          action: "chat",
+          data: {
+            user: "user-a",
+            conversation_id: "chat-file-revisions",
+            messages: [{ role: "user", content: "生成并修正同名文件" }]
+          }
+        })
+      );
+
+      await waitFor(() => {
+        const outputSteps = server.frames.filter(
+          (frame) =>
+            frame.req_id === "req-output-file-revisions" &&
+            frame.action === "chat" &&
+            frame.data?.object === "process.step" &&
+            frame.data.process_step?.step_code === "output_files"
+        );
+        expect(outputSteps).toHaveLength(2);
+        expect(outputSteps.map((frame) => frame.data.process_step.data.files[0].id)).toEqual([
+          "local-draft",
+          "local-final"
+        ]);
+        expect(outputSteps.map((frame) => frame.data.process_step.data.files[0].base64)).toEqual([
+          Buffer.from("wrong").toString("base64"),
+          Buffer.from("correct").toString("base64")
+        ]);
+        const segmentIds = outputSteps.map(
+          (frame) => frame.data.process_step.data.openclaw_timeline?.segment_id
+        );
+        expect(new Set(segmentIds).size).toBe(2);
       });
     } finally {
       await bridge.stop();
@@ -1489,17 +1841,19 @@ describe("53AIHub client", () => {
 
       await waitFor(() => {
         const chatFrames = server.frames.filter((frame) => frame.action === "chat");
+        const readThinkingDelta = (frame: any) =>
+          frame.data.choices[0]?.delta.reasoning_content ?? frame.data.choices[0]?.delta.content;
         expect(chatFrames.some((frame) => frame.status === "thinking")).toBe(true);
         expect(
           chatFrames.some(
             (frame) =>
               frame.status === "thinking" &&
-              frame.data.choices[0]?.delta.content === "Thinking through the request"
+              readThinkingDelta(frame) === "Thinking through the request"
           )
         ).toBe(true);
         const thinkingText = chatFrames
           .filter((frame) => frame.status === "thinking")
-          .map((frame) => frame.data.choices[0]?.delta.content)
+          .map(readThinkingDelta)
           .join("\n");
         expect(thinkingText).not.toContain("running");
         expect(thinkingText).not.toContain("done");

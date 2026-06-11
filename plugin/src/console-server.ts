@@ -813,7 +813,13 @@ function isTerminalEvent(kind: string): boolean {
   return kind === "run.completed" || kind === "run.failed" || kind === "run.interrupted";
 }
 
-function deriveDerivedAssistantMessage(
+function readEventRunId(event?: TimelineEvent): string {
+  const payload = event?.payload;
+  const value = payload?.runId ?? payload?.run_id;
+  return typeof value === "string" && value.trim() ? value : "";
+}
+
+export function deriveDerivedAssistantMessage(
   messages: SessionMessage[],
   events: TimelineEvent[],
   status: SessionStatus,
@@ -827,12 +833,29 @@ function deriveDerivedAssistantMessage(
   if (!lastTerminalEvent) {
     return null;
   }
+  const terminalRunId = readEventRunId(lastTerminalEvent);
+  const lastUserEvent = [...events]
+    .reverse()
+    .find((event) => event.kind === "user.message" && event.seq < lastTerminalEvent.seq);
+  const runStartEvent = terminalRunId
+    ? [...events]
+        .reverse()
+        .find(
+          (event) =>
+            event.kind === "run.started" &&
+            event.seq < lastTerminalEvent.seq &&
+            readEventRunId(event) === terminalRunId
+        )
+    : undefined;
+  const turnBoundarySeq = Math.max(lastUserEvent?.seq || 0, runStartEvent?.seq || 0);
 
   const deltaEvents = events
     .filter(
       (event) =>
         event.kind === "assistant.delta" &&
+        event.seq > turnBoundarySeq &&
         event.seq <= lastTerminalEvent.seq &&
+        (!terminalRunId || readEventRunId(event) === terminalRunId) &&
         typeof event.payload?.content === "string" &&
         String(event.payload.content).trim().length > 0
     )
