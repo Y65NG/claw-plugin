@@ -137,6 +137,7 @@ const MIN_DELTA_CHUNK_CHARS = 80;
 const SESSION_LIST_PAGE_LIMIT = 50;
 const SESSION_LIST_MAX_PAGES = 100;
 const CHAT_HISTORY_PAGE_LIMIT = 200;
+const CHAT_HISTORY_GATEWAY_MAX_LIMIT = 1000;
 const CHAT_HISTORY_MAX_PAGES = 100;
 const CRON_LIST_PAGE_LIMIT = 50;
 const CRON_LIST_MAX_PAGES = 100;
@@ -2028,13 +2029,17 @@ async function readChatHistoryPages(
   sessionId: string,
   maxItems = CHAT_HISTORY_PAGE_LIMIT * CHAT_HISTORY_MAX_PAGES
 ): Promise<unknown[]> {
-  const target = clampPositiveInteger(maxItems, CHAT_HISTORY_PAGE_LIMIT * CHAT_HISTORY_MAX_PAGES);
-  const messages: unknown[] = [];
+  const target = Math.min(
+    CHAT_HISTORY_GATEWAY_MAX_LIMIT,
+    clampPositiveInteger(maxItems, CHAT_HISTORY_PAGE_LIMIT * CHAT_HISTORY_MAX_PAGES)
+  );
+  const pages: unknown[][] = [];
   const seen = new Set<string>();
   let offset = 0;
+  let collected = 0;
 
-  for (let page = 0; page < CHAT_HISTORY_MAX_PAGES && messages.length < target; page += 1) {
-    const pageLimit = Math.min(CHAT_HISTORY_PAGE_LIMIT, target - messages.length);
+  for (let page = 0; page < CHAT_HISTORY_MAX_PAGES && collected < target; page += 1) {
+    const pageLimit = Math.min(CHAT_HISTORY_PAGE_LIMIT, target - collected);
     const fetchLimit = offset + pageLimit;
     const payload = await transport.request("chat.history", {
       sessionKey: sessionId,
@@ -2042,13 +2047,18 @@ async function readChatHistoryPages(
     });
     const fetchedMessages = readHistoryMessageArray(payload);
     const pageMessages = sliceLatestWindowPage(fetchedMessages, pageLimit, offset);
-    const before = messages.length;
+    const before = collected;
+    const uniquePageMessages: unknown[] = [];
     for (const message of pageMessages) {
       const key = messageIdentity(message);
       if (!seen.has(key)) {
         seen.add(key);
-        messages.push(message);
+        uniquePageMessages.push(message);
       }
+    }
+    if (uniquePageMessages.length > 0) {
+      pages.push(uniquePageMessages);
+      collected += uniquePageMessages.length;
     }
 
     const pagination = extractPagination(payload, {
@@ -2056,19 +2066,19 @@ async function readChatHistoryPages(
       offset,
       itemCount: pageMessages.length
     });
-    if (!pagination.hasMore || messages.length >= target) {
+    if (!pagination.hasMore || collected >= target) {
       break;
     }
     if (pageMessages.length > 0) {
       offset += pageMessages.length;
       continue;
     }
-    if (messages.length === before) {
+    if (collected === before) {
       break;
     }
   }
 
-  return messages;
+  return pages.reverse().flat();
 }
 
 function sliceLatestWindowPage<T>(items: T[], limit: number, offset: number): T[] {

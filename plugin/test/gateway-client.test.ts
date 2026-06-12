@@ -1310,7 +1310,11 @@ describe("gateway client", () => {
       secret: "shared-token"
     });
 
-    await expect(client.getSessionMessages("session-1")).resolves.toHaveLength(210);
+    const messages = await client.getSessionMessages("session-1");
+    expect(messages).toHaveLength(210);
+    expect(messages[0]?.content).toBe("assistant 0");
+    expect(messages[205]?.content).toBe("retry this old prompt");
+    expect(messages.at(-1)?.content).toBe("assistant 209");
     const events = await client.listEvents("session-1", 205);
     expect(events.map((event) => event.seq)).toEqual([207, 208, 209, 210]);
     await client.controlSession("session-1", "retry");
@@ -1318,6 +1322,78 @@ describe("gateway client", () => {
     expect(capturedHistoryParams).toContainEqual(expect.objectContaining({ sessionKey: "session-1", limit: 200 }));
     expect(capturedHistoryParams).toContainEqual(expect.objectContaining({ sessionKey: "session-1", limit: 400 }));
     expect(capturedHistoryParams.every((params) => params.offset === undefined)).toBe(true);
+    await client.stop();
+    await new Promise<void>((resolve) => wss.close(() => resolve()));
+  });
+
+  it("caps websocket chat history windows at the OpenClaw gateway limit", async () => {
+    const capturedHistoryParams: Array<Record<string, unknown>> = [];
+    const history = Array.from({ length: 1205 }, (_, index) => ({
+      role: "assistant",
+      content: `assistant ${index}`,
+      timestamp: 1779335000000 + index,
+      __openclaw: {
+        seq: index + 1
+      }
+    }));
+    const httpServer = createServer();
+    servers.add(httpServer);
+    const wss = new WebSocketServer({ noServer: true });
+
+    httpServer.on("upgrade", (request, socket, head) => {
+      wss.handleUpgrade(request, socket, head, (client) => {
+        client.send(
+          JSON.stringify({
+            type: "event",
+            event: "connect.challenge",
+            payload: { nonce: "nonce-1" }
+          })
+        );
+
+        client.on("message", (data) => {
+          const frame = JSON.parse(data.toString()) as {
+            id: string;
+            method: string;
+            params?: Record<string, unknown>;
+          };
+          if (frame.method === "connect") {
+            client.send(JSON.stringify({ type: "res", id: frame.id, ok: true, payload: { protocol: 4 } }));
+            return;
+          }
+          if (frame.method === "chat.history") {
+            capturedHistoryParams.push(frame.params ?? {});
+            const limit = Number(frame.params?.limit ?? 200);
+            const offset = Math.max(0, history.length - limit);
+            const page = history.slice(offset);
+            client.send(
+              JSON.stringify({
+                type: "res",
+                id: frame.id,
+                ok: true,
+                payload: {
+                  messages: page
+                }
+              })
+            );
+            return;
+          }
+          client.send(JSON.stringify({ type: "res", id: frame.id, ok: true, payload: { ok: true } }));
+        });
+      });
+    });
+
+    const address = await listen(httpServer);
+    const client = createGatewayClient({
+      baseUrl: address.replace("http://", "ws://"),
+      secret: "shared-token"
+    });
+
+    const messages = await client.getSessionMessages("session-1");
+    expect(messages).toHaveLength(1000);
+    expect(messages[0]?.content).toBe("assistant 205");
+    expect(messages.at(-1)?.content).toBe("assistant 1204");
+    expect(capturedHistoryParams.map((params) => Number(params.limit))).toEqual([200, 400, 600, 800, 1000]);
+    expect(capturedHistoryParams.every((params) => Number(params.limit) <= 1000)).toBe(true);
     await client.stop();
     await new Promise<void>((resolve) => wss.close(() => resolve()));
   });

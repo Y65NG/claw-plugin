@@ -1343,8 +1343,8 @@ npx wscat -c ws://127.0.0.1:4318/ws/status
 | `cron.list` | 分页读取，每页 50 条，并带分页推进保护。 | 已不再局限于 50 条；只有上游返回异常游标或极端超大页数时会停止，避免无限循环。 |
 | `sessions.list` during sync | 分页读取，每页 50 条；默认首页大小仍取 `persistence.maxSessions`。 | 左侧列表可以继续 `Load more sessions` 拉取后续远端页；本地后台同步仍只预取默认首页，避免启动时扫全量历史。 |
 | `getSession()` fallback | 分页查找，每页 50 条，最多 100 页。 | 已不再局限于前 200 条；如果上游超过 5000 条 session 或返回异常游标，仍会停止以避免无限循环。 |
-| `chat.history` for hydration | 分页读取，每页 200 条，最多 100 页。 | 刷新或首次打开长历史时会补齐多页历史；超过 20000 条或上游游标异常时仍会停止。 |
-| `retry` lookup | 使用分页后的 `chat.history` 查找最后一条 user message。 | 已不再局限于最近 50 条；实际边界与 `chat.history` 高水位保护一致。 |
+| `chat.history` for hydration | 通过累计最新窗口读取，每次最多扩大 200 条，且遵守 Gateway `limit <= 1000` 上限。 | 刷新或首次打开历史时读取最近最多 1000 条可显示消息；OpenClaw WebSocket `chat.history` 当前不提供 offset/cursor，所以不能通过该方法扫全量超长历史。 |
+| `retry` lookup | 使用有界 `chat.history` 窗口查找最后一条 user message。 | 实际边界与 Gateway `chat.history` 窗口一致；超出最近 1000 条的极旧 user message 不会作为 retry 目标。 |
 | Frontend Event List | 当前会话仅渲染最近 120 条 raw events。 | 这是 UI 展示截断，不是 API 数据丢失；`GET /api/sessions/:id/events?afterSeq=...` 仍可读取本地已保存事件。 |
 | Frontend Cron card | 状态栏只展示前 5 条 cron tasks。 | 这是状态面板摘要；完整列表仍在 `/api/status.cronTasks` 中返回。 |
 | Frontend Session List | 默认只加载第一页，用户点击 `Load more sessions` 后继续读取下一页。 | 这是 UI 懒加载策略，不是 Gateway 数据上限。 |
