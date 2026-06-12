@@ -236,6 +236,16 @@ type OpenClawTypedFinalTranscript = {
 
 type OpenClawTypedLiveTranscript = OpenClawTypedFinalTranscript;
 
+type OpenClawTypedToolCall = {
+  id: string;
+  name: string;
+  args: Record<string, unknown>;
+  command?: string;
+  meta?: string;
+  sourceEventId?: string;
+  sourceSeq?: number;
+};
+
 export type Hub53AIMediaAttachment = Hub53AIOutputFile & {
   kind: "image" | "audio" | "video" | "text" | "file";
 };
@@ -1101,6 +1111,7 @@ export function createHub53AIBridge(input: HubBridgeInput) {
       nextDeltaIndexBySegment: new Map<string, number>(),
       segmentIndexById: new Map<string, number>(),
       timelineMetaByEventKey: new Map<string, OpenClawTimelineV2Meta>(),
+      typedToolCallEnrichedKeys: new Set<string>(),
       currentActivitySeen: false,
       visibleResponseSeen: false,
       lastSeqSeen: 0,
@@ -1842,6 +1853,7 @@ export function createHub53AIBridge(input: HubBridgeInput) {
         nextDeltaIndexBySegment: new Map<string, number>(),
         segmentIndexById: new Map<string, number>(),
         timelineMetaByEventKey: new Map<string, OpenClawTimelineV2Meta>(),
+        typedToolCallEnrichedKeys: new Set<string>(),
         currentActivitySeen: false,
         visibleResponseSeen: false,
         lastSeqSeen: 0,
@@ -2121,6 +2133,7 @@ export function createHub53AIBridge(input: HubBridgeInput) {
     nextDeltaIndexBySegment: Map<string, number>;
     segmentIndexById: Map<string, number>;
     timelineMetaByEventKey: Map<string, OpenClawTimelineV2Meta>;
+    typedToolCallEnrichedKeys: Set<string>;
     currentActivitySeen: boolean;
     visibleResponseSeen: boolean;
     lastSeqSeen: number;
@@ -2307,7 +2320,28 @@ export function createHub53AIBridge(input: HubBridgeInput) {
     }
 
     if (event.kind === "tool.call" || event.kind === "tool.result") {
-      const summary = summarizeVisibleActivity(event);
+      const enrichment = await enrichToolEventFromTypedHistory(sessionId, event, eventScope);
+      if (enrichment.syntheticCallEvent && input.config.sendThinkingMessage) {
+        applyOpenClawEventScopeActivity(enrichment.syntheticCallEvent, eventScope);
+        const syntheticPayload = augmentPayloadWithEventMeta(enrichment.syntheticCallEvent, eventScope);
+        enrichment.syntheticCallEvent.payload = syntheticPayload;
+        const syntheticSummary = summarizeVisibleActivity(enrichment.syntheticCallEvent);
+        if (syntheticSummary) {
+          await sendReply({
+            reqId: message.reqId,
+            text: syntheticSummary,
+            status: "thinking",
+            sessionId,
+            mode: "replace",
+            replace: true,
+            eventKind: enrichment.syntheticCallEvent.kind,
+            payload: syntheticPayload
+          });
+        }
+      }
+
+      const visibleToolEvent = enrichment.event;
+      const summary = summarizeVisibleActivity(visibleToolEvent);
       if (summary && input.config.sendThinkingMessage) {
         await sendReply({
           reqId: message.reqId,
@@ -2316,8 +2350,8 @@ export function createHub53AIBridge(input: HubBridgeInput) {
           sessionId,
           mode: "append",
           replace: false,
-          eventKind: event.kind,
-          payload: augmentPayloadWithEventMeta(event, eventScope)
+          eventKind: visibleToolEvent.kind,
+          payload: augmentPayloadWithEventMeta(visibleToolEvent, eventScope)
         });
       }
       return;
@@ -2874,6 +2908,304 @@ export function createHub53AIBridge(input: HubBridgeInput) {
     }
 
     return Boolean(lastReplyByReq.get(reqId));
+  }
+
+  async function enrichToolEventFromTypedHistory(
+    sessionId: string,
+    event: TimelineEvent,
+    eventScope: GatewayEventScope
+  ): Promise<{ event: TimelineEvent; syntheticCallEvent?: TimelineEvent }> {
+    if (!shouldResolveTypedToolCallForEvent(event)) {
+      return { event };
+    }
+
+    const typedCall = await resolveTypedToolCallFromHistory(sessionId, event, eventScope);
+    if (!typedCall) {
+      traceOpenClawLedger(input.logger, "typed-tool", {
+        result: "miss",
+        sessionId,
+        event: summarizeTimelineEventForTrace(event)
+      }, input.config);
+      return { event };
+    }
+
+    const enrichedEvent = mergeTypedToolCallIntoEvent(event, typedCall);
+    const enrichmentKey = `${eventScope.currentTurnId || eventScope.turnId}:${typedCall.id || readToolCallIdFromPayload(event.payload) || typedCall.name}`;
+    let syntheticCallEvent: TimelineEvent | undefined;
+    if (event.kind === "tool.call") {
+      eventScope.typedToolCallEnrichedKeys.add(enrichmentKey);
+    } else if (!eventScope.typedToolCallEnrichedKeys.has(enrichmentKey)) {
+      eventScope.typedToolCallEnrichedKeys.add(enrichmentKey);
+      syntheticCallEvent = buildTypedToolCallEnrichmentEvent(sessionId, event, eventScope, typedCall);
+    }
+
+    traceOpenClawLedger(input.logger, "typed-tool", {
+      result: "enrich",
+      sessionId,
+      event: summarizeTimelineEventForTrace(event),
+      sourceEventId: typedCall.sourceEventId,
+      sourceSeq: typedCall.sourceSeq,
+      toolCallIdHash: hashTraceText(typedCall.id),
+      toolName: typedCall.name,
+      commandLength: typedCall.command?.length ?? 0,
+      commandHash: hashTraceText(typedCall.command || "")
+    }, input.config);
+    return { event: enrichedEvent, syntheticCallEvent };
+  }
+
+  function shouldResolveTypedToolCallForEvent(event: TimelineEvent): boolean {
+    if (event.kind !== "tool.call" && event.kind !== "tool.result") {
+      return false;
+    }
+    const toolName = readToolNameFromPayload(event.payload);
+    if (!isExecToolName(toolName)) {
+      return false;
+    }
+    return !readToolCommandFromPayload(event.payload);
+  }
+
+  async function resolveTypedToolCallFromHistory(
+    sessionId: string,
+    event: TimelineEvent,
+    eventScope: GatewayEventScope
+  ): Promise<OpenClawTypedToolCall | null> {
+    let events: TimelineEvent[] = [];
+    try {
+      events = await input.gateway.listEvents(sessionId, 0);
+    } catch (error) {
+      traceOpenClawLedger(input.logger, "typed-tool", {
+        result: "miss",
+        reason: "list_events_failed",
+        sessionId,
+        error: error instanceof Error ? error.message : String(error)
+      }, input.config);
+      return null;
+    }
+
+    const typedCalls = events
+      .filter((candidate) => candidate.kind === "tool.call")
+      .map(readTypedToolCallFromEvent)
+      .filter((candidate): candidate is OpenClawTypedToolCall => Boolean(candidate && candidate.command));
+    if (!typedCalls.length) {
+      return null;
+    }
+
+    const toolCallId = readToolCallIdFromPayload(event.payload);
+    if (toolCallId) {
+      const byId = typedCalls.find((candidate) => candidate.id === toolCallId);
+      if (byId) {
+        return byId;
+      }
+    }
+
+    const eventToolName = normalizeToolName(readToolNameFromPayload(event.payload));
+    const eventSeq = typeof event.seq === "number" && Number.isFinite(event.seq) ? event.seq : Number.POSITIVE_INFINITY;
+    const sameToolCalls = typedCalls
+      .filter((candidate) => normalizeToolName(candidate.name) === eventToolName)
+      .sort((left, right) => (right.sourceSeq ?? 0) - (left.sourceSeq ?? 0));
+    return sameToolCalls.find((candidate) => (candidate.sourceSeq ?? 0) <= eventSeq) ?? sameToolCalls[0] ?? null;
+  }
+
+  function readTypedToolCallFromEvent(event: TimelineEvent): OpenClawTypedToolCall | null {
+    const payload = toRecord(event.payload);
+    const data = toRecord(payload.data);
+    const name = normalizeToolName(stringOr(data.name, data.toolName, data.tool_name, payload.name, payload.toolName, "tool"));
+    const id = readToolCallIdFromPayload(payload) || `${name}:${event.seq || event.id}`;
+    const args = readToolArgsFromPayload(payload);
+    const command = readToolCommandFromPayload(payload);
+    if (!id || !name || Object.keys(args).length === 0) {
+      return null;
+    }
+    return {
+      id,
+      name,
+      args,
+      ...(command ? { command } : {}),
+      ...(stringOr(data.meta, payload.meta) ? { meta: stringOr(data.meta, payload.meta) } : {}),
+      sourceEventId: event.id,
+      sourceSeq: event.seq
+    };
+  }
+
+  function mergeTypedToolCallIntoEvent(event: TimelineEvent, typedCall: OpenClawTypedToolCall): TimelineEvent {
+    const payload = toRecord(event.payload);
+    const data = toRecord(payload.data);
+    const args = {
+      ...readToolArgsFromPayload(payload),
+      ...typedCall.args,
+      ...(typedCall.command ? { command: typedCall.command } : {})
+    };
+    return {
+      ...event,
+      payload: {
+        ...payload,
+        source_kind: stringOr(payload.source_kind) || event.kind,
+        typed_tool_call_enriched: true,
+        typed_tool_call_source_event_id: typedCall.sourceEventId,
+        typed_tool_call_source_seq: typedCall.sourceSeq,
+        typed_tool_call_command_hash: hashTraceText(typedCall.command || ""),
+        data: {
+          ...data,
+          name: typedCall.name,
+          toolCallId: typedCall.id,
+          args,
+          ...(typedCall.command ? { command: typedCall.command } : {}),
+          ...(typedCall.meta && !stringOr(data.meta) ? { meta: typedCall.meta } : {})
+        }
+      }
+    };
+  }
+
+  function buildTypedToolCallEnrichmentEvent(
+    sessionId: string,
+    sourceEvent: TimelineEvent,
+    eventScope: GatewayEventScope,
+    typedCall: OpenClawTypedToolCall
+  ): TimelineEvent {
+    const payload = toRecord(sourceEvent.payload);
+    const runId = getGatewayEventRunIdentity(sourceEvent) || eventScope.currentRunId || "";
+    return {
+      id: `typed-tool-call:${typedCall.id || sourceEvent.id}:${hashTraceText(typedCall.command || typedCall.name) || "tool"}`,
+      sessionId,
+      seq: getTypedToolCallEnrichmentEventSeq(sourceEvent, eventScope),
+      kind: "tool.call",
+      payload: {
+        source_kind: "typed_transcript.tool_call_enrich",
+        typed_tool_call_enriched: true,
+        typed_tool_call_source_event_id: typedCall.sourceEventId,
+        typed_tool_call_source_seq: typedCall.sourceSeq,
+        typed_tool_call_command_hash: hashTraceText(typedCall.command || ""),
+        active_request_id: eventScope.activeRequestId,
+        turn_id: eventScope.currentTurnId || eventScope.turnId,
+        data: {
+          phase: "call",
+          name: typedCall.name,
+          toolCallId: typedCall.id,
+          args: {
+            ...typedCall.args,
+            ...(typedCall.command ? { command: typedCall.command } : {})
+          },
+          ...(typedCall.command ? { command: typedCall.command } : {}),
+          ...(typedCall.meta ? { meta: typedCall.meta } : {})
+        },
+        ...(runId ? { runId, run_id: runId } : {}),
+        ...(payload.rawSeq ? { rawSeq: payload.rawSeq } : {})
+      },
+      createdAt: sourceEvent.createdAt || new Date().toISOString()
+    };
+  }
+
+  function getTypedToolCallEnrichmentEventSeq(sourceEvent: TimelineEvent, eventScope: GatewayEventScope): number {
+    const sourceSeq = typeof sourceEvent.seq === "number" && Number.isFinite(sourceEvent.seq)
+      ? sourceEvent.seq
+      : eventScope.lastSeqSeen;
+    return sourceSeq - 0.01;
+  }
+
+  function readToolNameFromPayload(payload: unknown): string {
+    const record = toRecord(payload);
+    const data = toRecord(record.data);
+    return normalizeToolName(stringOr(data.name, data.toolName, data.tool_name, data.tool, record.name, record.toolName, record.tool_name, record.tool));
+  }
+
+  function readToolCallIdFromPayload(payload: unknown): string {
+    const record = toRecord(payload);
+    const data = toRecord(record.data);
+    return stringOr(
+      data.toolCallId,
+      data.tool_call_id,
+      data.callId,
+      data.call_id,
+      data.id,
+      record.toolCallId,
+      record.tool_call_id,
+      record.callId,
+      record.call_id,
+      record.id
+    );
+  }
+
+  function readToolArgsFromPayload(payload: unknown): Record<string, unknown> {
+    const record = toRecord(payload);
+    const data = toRecord(record.data);
+    const fn = toRecord(data.function ?? record.function);
+    for (const value of [
+      data.args,
+      data.arguments,
+      data.input,
+      data.parameters,
+      record.args,
+      record.arguments,
+      record.input,
+      record.parameters,
+      fn.arguments
+    ]) {
+      const parsed = parseToolArgumentsRecord(value);
+      if (Object.keys(parsed).length > 0) {
+        return parsed;
+      }
+    }
+    return {};
+  }
+
+  function parseToolArgumentsRecord(value: unknown): Record<string, unknown> {
+    const normalized = normalizeToolArguments(value);
+    return toRecord(normalized);
+  }
+
+  function normalizeToolArguments(value: unknown): unknown {
+    if (typeof value !== "string") {
+      return value;
+    }
+    const trimmed = value.trim();
+    if (!trimmed) {
+      return undefined;
+    }
+    try {
+      return JSON.parse(trimmed);
+    } catch {
+      return trimmed;
+    }
+  }
+
+  function readToolCommandFromPayload(payload: unknown): string {
+    const record = toRecord(payload);
+    const data = toRecord(record.data);
+    const args = readToolArgsFromPayload(record);
+    for (const candidate of [args, data, record]) {
+      const command = normalizeToolCommandText(stringOr(
+        candidate.command,
+        candidate.cmd,
+        candidate.script,
+        candidate.shell,
+        candidate.commandLine,
+        candidate.command_line,
+        candidate.code
+      ));
+      if (command) {
+        return command;
+      }
+    }
+    return "";
+  }
+
+  function normalizeToolCommandText(value: string): string {
+    const command = value.replace(/\r\n/g, "\n").replace(/\\"/g, "\"").replace(/\\'/g, "'").trim();
+    const normalized = command.replace(/\s+/g, " ").trim().toLowerCase();
+    if (!normalized || normalized === "exec" || normalized === "used exec" || normalized === "used tool" || normalized === "tool output") {
+      return "";
+    }
+    return command;
+  }
+
+  function normalizeToolName(value: string): string {
+    const normalized = value.replace(/[\s-]+/g, "_").trim().toLowerCase();
+    return isExecToolName(normalized) ? "exec" : normalized || "tool";
+  }
+
+  function isExecToolName(value: string): boolean {
+    const normalized = value.replace(/[\s-]+/g, "_").trim().toLowerCase();
+    return normalized === "exec" || normalized === "used_exec" || normalized === "bash" || normalized === "shell" || normalized === "run_command";
   }
 
   function selectTypedFinalMessagesInRequestWindow(
@@ -3823,6 +4155,7 @@ export function createHub53AIBridge(input: HubBridgeInput) {
       nextDeltaIndexBySegment: new Map<string, number>(),
       segmentIndexById: new Map<string, number>(),
       timelineMetaByEventKey: new Map<string, OpenClawTimelineV2Meta>(),
+      typedToolCallEnrichedKeys: new Set<string>(),
       currentActivitySeen: false,
       visibleResponseSeen: false,
       lastSeqSeen: 0,

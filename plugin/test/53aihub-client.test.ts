@@ -1428,6 +1428,142 @@ describe("53AIHub client", () => {
     }
   });
 
+  it("enriches live exec tool calls with command arguments from typed history events", async () => {
+    const stateDir = await mkdtemp(join(tmpdir(), "claw-53aihub-"));
+    cleanupPaths.push(stateDir);
+    const server = await createFakeHubServer();
+    cleanupServers.push(server.close);
+    const gateway = new FakeGateway();
+    gateway.eventsToEmit = [
+      {
+        id: "evt-live-exec-call",
+        sessionId: "session-1",
+        seq: 10,
+        kind: "tool.call",
+        payload: {
+          data: {
+            phase: "call",
+            name: "Exec",
+            toolCallId: "call-exec-1"
+          }
+        },
+        createdAt: new Date().toISOString()
+      },
+      {
+        id: "evt-live-exec-result",
+        sessionId: "session-1",
+        seq: 11,
+        kind: "tool.result",
+        payload: {
+          data: {
+            phase: "result",
+            name: "Exec",
+            toolCallId: "call-exec-1",
+            result: {
+              status: "completed",
+              exitCode: 0,
+              aggregated: "New York: cloudy"
+            }
+          }
+        },
+        createdAt: new Date().toISOString()
+      },
+      {
+        id: "evt-done",
+        sessionId: "session-1",
+        seq: 12,
+        kind: "run.completed",
+        payload: { ok: true },
+        createdAt: new Date().toISOString()
+      }
+    ];
+    gateway.eventsBySession.set("session-1", [
+      {
+        id: "history-exec-call",
+        sessionId: "session-1",
+        seq: 101,
+        kind: "tool.call",
+        payload: {
+          data: {
+            phase: "call",
+            name: "exec",
+            toolCallId: "call-exec-1",
+            args: {
+              command: 'curl -s --max-time 10 "wttr.in/NewYork?1"',
+              timeout: 15
+            }
+          }
+        },
+        createdAt: new Date().toISOString()
+      }
+    ]);
+
+    const bridge = createHub53AIBridge({
+      stateDir,
+      config: {
+        enabled: true,
+        botId: "bot-123",
+        secret: "sk-secret",
+        wsUrl: server.url,
+        accessPolicy: "open",
+        allowFrom: [],
+        sendThinkingMessage: true,
+        reconnectBaseMs: 20,
+        maxReconnectAttempts: 2
+      },
+      gateway,
+      callbacks: {
+        onSessionUpsert: async (session) => {
+          gateway.upsertSession(session);
+        },
+        onUserMessage: async () => undefined,
+        onSessionStatus: async () => undefined,
+        onEnsureSessionStream: async () => undefined,
+        getLastEventSeq: () => 0,
+        onStatusChange: () => undefined
+      }
+    });
+
+    await bridge.start();
+    try {
+      const connection = await server.connected;
+      connection.socket.send(
+        JSON.stringify({
+          req_id: "req-exec-enrich",
+          action: "chat",
+          data: {
+            user: "user-123",
+            conversation_id: "chat-exec-enrich",
+            messages: [{ role: "user", content: "今天纽约天气怎么样？" }]
+          }
+        })
+      );
+
+      await waitFor(() => {
+        const toolCall = server.frames.find(
+          (frame) =>
+            frame.req_id === "req-exec-enrich" &&
+            frame.action === "chat" &&
+            frame.status === "thinking" &&
+            frame.data?.event_kind === "tool.call"
+        );
+        expect(toolCall?.data.payload.data).toMatchObject({
+          name: "exec",
+          command: 'curl -s --max-time 10 "wttr.in/NewYork?1"',
+          args: {
+            command: 'curl -s --max-time 10 "wttr.in/NewYork?1"',
+            timeout: 15
+          }
+        });
+        expect(toolCall?.data.payload.openclaw_ledger.payload.data.args.command).toBe(
+          'curl -s --max-time 10 "wttr.in/NewYork?1"'
+        );
+      });
+    } finally {
+      await bridge.stop();
+    }
+  });
+
   it("emits standard output_files process steps for gateway file events", async () => {
     const stateDir = await mkdtemp(join(tmpdir(), "claw-53aihub-"));
     cleanupPaths.push(stateDir);
