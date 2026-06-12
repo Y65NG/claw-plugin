@@ -674,21 +674,26 @@ export function createHub53AIBridge(input: HubBridgeInput) {
     );
     await ensureCanonicalLedgerBackfillFromEvents(sessionId, rawEvents);
     const canonicalEvents = listCanonicalSessionEvents(sessionId);
-    const deduped = dedupeTimelineEvents([...rawEvents, ...canonicalEvents]);
+    const exposedEvents = dedupeTimelineEvents(canonicalEvents);
+    const rawOnlyHiddenCount = rawEvents.filter(
+      (event) => !normalizeOpenClawLedgerEvent(readOpenClawLedgerFromEvent(event))
+    ).length;
     traceOpenClawDuplicate(input.logger, "hub.events.list", {
       sessionId,
       gatewayCount: gatewayEvents.length,
+      rawInputCount: rawEvents.length,
       canonicalCount: canonicalEvents.length,
       storedCount: storedEvents.length,
       syntheticCount: syntheticEventsBySession.get(sessionId)?.length ?? 0,
-      dedupedCount: deduped.length,
+      exposedCount: exposedEvents.length,
+      rawOnlyHiddenCount,
       gatewayTail: gatewayEvents.slice(-6).map(summarizeTimelineEventForTrace),
       canonicalTail: canonicalEvents.slice(-6).map(summarizeTimelineEventForTrace),
       storedTail: storedEvents.slice(-6).map(summarizeTimelineEventForTrace),
       syntheticTail: (syntheticEventsBySession.get(sessionId) ?? []).slice(-6).map(summarizeTimelineEventForTrace),
-      dedupedTail: deduped.slice(-6).map(summarizeTimelineEventForTrace)
+      exposedTail: exposedEvents.slice(-6).map(summarizeTimelineEventForTrace)
     }, input.config);
-    return deduped;
+    return exposedEvents;
   }
 
   async function ensureCanonicalLedgerBackfill(sessionId: string) {

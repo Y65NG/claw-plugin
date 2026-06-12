@@ -4466,7 +4466,7 @@ describe("53AIHub client", () => {
     }
   });
 
-  it("deduplicates tool timeline events by tool call id while preserving history order", async () => {
+  it("does not expose raw-only stored tool timeline events through sessions.events", async () => {
     const stateDir = await mkdtemp(join(tmpdir(), "claw-53aihub-rpc-events-"));
     cleanupPaths.push(stateDir);
 
@@ -4558,27 +4558,9 @@ describe("53AIHub client", () => {
           action: "sessions.events",
           status: "done",
           data: {
-            events: [
-              {
-                id: "history-tool-result",
-                seq: 30,
-                kind: "tool.result",
-                payload: {
-                  data: {
-                    name: "web_fetch",
-                    toolCallId: "call-1",
-                    meta: "from https://example.com (max 8000 chars)",
-                    result: {
-                      details: {
-                        status: "error",
-                        error: "timeout"
-                      }
-                    }
-                  }
-                }
-              }
-            ],
-            pagination: { limit: 10, offset: 0, total: 1, hasMore: false }
+            events: [],
+            ledger_events: [],
+            pagination: { limit: 10, offset: 0, total: 0, hasMore: false }
           }
         });
       });
@@ -5033,6 +5015,109 @@ describe("53AIHub client", () => {
         });
         expect(firstThinking.turn_id).not.toBe(secondThinking.turn_id);
         expect(firstThinking.active_request_id).not.toBe(secondThinking.active_request_id);
+      });
+    } finally {
+      await bridge.stop();
+    }
+  });
+
+  it("exposes only canonical ledger events from sessions.events after raw history backfill", async () => {
+    const stateDir = await mkdtemp(join(tmpdir(), "claw-53aihub-rpc-events-canonical-only-"));
+    cleanupPaths.push(stateDir);
+
+    const server = await createFakeHubServer();
+    cleanupServers.push(server.close);
+
+    const gateway = new FakeGateway();
+    gateway.eventsBySession.set("session-1", [
+      {
+        id: "raw-run-started",
+        sessionId: "session-1",
+        seq: 1,
+        kind: "run.started",
+        payload: { runId: "run-canonical-only" },
+        createdAt: "2026-06-12T00:00:00.000Z"
+      },
+      {
+        id: "raw-thinking",
+        sessionId: "session-1",
+        seq: 2,
+        kind: "assistant.thinking",
+        payload: { content: "Raw thinking should be exposed only through ledger payload." },
+        createdAt: "2026-06-12T00:00:01.000Z"
+      },
+      {
+        id: "raw-answer",
+        sessionId: "session-1",
+        seq: 3,
+        kind: "assistant.message",
+        payload: { content: "Raw answer should be exposed only through ledger payload." },
+        createdAt: "2026-06-12T00:00:02.000Z"
+      },
+      {
+        id: "raw-run-completed",
+        sessionId: "session-1",
+        seq: 4,
+        kind: "run.completed",
+        payload: { runId: "run-canonical-only" },
+        createdAt: "2026-06-12T00:00:03.000Z"
+      }
+    ]);
+
+    const bridge = createHub53AIBridge({
+      stateDir,
+      config: {
+        enabled: true,
+        botId: "bot-123",
+        secret: "sk-secret",
+        wsUrl: server.url,
+        accessPolicy: "open",
+        allowFrom: [],
+        sendThinkingMessage: false,
+        reconnectBaseMs: 20,
+        maxReconnectAttempts: 2
+      },
+      gateway,
+      callbacks: {
+        onSessionUpsert: async (session) => {
+          gateway.upsertSession(session);
+        },
+        onUserMessage: async () => undefined,
+        onSessionStatus: async () => undefined,
+        onEnsureSessionStream: async () => undefined,
+        listSessionEvents: () => [],
+        getLastEventSeq: () => 0,
+        onStatusChange: () => undefined
+      }
+    });
+
+    await bridge.start();
+    try {
+      const connection = await server.connected;
+      connection.socket.send(
+        JSON.stringify({
+          req_id: "rpc-events-canonical-only",
+          action: "sessions.events",
+          status: "request",
+          data: { session_id: "session-1", limit: 10, offset: 0 }
+        })
+      );
+
+      await waitFor(() => {
+        const frame = frameByReq(server.frames, "rpc-events-canonical-only");
+        expect(frame).toMatchObject({ action: "sessions.events", status: "done" });
+        const events = frame?.data?.events || [];
+        expect(events).toHaveLength(4);
+        expect(
+          events.every((event: any) => event.payload?.openclaw_ledger?.protocol_version === "openclaw.ledger.v1")
+        ).toBe(true);
+        expect(frame?.data?.ledger_events).toHaveLength(4);
+        expect(frame?.data?.ledger_events.map((event: any) => event.event_type)).toEqual([
+          "turn.started",
+          "part.replace",
+          "part.replace",
+          "turn.completed"
+        ]);
       });
     } finally {
       await bridge.stop();
@@ -6280,7 +6365,7 @@ describe("53AIHub client", () => {
     }
   });
 
-  it("filters synthetic bridge tool placeholder thinking events from sessions.events history", async () => {
+  it("hides raw-only placeholder history from sessions.events", async () => {
     const stateDir = await mkdtemp(join(tmpdir(), "claw-53aihub-rpc-events-"));
     cleanupPaths.push(stateDir);
 
@@ -6396,13 +6481,9 @@ describe("53AIHub client", () => {
           action: "sessions.events",
           status: "done",
           data: {
-            events: [
-              { id: "run-started", kind: "run.started" },
-              { id: "tool-call-1", kind: "tool.call" },
-              { id: "tool-result-1", kind: "tool.result" },
-              { id: "assistant-final", kind: "assistant.message" }
-            ],
-            pagination: { limit: 10, offset: 0, total: 4, hasMore: false }
+            events: [],
+            ledger_events: [],
+            pagination: { limit: 10, offset: 0, total: 0, hasMore: false }
           }
         });
         const frame = frameByReq(server.frames, "rpc-events-filter-placeholders");
@@ -6414,7 +6495,7 @@ describe("53AIHub client", () => {
     }
   });
 
-  it("normalizes mismatched protocol segment types in sessions.events history", async () => {
+  it("hides raw-only mismatched protocol segment events from sessions.events", async () => {
     const stateDir = await mkdtemp(join(tmpdir(), "claw-53aihub-rpc-events-"));
     cleanupPaths.push(stateDir);
 
@@ -6494,19 +6575,9 @@ describe("53AIHub client", () => {
           action: "sessions.events",
           status: "done",
           data: {
-            events: [
-              {
-                id: "tool-result-1",
-                kind: "tool.result",
-                payload: {
-                  segment_type: "tool_result",
-                  openclaw_timeline: {
-                    segment_type: "tool_result"
-                  }
-                }
-              }
-            ],
-            pagination: { limit: 10, offset: 0, total: 1, hasMore: false }
+            events: [],
+            ledger_events: [],
+            pagination: { limit: 10, offset: 0, total: 0, hasMore: false }
           }
         });
       });
@@ -6515,7 +6586,7 @@ describe("53AIHub client", () => {
     }
   });
 
-  it("adds OpenClaw history message seq metadata without replacing stream rawSeq", async () => {
+  it("hides raw-only history message seq metadata from sessions.events", async () => {
     const stateDir = await mkdtemp(join(tmpdir(), "claw-53aihub-rpc-events-"));
     cleanupPaths.push(stateDir);
 
@@ -6586,21 +6657,9 @@ describe("53AIHub client", () => {
           action: "sessions.events",
           status: "done",
           data: {
-            events: [
-              {
-                id: "session-1:history:163:tool-call:chatcmpl-tool-new-york",
-                kind: "tool.call",
-                payload: {
-                  rawSeq: 83,
-                  messageSeq: 163,
-                  message_seq: 163,
-                  data: {
-                    toolCallId: "chatcmpl-tool-new-york"
-                  }
-                }
-              }
-            ],
-            pagination: { limit: 10, offset: 0, total: 1, hasMore: false }
+            events: [],
+            ledger_events: [],
+            pagination: { limit: 10, offset: 0, total: 0, hasMore: false }
           }
         });
       });
@@ -6609,7 +6668,7 @@ describe("53AIHub client", () => {
     }
   });
 
-  it("drops live thinking snapshots superseded by OpenClaw history thinking events", async () => {
+  it("hides raw-only history thinking snapshots from sessions.events", async () => {
     const stateDir = await mkdtemp(join(tmpdir(), "claw-53aihub-rpc-events-"));
     cleanupPaths.push(stateDir);
 
@@ -6703,11 +6762,9 @@ describe("53AIHub client", () => {
           action: "sessions.events",
           status: "done",
           data: {
-            events: [
-              { id: "session-1:history:163:thinking", kind: "assistant.thinking" },
-              { id: "session-1:history:163:tool-call:chatcmpl-tool-new-york", kind: "tool.call" }
-            ],
-            pagination: { limit: 10, offset: 0, total: 2, hasMore: false }
+            events: [],
+            ledger_events: [],
+            pagination: { limit: 10, offset: 0, total: 0, hasMore: false }
           }
         });
         expect(frame.data.events.map((event: any) => event.id)).not.toContain("session-1:thinking:1675");
@@ -6717,7 +6774,7 @@ describe("53AIHub client", () => {
     }
   });
 
-  it("deduplicates assistant message echoes while preserving the richer chat final event", async () => {
+  it("hides raw-only assistant message echoes from sessions.events", async () => {
     const stateDir = await mkdtemp(join(tmpdir(), "claw-53aihub-rpc-events-"));
     cleanupPaths.push(stateDir);
 
@@ -6802,22 +6859,9 @@ describe("53AIHub client", () => {
           action: "sessions.events",
           status: "done",
           data: {
-            events: [
-              { id: "run-started", kind: "run.started" },
-              {
-                id: "chat-final",
-                seq: 3,
-                kind: "assistant.message",
-                payload: {
-                  content: finalText,
-                  runId: "run-weather",
-                  rawSeq: 46,
-                  state: "final",
-                  mode: "replace"
-                }
-              }
-            ],
-            pagination: { limit: 10, offset: 0, total: 2, hasMore: false }
+            events: [],
+            ledger_events: [],
+            pagination: { limit: 10, offset: 0, total: 0, hasMore: false }
           }
         });
       });
