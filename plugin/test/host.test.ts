@@ -155,4 +155,25 @@ describe("host helpers", () => {
     expect(config.hub53ai.secret).toBe("legacy-secret");
     expect(config.hub53ai.wsUrl).toBe("wss://legacy.example.com/api/v1/openclaw/ws/connect");
   });
+
+  it("resolves 53AIHub debug logging flags from plugin config", () => {
+    const directory = mkdtempSync(join(tmpdir(), "claw-plugin-host-"));
+    const configPath = join(directory, "openclaw.json");
+    writeFileSync(configPath, JSON.stringify({}));
+
+    const config = resolvePluginConfigWithHostDefaults(configPath, {
+      hub53ai: {
+        enabled: true,
+        debug: {
+          ledger: true,
+          duplicates: true
+        }
+      }
+    });
+
+    expect(config.hub53ai.ledgerDebug).toBe(true);
+    expect(config.hub53ai.duplicateTrace).toBe(true);
+    expect(config.hub53ai.debug.ledger).toBe(true);
+    expect(config.hub53ai.debug.duplicates).toBe(true);
+  });
 });

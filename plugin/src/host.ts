@@ -29,6 +29,14 @@ export type PluginConfig = {
     createdFilesMaxFileBytes?: number;
     createdFilesMaxCount?: number;
     createdFilesExclude?: string[];
+    diagnosticLogs?: boolean;
+    ledgerDebug?: boolean;
+    duplicateTrace?: boolean;
+    debug?: {
+      all?: boolean;
+      ledger?: boolean;
+      duplicates?: boolean;
+    };
   };
   console?: {
     enabled?: boolean;
@@ -69,6 +77,14 @@ export type ResolvedPluginConfig = {
     createdFilesMaxFileBytes: number;
     createdFilesMaxCount: number;
     createdFilesExclude: string[];
+    diagnosticLogs: boolean;
+    ledgerDebug: boolean;
+    duplicateTrace: boolean;
+    debug: {
+      all: boolean;
+      ledger: boolean;
+      duplicates: boolean;
+    };
   };
   console: {
     enabled: boolean;
@@ -159,7 +175,15 @@ export function resolvePluginConfig(config?: PluginConfig): ResolvedPluginConfig
       createdFilesMaxCount: config?.hub53ai?.createdFilesMaxCount ?? 20,
       createdFilesExclude: Array.isArray(config?.hub53ai?.createdFilesExclude)
         ? config.hub53ai.createdFilesExclude.map((entry) => String(entry).trim()).filter(Boolean)
-        : []
+        : [],
+      diagnosticLogs: config?.hub53ai?.diagnosticLogs ?? config?.hub53ai?.debug?.all ?? false,
+      ledgerDebug: config?.hub53ai?.ledgerDebug ?? config?.hub53ai?.debug?.ledger ?? false,
+      duplicateTrace: config?.hub53ai?.duplicateTrace ?? config?.hub53ai?.debug?.duplicates ?? false,
+      debug: {
+        all: config?.hub53ai?.debug?.all ?? config?.hub53ai?.diagnosticLogs ?? false,
+        ledger: config?.hub53ai?.debug?.ledger ?? config?.hub53ai?.ledgerDebug ?? false,
+        duplicates: config?.hub53ai?.debug?.duplicates ?? config?.hub53ai?.duplicateTrace ?? false
+      }
     },
     console: {
       enabled: config?.console?.enabled ?? true,

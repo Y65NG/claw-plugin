@@ -80,6 +80,39 @@
             "type": "boolean",
             "default": true
           },
+          "diagnosticLogs": {
+            "type": "boolean",
+            "default": false,
+            "description": "Enable concise 53AIHub diagnostic logs without logging message bodies."
+          },
+          "ledgerDebug": {
+            "type": "boolean",
+            "default": false,
+            "description": "Enable canonical OpenClaw ledger transition logs without logging message bodies."
+          },
+          "duplicateTrace": {
+            "type": "boolean",
+            "default": false,
+            "description": "Enable duplicate and stale-event trace logs without logging message bodies."
+          },
+          "debug": {
+            "type": "object",
+            "additionalProperties": false,
+            "properties": {
+              "all": {
+                "type": "boolean",
+                "default": false
+              },
+              "ledger": {
+                "type": "boolean",
+                "default": false
+              },
+              "duplicates": {
+                "type": "boolean",
+                "default": false
+              }
+            }
+          },
           "reconnectBaseMs": {
             "type": "number",
             "default": 2000

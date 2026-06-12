@@ -39,6 +39,9 @@ describe("53AIHub client", () => {
         data: {
           user: "user-a",
           conversation_id: "chat-a",
+          metadata: {
+            openclaw_client_message_id: "client-message-a"
+          },
           messages: [
             { role: "system", content: "ignore" },
             {
@@ -58,6 +61,7 @@ describe("53AIHub client", () => {
       msgId: "req-1",
       chatId: "chat-a",
       userId: "user-a",
+      clientMessageId: "client-message-a",
       text: "hello",
       imageUrls: ["https://example.com/image.png"]
     });
@@ -233,7 +237,7 @@ describe("53AIHub client", () => {
         sessionId: "session-1",
         seq: 4,
         kind: "run.completed",
-        payload: { ok: true },
+        payload: { ok: true, run_id: "gateway-run-1" },
         createdAt: new Date().toISOString()
       }
     ];
@@ -274,6 +278,9 @@ describe("53AIHub client", () => {
           data: {
             user: "user-123",
             conversation_id: "chat-meta",
+            metadata: {
+              openclaw_client_message_id: "client-meta"
+            },
             messages: [{ role: "user", content: "测试" }]
           }
         })
@@ -312,6 +319,14 @@ describe("53AIHub client", () => {
                 operation: "replace",
                 visibility: "stream",
                 final: false
+              },
+              openclaw_ledger: {
+                protocol_version: "openclaw.ledger.v1",
+                active_request_id: "client-meta",
+                part_type: "answer",
+                event_type: "part.replace",
+                operation: "replace",
+                visibility: "stream"
               }
             }
           }
@@ -333,6 +348,14 @@ describe("53AIHub client", () => {
                 operation: "replace",
                 visibility: "final",
                 final: true
+              },
+              openclaw_ledger: {
+                protocol_version: "openclaw.ledger.v1",
+                active_request_id: "client-meta",
+                part_type: "thinking",
+                event_type: "part.replace",
+                operation: "replace",
+                visibility: "final"
               }
             }
           }
@@ -356,6 +379,14 @@ describe("53AIHub client", () => {
                 operation: "replace",
                 visibility: "final",
                 final: true
+              },
+              openclaw_ledger: {
+                protocol_version: "openclaw.ledger.v1",
+                active_request_id: "client-meta",
+                part_type: "tool",
+                event_type: "part.replace",
+                operation: "replace",
+                visibility: "final"
               }
             }
           }
@@ -366,6 +397,7 @@ describe("53AIHub client", () => {
         expect(thinking?.data.payload.openclaw_timeline.turn_id).toBe(
           toolCall?.data.payload.openclaw_timeline.turn_id
         );
+        expect(streaming?.data.payload.openclaw_timeline.turn_id).toContain("client-meta");
         const done = server.frames.find(
           (frame) =>
             frame.action === "chat" &&
@@ -383,7 +415,18 @@ describe("53AIHub client", () => {
                 segment_type: "run",
                 operation: "close",
                 visibility: "final",
-                final: true
+                final: true,
+                turn_id: streaming?.data.payload.openclaw_timeline.turn_id
+              },
+              openclaw_ledger: {
+                protocol_version: "openclaw.ledger.v1",
+                active_request_id: "client-meta",
+                turn_id: streaming?.data.payload.openclaw_timeline.turn_id,
+                run_id: "gateway-run-1",
+                part_type: "status",
+                event_type: "turn.completed",
+                operation: "close",
+                terminal_status: "completed"
               }
             }
           }
@@ -591,6 +634,176 @@ describe("53AIHub client", () => {
         expect(streamByKind.get("assistant.message")?.data?.payload?.runId).toBe("run-doc-15");
         expect(eventsByKind.get("assistant.thinking")?.payload?.runId).toBe("run-doc-15");
         expect(eventsByKind.get("assistant.message")?.payload?.runId).toBe("run-doc-15");
+      });
+    } finally {
+      await bridge.stop();
+    }
+  });
+
+  it("keeps resumed assistant text on the same canonical answer part after tool activity", async () => {
+    const stateDir = await mkdtemp(join(tmpdir(), "claw-53aihub-answer-segments-"));
+    cleanupPaths.push(stateDir);
+    const server = await createFakeHubServer();
+    cleanupServers.push(server.close);
+    const gateway = new FakeGateway();
+    const createdAt = "2026-06-12T01:29:24.000Z";
+    const events: GatewayEvent[] = [
+      {
+        id: "evt-run-start",
+        sessionId: "session-1",
+        seq: 1,
+        kind: "run.started",
+        payload: { runId: "run-doc-10", phase: "start" },
+        createdAt
+      },
+      {
+        id: "evt-answer-intro",
+        sessionId: "session-1",
+        seq: 2,
+        kind: "assistant.message",
+        payload: {
+          content: "好的！我来为您生成一个包含10个字的纯文本测试文档。",
+          runId: "run-doc-10",
+          state: "final",
+          mode: "replace",
+          replace: true
+        },
+        createdAt
+      },
+      {
+        id: "evt-tool-call",
+        sessionId: "session-1",
+        seq: 3,
+        kind: "tool.call",
+        payload: {
+          runId: "run-doc-10",
+          data: {
+            name: "write",
+            toolCallId: "tool-write-doc",
+            args: { path: "test_document.txt" }
+          }
+        },
+        createdAt
+      },
+      {
+        id: "evt-tool-result",
+        sessionId: "session-1",
+        seq: 4,
+        kind: "tool.result",
+        payload: {
+          runId: "run-doc-10",
+          data: {
+            name: "write",
+            toolCallId: "tool-write-doc",
+            result: { output: "ok" }
+          }
+        },
+        createdAt
+      },
+      {
+        id: "evt-answer-final",
+        sessionId: "session-1",
+        seq: 5,
+        kind: "assistant.message",
+        payload: {
+          content: "完成！我已经为您生成了一个纯文本测试文档。\n\n**文件信息：**",
+          runId: "run-doc-10",
+          state: "final",
+          mode: "replace",
+          replace: true
+        },
+        createdAt
+      },
+      {
+        id: "evt-done",
+        sessionId: "session-1",
+        seq: 6,
+        kind: "run.completed",
+        payload: { runId: "run-doc-10", phase: "end", status: "completed" },
+        createdAt
+      }
+    ];
+    gateway.eventsToEmit = events;
+    gateway.eventsBySession.set("session-1", events);
+
+    const bridge = createHub53AIBridge({
+      stateDir,
+      config: {
+        enabled: true,
+        botId: "bot-123",
+        secret: "sk-secret",
+        wsUrl: server.url,
+        accessPolicy: "open",
+        allowFrom: [],
+        sendThinkingMessage: true,
+        reconnectBaseMs: 20,
+        maxReconnectAttempts: 2
+      },
+      gateway,
+      callbacks: {
+        onSessionUpsert: async (session) => {
+          gateway.upsertSession(session);
+        },
+        onUserMessage: async () => undefined,
+        onSessionStatus: async () => undefined,
+        onEnsureSessionStream: async () => undefined,
+        listSessionEvents: () => [],
+        getLastEventSeq: () => 0,
+        onStatusChange: () => undefined
+      }
+    });
+
+    await bridge.start();
+    try {
+      const connection = await server.connected;
+      connection.socket.send(
+        JSON.stringify({
+          req_id: "req-answer-segments",
+          action: "chat",
+          data: {
+            user: "user-123",
+            conversation_id: "chat-answer-segments",
+            messages: [{ role: "user", content: "生成一个10字测试文档" }]
+          }
+        })
+      );
+
+      await waitFor(() => {
+        const answerFrames = server.frames.filter(
+          (frame) =>
+            frame.req_id === "req-answer-segments" &&
+            frame.action === "chat" &&
+            frame.data?.event_kind === "assistant.message"
+        );
+        expect(answerFrames).toHaveLength(2);
+        expect(answerFrames.map((frame) => frame.data.payload.openclaw_timeline.segment_id)).toEqual([
+          "session-1:turn:req-answer-segments:answer:0",
+          "session-1:turn:req-answer-segments:answer:0"
+        ]);
+        expect(answerFrames.map((frame) => frame.data.payload.openclaw_ledger.part_id)).toEqual([
+          "session-1:turn:req-answer-segments:answer:0",
+          "session-1:turn:req-answer-segments:answer:0"
+        ]);
+      });
+
+      connection.socket.send(
+        JSON.stringify({
+          req_id: "rpc-answer-segments-events",
+          action: "sessions.events",
+          status: "request",
+          data: { session_id: "session-1", limit: 20, offset: 0 }
+        })
+      );
+
+      await waitFor(() => {
+        const rpcFrame = frameByReq(server.frames, "rpc-answer-segments-events");
+        expect(rpcFrame).toMatchObject({ action: "sessions.events", status: "done" });
+        const ledgerAnswers = rpcFrame.data.ledger_events.filter((event: any) => event.part_type === "answer");
+        expect(ledgerAnswers).toHaveLength(1);
+        expect(ledgerAnswers[0]).toMatchObject({
+          part_id: "session-1:turn:req-answer-segments:answer:0",
+          text: "完成！我已经为您生成了一个纯文本测试文档。\n\n**文件信息：**"
+        });
       });
     } finally {
       await bridge.stop();
@@ -1114,7 +1327,8 @@ describe("53AIHub client", () => {
         const segmentIds = outputSteps.map(
           (frame) => frame.data.process_step.data.openclaw_timeline?.segment_id
         );
-        expect(new Set(segmentIds).size).toBe(2);
+        expect(new Set(segmentIds).size).toBe(1);
+        expect(segmentIds[0]).toContain("output_files:name:report.txt");
       });
     } finally {
       await bridge.stop();
@@ -1880,6 +2094,308 @@ describe("53AIHub client", () => {
     }
   });
 
+  it("classifies QClaw login failures from failed status updates into ledger terminal events", async () => {
+    const stateDir = await mkdtemp(join(tmpdir(), "claw-53aihub-qclaw-login-"));
+    cleanupPaths.push(stateDir);
+
+    const server = await createFakeHubServer();
+    cleanupServers.push(server.close);
+
+    const gateway = new FakeGateway();
+    gateway.eventsToEmit = [
+      {
+        id: "evt-run-started-qclaw-login",
+        sessionId: "session-1",
+        seq: 1,
+        kind: "run.started",
+        payload: { runId: "run-qclaw-login" },
+        createdAt: "2026-06-11T12:00:00.000Z"
+      },
+      {
+        id: "evt-status-qclaw-login-failed",
+        sessionId: "session-1",
+        seq: 2,
+        kind: "status.update",
+        payload: {
+          runId: "run-qclaw-login",
+          phase: "error",
+          status: "failed",
+          session: {
+            status: "failed",
+            modelProvider: "qclaw",
+            model: "pool-hy3-preview",
+            runtimeMs: 393
+          }
+        },
+        createdAt: "2026-06-11T12:00:00.393Z"
+      }
+    ];
+    const statuses: Array<{ sessionId: string; status: SessionStatus }> = [];
+
+    const bridge = createHub53AIBridge({
+      stateDir,
+      config: {
+        enabled: true,
+        botId: "bot-123",
+        secret: "sk-secret",
+        wsUrl: server.url,
+        accessPolicy: "open",
+        allowFrom: [],
+        sendThinkingMessage: false,
+        reconnectBaseMs: 20,
+        maxReconnectAttempts: 2
+      },
+      gateway,
+      callbacks: {
+        onSessionUpsert: async (session) => {
+          gateway.upsertSession(session);
+        },
+        onUserMessage: async () => undefined,
+        onSessionStatus: async (sessionId, status) => {
+          statuses.push({ sessionId, status });
+        },
+        onEnsureSessionStream: async () => undefined,
+        getLastEventSeq: () => 0,
+        onStatusChange: () => undefined
+      }
+    });
+
+    await bridge.start();
+    try {
+      const connection = await server.connected;
+      connection.socket.send(
+        JSON.stringify({
+          req_id: "req-qclaw-login",
+          action: "chat",
+          data: {
+            user: "user-a",
+            conversation_id: "chat-a",
+            messages: [{ role: "user", content: "Trigger QClaw login failure" }]
+          }
+        })
+      );
+
+      await waitFor(() => {
+        const errorFrame = server.frames.find((frame) => frame.req_id === "req-qclaw-login" && frame.status === "error");
+        expect(errorFrame).toMatchObject({
+          action: "chat",
+          status: "error",
+          data: {
+            event_kind: "run.failed",
+            error: {
+              code: "QCLAW_LOGIN_REQUIRED"
+            },
+            payload: {
+              failure_code: "QCLAW_LOGIN_REQUIRED",
+              failure_reason: "qclaw_login_or_provider_auth_failed",
+              user_message: expect.stringContaining("QClaw/OpenClaw 智能体登录失败"),
+              terminal_status: "failed",
+              derived_terminal: true,
+              derived_from_kind: "status.update",
+              openclaw_ledger: {
+                protocol_version: "openclaw.ledger.v1",
+                seq: 2,
+                run_id: "run-qclaw-login",
+                event_type: "turn.failed",
+                terminal_status: "failed",
+                payload: {
+                  failure_code: "QCLAW_LOGIN_REQUIRED"
+                }
+              }
+            }
+          }
+        });
+        expect(errorFrame?.data.choices[0]?.delta.content).toContain("QClaw/OpenClaw 智能体登录失败");
+      });
+      expect(statuses.at(-1)).toEqual({ sessionId: "session-1", status: "failed" });
+
+      connection.socket.send(
+        JSON.stringify({
+          req_id: "rpc-qclaw-login-snapshot",
+          action: "sessions.snapshot",
+          status: "request",
+          data: { session_id: "session-1", after_seq: 1 }
+        })
+      );
+
+      await waitFor(() => {
+        expect(frameByReq(server.frames, "rpc-qclaw-login-snapshot")).toMatchObject({
+          action: "sessions.snapshot",
+          status: "done",
+          data: {
+            session_id: "session-1",
+            conversation_id: "session-1",
+            last_seq: 2,
+            active_turns: [],
+            ledger_events: [
+              {
+                protocol_version: "openclaw.ledger.v1",
+                seq: 2,
+                run_id: "run-qclaw-login",
+                part_type: "status",
+                event_type: "turn.failed",
+                operation: "close",
+                terminal_status: "failed",
+                payload: {
+                  failure_code: "QCLAW_LOGIN_REQUIRED",
+                  derived_from_kind: "status.update"
+                }
+              }
+            ]
+          }
+        });
+      });
+    } finally {
+      await bridge.stop();
+    }
+  });
+
+  it("classifies raw QClaw login text even when failed status updates have no run identity", async () => {
+    const stateDir = await mkdtemp(join(tmpdir(), "claw-53aihub-qclaw-login-raw-"));
+    cleanupPaths.push(stateDir);
+
+    const server = await createFakeHubServer();
+    cleanupServers.push(server.close);
+
+    const gateway = new FakeGateway();
+    gateway.eventsToEmit = [
+      {
+        id: "evt-status-qclaw-login-raw-failed",
+        sessionId: "session-1",
+        seq: 1,
+        kind: "status.update",
+        payload: {
+          phase: "error",
+          status: "failed",
+          error: "QClaw login required: please sign in to continue",
+          session: {
+            status: "failed",
+            runtimeMs: 318
+          }
+        },
+        createdAt: new Date(Date.now() + 10_000).toISOString()
+      }
+    ];
+    const statuses: Array<{ sessionId: string; status: SessionStatus }> = [];
+
+    const bridge = createHub53AIBridge({
+      stateDir,
+      config: {
+        enabled: true,
+        botId: "bot-123",
+        secret: "sk-secret",
+        wsUrl: server.url,
+        accessPolicy: "open",
+        allowFrom: [],
+        sendThinkingMessage: false,
+        reconnectBaseMs: 20,
+        maxReconnectAttempts: 2
+      },
+      gateway,
+      callbacks: {
+        onSessionUpsert: async (session) => {
+          gateway.upsertSession(session);
+        },
+        onUserMessage: async () => undefined,
+        onSessionStatus: async (sessionId, status) => {
+          statuses.push({ sessionId, status });
+        },
+        onEnsureSessionStream: async () => undefined,
+        getLastEventSeq: () => 0,
+        onStatusChange: () => undefined
+      }
+    });
+
+    await bridge.start();
+    try {
+      const connection = await server.connected;
+      connection.socket.send(
+        JSON.stringify({
+          req_id: "req-qclaw-login-raw",
+          action: "chat",
+          data: {
+            user: "user-a",
+            conversation_id: "chat-a",
+            messages: [{ role: "user", content: "Trigger raw QClaw login failure" }]
+          }
+        })
+      );
+
+      await waitFor(() => {
+        const errorFrame = server.frames.find((frame) => frame.req_id === "req-qclaw-login-raw" && frame.status === "error");
+        expect(errorFrame).toMatchObject({
+          action: "chat",
+          status: "error",
+          data: {
+            event_kind: "run.failed",
+            error: {
+              code: "QCLAW_LOGIN_REQUIRED"
+            },
+            payload: {
+              failure_code: "QCLAW_LOGIN_REQUIRED",
+              failure_reason: "qclaw_auth_failed",
+              user_message: expect.stringContaining("QClaw/OpenClaw 智能体登录失败"),
+              raw_error_message: "QClaw login required: please sign in to continue",
+              terminal_status: "failed",
+              derived_terminal: true,
+              derived_from_kind: "status.update",
+              openclaw_ledger: {
+                protocol_version: "openclaw.ledger.v1",
+                seq: 1,
+                active_request_id: "req-qclaw-login-raw",
+                event_type: "turn.failed",
+                terminal_status: "failed",
+                payload: {
+                  failure_code: "QCLAW_LOGIN_REQUIRED",
+                  raw_error_message: "QClaw login required: please sign in to continue"
+                }
+              }
+            }
+          }
+        });
+        expect(errorFrame?.data.choices[0]?.delta.content).toContain("QClaw/OpenClaw 智能体登录失败");
+      });
+      expect(statuses.at(-1)).toEqual({ sessionId: "session-1", status: "failed" });
+
+      connection.socket.send(
+        JSON.stringify({
+          req_id: "rpc-qclaw-login-raw-snapshot",
+          action: "sessions.snapshot",
+          status: "request",
+          data: { session_id: "session-1", after_seq: 0 }
+        })
+      );
+
+      await waitFor(() => {
+        expect(frameByReq(server.frames, "rpc-qclaw-login-raw-snapshot")).toMatchObject({
+          action: "sessions.snapshot",
+          status: "done",
+          data: {
+            session_id: "session-1",
+            last_seq: 1,
+            active_turns: [],
+            ledger_events: [
+              {
+                protocol_version: "openclaw.ledger.v1",
+                seq: 1,
+                part_type: "status",
+                event_type: "turn.failed",
+                operation: "close",
+                terminal_status: "failed",
+                payload: {
+                  failure_code: "QCLAW_LOGIN_REQUIRED",
+                  derived_from_kind: "status.update"
+                }
+              }
+            ]
+          }
+        });
+      });
+    } finally {
+      await bridge.stop();
+    }
+  });
+
   it("keeps reconnecting after max reconnect attempts until 53AIHub is available again", async () => {
     const stateDir = await mkdtemp(join(tmpdir(), "claw-53aihub-reconnect-"));
     cleanupPaths.push(stateDir);
@@ -2105,6 +2621,54 @@ describe("53AIHub client", () => {
         expect(frameByReq(server.frames, "rpc-stop-stuck-run")).toMatchObject({
           action: "sessions.control",
           status: "done"
+        });
+        expect(frameByReq(server.frames, "req-stopped-run")).toMatchObject({
+          action: "chat",
+          status: "done",
+          data: {
+            event_kind: "run.interrupted",
+            payload: {
+              synthetic_terminal: true,
+              openclaw_ledger: {
+                protocol_version: "openclaw.ledger.v1",
+                event_type: "turn.interrupted",
+                terminal_status: "interrupted",
+                active_request_id: "req-stopped-run"
+              }
+            }
+          }
+        });
+      });
+
+      connection.socket.send(
+        JSON.stringify({
+          req_id: "rpc-stop-snapshot",
+          action: "sessions.snapshot",
+          status: "request",
+          data: { session_id: "session-1" }
+        })
+      );
+
+      await waitFor(() => {
+        expect(frameByReq(server.frames, "rpc-stop-snapshot")).toMatchObject({
+          action: "sessions.snapshot",
+          status: "done",
+          data: {
+            session_id: "session-1",
+            active_turns: [],
+            recent_events: [
+              {
+                protocol_version: "openclaw.ledger.v1",
+                event_type: "turn.interrupted",
+                terminal_status: "interrupted",
+                active_request_id: "req-stopped-run",
+                payload: {
+                  synthetic_terminal: true,
+                  synthetic_reason: "control.stop"
+                }
+              }
+            ]
+          }
         });
       });
 
@@ -4023,6 +4587,1699 @@ describe("53AIHub client", () => {
     }
   });
 
+  it("returns canonical OpenClaw ledger snapshot for resumable session recovery", async () => {
+    const stateDir = await mkdtemp(join(tmpdir(), "claw-53aihub-rpc-snapshot-"));
+    cleanupPaths.push(stateDir);
+
+    const server = await createFakeHubServer();
+    cleanupServers.push(server.close);
+
+    const gateway = new FakeGateway();
+    gateway.eventsToEmit = [
+      {
+        id: "evt-run-started",
+        sessionId: "session-1",
+        seq: 1,
+        kind: "run.started",
+        payload: { runId: "run-ledger" },
+        createdAt: "2026-06-11T09:00:00.000Z"
+      },
+      {
+        id: "evt-answer-delta",
+        sessionId: "session-1",
+        seq: 2,
+        kind: "assistant.delta",
+        payload: { content: "Hel", runId: "run-ledger" },
+        createdAt: "2026-06-11T09:00:01.000Z"
+      },
+      {
+        id: "evt-run-completed",
+        sessionId: "session-1",
+        seq: 3,
+        kind: "run.completed",
+        payload: { runId: "run-ledger" },
+        createdAt: "2026-06-11T09:00:02.000Z"
+      }
+    ];
+
+    const bridge = createHub53AIBridge({
+      stateDir,
+      config: {
+        enabled: true,
+        botId: "bot-123",
+        secret: "sk-secret",
+        wsUrl: server.url,
+        accessPolicy: "open",
+        allowFrom: [],
+        sendThinkingMessage: false,
+        reconnectBaseMs: 20,
+        maxReconnectAttempts: 2
+      },
+      gateway,
+      callbacks: {
+        onSessionUpsert: async (session) => {
+          gateway.upsertSession(session);
+        },
+        onUserMessage: async () => undefined,
+        onSessionStatus: async () => undefined,
+        onEnsureSessionStream: async () => undefined,
+        listSessionEvents: () => [],
+        getLastEventSeq: () => 0,
+        onStatusChange: () => undefined
+      }
+    });
+
+    await bridge.start();
+    try {
+      const connection = await server.connected;
+      connection.socket.send(
+        JSON.stringify({
+          req_id: "req-ledger-snapshot",
+          action: "chat",
+          data: {
+            user: "user-a",
+            conversation_id: "chat-a",
+            metadata: {
+              openclaw_client_message_id: "client-ledger-snapshot"
+            },
+            messages: [{ role: "user", content: "Start a running ledger turn" }]
+          }
+        })
+      );
+
+      await waitFor(() => {
+        expect(server.frames.some((frame) => frame.req_id === "req-ledger-snapshot" && frame.status === "done")).toBe(true);
+      });
+
+      connection.socket.send(
+        JSON.stringify({
+          req_id: "rpc-snapshot",
+          action: "sessions.snapshot",
+          status: "request",
+          data: { session_id: "session-1", after_seq: 1 }
+        })
+      );
+
+      await waitFor(() => {
+        expect(frameByReq(server.frames, "rpc-snapshot")).toMatchObject({
+          action: "sessions.snapshot",
+          status: "done",
+          data: {
+            session_id: "session-1",
+            conversation_id: "session-1",
+            last_seq: 3,
+            active_turns: [],
+            recent_events: [
+              {
+                protocol_version: "openclaw.ledger.v1",
+                seq: 1,
+                run_id: "run-ledger",
+                active_request_id: "client-ledger-snapshot",
+                part_type: "status",
+                event_type: "turn.started",
+                operation: "noop",
+                terminal_status: "running"
+              },
+              {
+                protocol_version: "openclaw.ledger.v1",
+                seq: 2,
+                run_id: "run-ledger",
+                active_request_id: "client-ledger-snapshot",
+                part_type: "answer",
+                event_type: "part.delta",
+                operation: "append",
+                text: "Hel"
+              },
+              {
+                protocol_version: "openclaw.ledger.v1",
+                seq: 3,
+                run_id: "run-ledger",
+                active_request_id: "client-ledger-snapshot",
+                part_type: "status",
+                event_type: "turn.completed",
+                operation: "close",
+                terminal_status: "completed"
+              }
+            ],
+            ledger_events: [
+              {
+                protocol_version: "openclaw.ledger.v1",
+                seq: 2,
+                run_id: "run-ledger",
+                active_request_id: "client-ledger-snapshot",
+                part_type: "answer",
+                event_type: "part.delta",
+                operation: "append",
+                text: "Hel"
+              },
+              {
+                protocol_version: "openclaw.ledger.v1",
+                seq: 3,
+                run_id: "run-ledger",
+                active_request_id: "client-ledger-snapshot",
+                part_type: "status",
+                event_type: "turn.completed",
+                operation: "close",
+                terminal_status: "completed"
+              }
+            ]
+          }
+        });
+      });
+    } finally {
+      await bridge.stop();
+    }
+  });
+
+  it("does not expose stale historical running turns after later terminal events", async () => {
+    const stateDir = await mkdtemp(join(tmpdir(), "claw-53aihub-rpc-stale-active-turn-"));
+    cleanupPaths.push(stateDir);
+
+    const server = await createFakeHubServer();
+    cleanupServers.push(server.close);
+
+    const gateway = new FakeGateway();
+    gateway.eventsBySession.set("session-1", [
+      {
+        id: "evt-stale-run-started",
+        sessionId: "session-1",
+        seq: 1,
+        kind: "run.started",
+        payload: { runId: "run-stale" },
+        createdAt: "2026-06-11T09:00:00.000Z"
+      },
+      {
+        id: "evt-stale-answer-delta",
+        sessionId: "session-1",
+        seq: 2,
+        kind: "assistant.delta",
+        payload: { content: "still old", runId: "run-stale" },
+        createdAt: "2026-06-11T09:00:01.000Z"
+      },
+      {
+        id: "evt-current-run-started",
+        sessionId: "session-1",
+        seq: 3,
+        kind: "run.started",
+        payload: { runId: "run-current" },
+        createdAt: "2026-06-11T09:00:02.000Z"
+      },
+      {
+        id: "evt-current-run-completed",
+        sessionId: "session-1",
+        seq: 4,
+        kind: "run.completed",
+        payload: { runId: "run-current" },
+        createdAt: "2026-06-11T09:00:03.000Z"
+      }
+    ]);
+
+    const bridge = createHub53AIBridge({
+      stateDir,
+      config: {
+        enabled: true,
+        botId: "bot-123",
+        secret: "sk-secret",
+        wsUrl: server.url,
+        accessPolicy: "open",
+        allowFrom: [],
+        sendThinkingMessage: false,
+        reconnectBaseMs: 20,
+        maxReconnectAttempts: 2
+      },
+      gateway,
+      callbacks: {
+        onSessionUpsert: async (session) => {
+          gateway.upsertSession(session);
+        },
+        onUserMessage: async () => undefined,
+        onSessionStatus: async () => undefined,
+        onEnsureSessionStream: async () => undefined,
+        listSessionEvents: () => [],
+        getLastEventSeq: () => 0,
+        onStatusChange: () => undefined
+      }
+    });
+
+    await bridge.start();
+    try {
+      const connection = await server.connected;
+      connection.socket.send(
+        JSON.stringify({
+          req_id: "rpc-stale-active-turn-snapshot",
+          action: "sessions.snapshot",
+          status: "request",
+          data: { session_id: "session-1" }
+        })
+      );
+
+      await waitFor(() => {
+        expect(frameByReq(server.frames, "rpc-stale-active-turn-snapshot")).toMatchObject({
+          action: "sessions.snapshot",
+          status: "done",
+          data: {
+            session_id: "session-1",
+            last_seq: 2,
+            active_turns: [],
+            recent_events: [
+              {
+                protocol_version: "openclaw.ledger.v1",
+                seq: 1,
+                run_id: "run-current",
+                part_type: "status",
+                event_type: "turn.started",
+                terminal_status: "running"
+              },
+              {
+                protocol_version: "openclaw.ledger.v1",
+                seq: 2,
+                run_id: "run-current",
+                part_type: "status",
+                event_type: "turn.completed",
+                terminal_status: "completed"
+              }
+            ],
+            ledger_events: [
+              {
+                protocol_version: "openclaw.ledger.v1",
+                seq: 1,
+                run_id: "run-current",
+                part_type: "status",
+                event_type: "turn.started",
+                terminal_status: "running"
+              },
+              {
+                protocol_version: "openclaw.ledger.v1",
+                seq: 2,
+                run_id: "run-current",
+                part_type: "status",
+                event_type: "turn.completed",
+                terminal_status: "completed"
+              }
+            ]
+          }
+        });
+        const recentEvents = frameByReq(server.frames, "rpc-stale-active-turn-snapshot")?.data?.recent_events || [];
+        expect(recentEvents.some((event: any) => event.run_id === "run-stale")).toBe(false);
+      });
+    } finally {
+      await bridge.stop();
+    }
+  });
+
+  it("backfills historical raw events into separate canonical ledger turns", async () => {
+    const stateDir = await mkdtemp(join(tmpdir(), "claw-53aihub-rpc-history-backfill-"));
+    cleanupPaths.push(stateDir);
+
+    const server = await createFakeHubServer();
+    cleanupServers.push(server.close);
+
+    const gateway = new FakeGateway();
+    gateway.eventsBySession.set("session-1", [
+      {
+        id: "first-run-started",
+        sessionId: "session-1",
+        seq: 1,
+        kind: "run.started",
+        payload: { runId: "run-one" },
+        createdAt: "2026-06-11T09:00:00.000Z"
+      },
+      {
+        id: "first-thinking",
+        sessionId: "session-1",
+        seq: 2,
+        kind: "assistant.thinking",
+        payload: { content: "Thinking for one." },
+        createdAt: "2026-06-11T09:00:01.000Z"
+      },
+      {
+        id: "first-answer",
+        sessionId: "session-1",
+        seq: 3,
+        kind: "assistant.message",
+        payload: { content: "Answer one." },
+        createdAt: "2026-06-11T09:00:02.000Z"
+      },
+      {
+        id: "first-run-completed",
+        sessionId: "session-1",
+        seq: 4,
+        kind: "run.completed",
+        payload: { runId: "run-one" },
+        createdAt: "2026-06-11T09:00:03.000Z"
+      },
+      {
+        id: "second-run-started",
+        sessionId: "session-1",
+        seq: 5,
+        kind: "run.started",
+        payload: { runId: "run-two" },
+        createdAt: "2026-06-11T09:01:00.000Z"
+      },
+      {
+        id: "second-thinking",
+        sessionId: "session-1",
+        seq: 6,
+        kind: "assistant.thinking",
+        payload: { content: "Thinking for two." },
+        createdAt: "2026-06-11T09:01:01.000Z"
+      },
+      {
+        id: "second-answer",
+        sessionId: "session-1",
+        seq: 7,
+        kind: "assistant.message",
+        payload: { content: "Answer two." },
+        createdAt: "2026-06-11T09:01:02.000Z"
+      },
+      {
+        id: "second-run-completed",
+        sessionId: "session-1",
+        seq: 8,
+        kind: "run.completed",
+        payload: { runId: "run-two" },
+        createdAt: "2026-06-11T09:01:03.000Z"
+      }
+    ]);
+
+    const bridge = createHub53AIBridge({
+      stateDir,
+      config: {
+        enabled: true,
+        botId: "bot-123",
+        secret: "sk-secret",
+        wsUrl: server.url,
+        accessPolicy: "open",
+        allowFrom: [],
+        sendThinkingMessage: false,
+        reconnectBaseMs: 20,
+        maxReconnectAttempts: 2
+      },
+      gateway,
+      callbacks: {
+        onSessionUpsert: async (session) => {
+          gateway.upsertSession(session);
+        },
+        onUserMessage: async () => undefined,
+        onSessionStatus: async () => undefined,
+        onEnsureSessionStream: async () => undefined,
+        listSessionEvents: () => [],
+        getLastEventSeq: () => 0,
+        onStatusChange: () => undefined
+      }
+    });
+
+    await bridge.start();
+    try {
+      const connection = await server.connected;
+      connection.socket.send(
+        JSON.stringify({
+          req_id: "rpc-history-backfill-snapshot",
+          action: "sessions.snapshot",
+          status: "request",
+          data: { session_id: "session-1" }
+        })
+      );
+
+      await waitFor(() => {
+        const frame = frameByReq(server.frames, "rpc-history-backfill-snapshot");
+        expect(frame).toMatchObject({
+          action: "sessions.snapshot",
+          status: "done",
+          data: {
+            session_id: "session-1",
+            last_seq: 8,
+            active_turns: []
+          }
+        });
+        const events = frame?.data?.recent_events || [];
+        expect(events).toHaveLength(8);
+
+        const firstThinking = events.find((event: any) => event.seq === 2);
+        const secondThinking = events.find((event: any) => event.seq === 6);
+        expect(firstThinking).toMatchObject({
+          protocol_version: "openclaw.ledger.v1",
+          run_id: "run-one",
+          part_type: "thinking",
+          event_type: "part.replace",
+          text: "Thinking for one."
+        });
+        expect(secondThinking).toMatchObject({
+          protocol_version: "openclaw.ledger.v1",
+          run_id: "run-two",
+          part_type: "thinking",
+          event_type: "part.replace",
+          text: "Thinking for two."
+        });
+        expect(firstThinking.turn_id).not.toBe(secondThinking.turn_id);
+        expect(firstThinking.active_request_id).not.toBe(secondThinking.active_request_id);
+      });
+    } finally {
+      await bridge.stop();
+    }
+  });
+
+  it("backfills delayed history thinking by message sequence instead of physical event order", async () => {
+    const stateDir = await mkdtemp(join(tmpdir(), "claw-53aihub-rpc-history-backfill-delayed-thinking-"));
+    cleanupPaths.push(stateDir);
+
+    const server = await createFakeHubServer();
+    cleanupServers.push(server.close);
+
+    const gateway = new FakeGateway();
+    gateway.eventsBySession.set("session-1", [
+      {
+        id: "first-run-started",
+        sessionId: "session-1",
+        seq: 3,
+        kind: "run.started",
+        payload: { runId: "run-one" },
+        createdAt: "2026-06-11T09:00:00.000Z"
+      },
+      {
+        id: "first-message-status",
+        sessionId: "session-1",
+        seq: 14,
+        kind: "status.update",
+        payload: { phase: "message", messageSeq: 2, runId: "run-one" },
+        createdAt: "2026-06-11T09:00:01.000Z"
+      },
+      {
+        id: "first-answer",
+        sessionId: "session-1",
+        seq: 15,
+        kind: "assistant.message",
+        payload: { content: "Answer one.", runId: "run-one" },
+        createdAt: "2026-06-11T09:00:02.000Z"
+      },
+      {
+        id: "first-run-completed",
+        sessionId: "session-1",
+        seq: 16,
+        kind: "run.completed",
+        payload: { runId: "run-one" },
+        createdAt: "2026-06-11T09:00:03.000Z"
+      },
+      {
+        id: "first-message-done-status",
+        sessionId: "session-1",
+        seq: 18,
+        kind: "status.update",
+        payload: { phase: "message", status: "done", messageSeq: 2 },
+        createdAt: "2026-06-11T09:00:04.000Z"
+      },
+      {
+        id: "second-run-started",
+        sessionId: "session-1",
+        seq: 19,
+        kind: "run.started",
+        payload: { runId: "run-two" },
+        createdAt: "2026-06-11T09:01:00.000Z"
+      },
+      {
+        id: "session-1:history:2:thinking",
+        sessionId: "session-1",
+        seq: 20,
+        kind: "assistant.thinking",
+        payload: { rawSeq: 2, content: "Thinking for one." },
+        createdAt: "2026-06-11T09:01:01.000Z"
+      },
+      {
+        id: "second-message-status",
+        sessionId: "session-1",
+        seq: 25,
+        kind: "status.update",
+        payload: { phase: "message", messageSeq: 4, runId: "run-two" },
+        createdAt: "2026-06-11T09:01:02.000Z"
+      },
+      {
+        id: "second-answer",
+        sessionId: "session-1",
+        seq: 27,
+        kind: "assistant.message",
+        payload: { content: "Answer two.", runId: "run-two" },
+        createdAt: "2026-06-11T09:01:03.000Z"
+      },
+      {
+        id: "second-run-completed",
+        sessionId: "session-1",
+        seq: 28,
+        kind: "run.completed",
+        payload: { runId: "run-two" },
+        createdAt: "2026-06-11T09:01:04.000Z"
+      },
+      {
+        id: "second-message-done-status",
+        sessionId: "session-1",
+        seq: 30,
+        kind: "status.update",
+        payload: { phase: "message", status: "done", messageSeq: 4 },
+        createdAt: "2026-06-11T09:01:05.000Z"
+      },
+      {
+        id: "third-run-started",
+        sessionId: "session-1",
+        seq: 31,
+        kind: "run.started",
+        payload: { runId: "run-three" },
+        createdAt: "2026-06-11T09:02:00.000Z"
+      },
+      {
+        id: "session-1:history:4:thinking",
+        sessionId: "session-1",
+        seq: 40,
+        kind: "assistant.thinking",
+        payload: { rawSeq: 4, content: "Thinking for two." },
+        createdAt: "2026-06-11T09:02:01.000Z"
+      },
+      {
+        id: "third-answer",
+        sessionId: "session-1",
+        seq: 42,
+        kind: "assistant.message",
+        payload: { content: "Answer three.", runId: "run-three" },
+        createdAt: "2026-06-11T09:02:02.000Z"
+      },
+      {
+        id: "third-run-completed",
+        sessionId: "session-1",
+        seq: 43,
+        kind: "run.completed",
+        payload: { runId: "run-three" },
+        createdAt: "2026-06-11T09:02:03.000Z"
+      }
+    ]);
+
+    const bridge = createHub53AIBridge({
+      stateDir,
+      config: {
+        enabled: true,
+        botId: "bot-123",
+        secret: "sk-secret",
+        wsUrl: server.url,
+        accessPolicy: "open",
+        allowFrom: [],
+        sendThinkingMessage: false,
+        reconnectBaseMs: 20,
+        maxReconnectAttempts: 2
+      },
+      gateway,
+      callbacks: {
+        onSessionUpsert: async (session) => {
+          gateway.upsertSession(session);
+        },
+        onUserMessage: async () => undefined,
+        onSessionStatus: async () => undefined,
+        onEnsureSessionStream: async () => undefined,
+        listSessionEvents: () => [],
+        getLastEventSeq: () => 0,
+        onStatusChange: () => undefined
+      }
+    });
+
+    await bridge.start();
+    try {
+      const connection = await server.connected;
+      connection.socket.send(
+        JSON.stringify({
+          req_id: "rpc-history-backfill-delayed-thinking-snapshot",
+          action: "sessions.snapshot",
+          status: "request",
+          data: { session_id: "session-1" }
+        })
+      );
+
+      await waitFor(() => {
+        const frame = frameByReq(server.frames, "rpc-history-backfill-delayed-thinking-snapshot");
+        const events = frame?.data?.recent_events || [];
+        const firstDelayedThinking = events.find((event: any) => String(event.raw_event_ref || "").includes("history:2:thinking"));
+        const secondDelayedThinking = events.find((event: any) => String(event.raw_event_ref || "").includes("history:4:thinking"));
+
+        expect(firstDelayedThinking).toMatchObject({
+          protocol_version: "openclaw.ledger.v1",
+          run_id: "run-one",
+          part_type: "thinking",
+          event_type: "part.replace",
+          text: "Thinking for one."
+        });
+        expect(secondDelayedThinking).toMatchObject({
+          protocol_version: "openclaw.ledger.v1",
+          run_id: "run-two",
+          part_type: "thinking",
+          event_type: "part.replace",
+          text: "Thinking for two."
+        });
+        expect(firstDelayedThinking.turn_id).not.toBe(secondDelayedThinking.turn_id);
+      });
+    } finally {
+      await bridge.stop();
+    }
+  });
+
+  it("rewrites stale historical canonical thinking events when the mapped turn changes", async () => {
+    const stateDir = await mkdtemp(join(tmpdir(), "claw-53aihub-rpc-history-backfill-rewrite-"));
+    cleanupPaths.push(stateDir);
+    await writeFile(
+      join(stateDir, "claw-control-center-53aihub.json"),
+      JSON.stringify({
+        mappings: {},
+        outbox: [],
+        canonicalEventsBySession: {
+          "session-1": [
+            {
+              id: "session-1:history:2:thinking",
+              sessionId: "session-1",
+              seq: 20,
+              kind: "assistant.thinking",
+              payload: {
+                content: "Thinking for one.",
+                openclaw_ledger: {
+                  protocol_version: "openclaw.ledger.v1",
+                  seq: 20,
+                  session_id: "session-1",
+                  conversation_id: "session-1",
+                  turn_id: "session-1:turn:history:run-two",
+                  run_id: "run-two",
+                  active_request_id: "history:run-two",
+                  part_id: "session-1:turn:history:run-two:thinking:0",
+                  part_type: "thinking",
+                  event_type: "part.replace",
+                  operation: "replace",
+                  visibility: "final",
+                  text: "Thinking for one.",
+                  created_at: "2026-06-11T09:01:01.000Z",
+                  raw_event_ref: "session-1:20:session-1:history:2:thinking"
+                }
+              },
+              createdAt: "2026-06-11T09:01:01.000Z"
+            }
+          ]
+        }
+      })
+    );
+
+    const server = await createFakeHubServer();
+    cleanupServers.push(server.close);
+
+    const gateway = new FakeGateway();
+    gateway.eventsBySession.set("session-1", [
+      {
+        id: "first-run-started",
+        sessionId: "session-1",
+        seq: 3,
+        kind: "run.started",
+        payload: { runId: "run-one" },
+        createdAt: "2026-06-11T09:00:00.000Z"
+      },
+      {
+        id: "first-message-status",
+        sessionId: "session-1",
+        seq: 14,
+        kind: "status.update",
+        payload: { phase: "message", messageSeq: 2, runId: "run-one" },
+        createdAt: "2026-06-11T09:00:01.000Z"
+      },
+      {
+        id: "first-answer",
+        sessionId: "session-1",
+        seq: 15,
+        kind: "assistant.message",
+        payload: { content: "Answer one.", runId: "run-one" },
+        createdAt: "2026-06-11T09:00:02.000Z"
+      },
+      {
+        id: "first-run-completed",
+        sessionId: "session-1",
+        seq: 16,
+        kind: "run.completed",
+        payload: { runId: "run-one" },
+        createdAt: "2026-06-11T09:00:03.000Z"
+      },
+      {
+        id: "first-message-done-status",
+        sessionId: "session-1",
+        seq: 18,
+        kind: "status.update",
+        payload: { phase: "message", status: "done", messageSeq: 2 },
+        createdAt: "2026-06-11T09:00:04.000Z"
+      },
+      {
+        id: "second-run-started",
+        sessionId: "session-1",
+        seq: 19,
+        kind: "run.started",
+        payload: { runId: "run-two" },
+        createdAt: "2026-06-11T09:01:00.000Z"
+      },
+      {
+        id: "session-1:history:2:thinking",
+        sessionId: "session-1",
+        seq: 20,
+        kind: "assistant.thinking",
+        payload: { rawSeq: 2, content: "Thinking for one." },
+        createdAt: "2026-06-11T09:01:01.000Z"
+      },
+      {
+        id: "second-answer",
+        sessionId: "session-1",
+        seq: 27,
+        kind: "assistant.message",
+        payload: { content: "Answer two.", runId: "run-two" },
+        createdAt: "2026-06-11T09:01:03.000Z"
+      },
+      {
+        id: "second-run-completed",
+        sessionId: "session-1",
+        seq: 28,
+        kind: "run.completed",
+        payload: { runId: "run-two" },
+        createdAt: "2026-06-11T09:01:04.000Z"
+      }
+    ]);
+
+    const bridge = createHub53AIBridge({
+      stateDir,
+      config: {
+        enabled: true,
+        botId: "bot-123",
+        secret: "sk-secret",
+        wsUrl: server.url,
+        accessPolicy: "open",
+        allowFrom: [],
+        sendThinkingMessage: false,
+        reconnectBaseMs: 20,
+        maxReconnectAttempts: 2
+      },
+      gateway,
+      callbacks: {
+        onSessionUpsert: async (session) => {
+          gateway.upsertSession(session);
+        },
+        onUserMessage: async () => undefined,
+        onSessionStatus: async () => undefined,
+        onEnsureSessionStream: async () => undefined,
+        listSessionEvents: () => [],
+        getLastEventSeq: () => 0,
+        onStatusChange: () => undefined
+      }
+    });
+
+    await bridge.start();
+    try {
+      const connection = await server.connected;
+      connection.socket.send(
+        JSON.stringify({
+          req_id: "rpc-history-backfill-rewrite-snapshot",
+          action: "sessions.snapshot",
+          status: "request",
+          data: { session_id: "session-1" }
+        })
+      );
+
+      await waitFor(() => {
+        const frame = frameByReq(server.frames, "rpc-history-backfill-rewrite-snapshot");
+        const events = frame?.data?.recent_events || [];
+        const rewrittenThinking = events.find((event: any) => String(event.raw_event_ref || "").includes("history:2:thinking"));
+
+        expect(rewrittenThinking).toMatchObject({
+          protocol_version: "openclaw.ledger.v1",
+          run_id: "run-one",
+          active_request_id: "history:run-one",
+          part_type: "thinking",
+          text: "Thinking for one."
+        });
+      });
+    } finally {
+      await bridge.stop();
+    }
+  });
+
+  it("prunes orphaned historical canonical events that no longer map to a complete turn", async () => {
+    const stateDir = await mkdtemp(join(tmpdir(), "claw-53aihub-rpc-history-backfill-orphan-"));
+    cleanupPaths.push(stateDir);
+    await writeFile(
+      join(stateDir, "claw-control-center-53aihub.json"),
+      JSON.stringify({
+        mappings: {},
+        outbox: [],
+        canonicalEventsBySession: {
+          "session-1": [
+            {
+              id: "session-1:history:8:thinking",
+              sessionId: "session-1",
+              seq: 80,
+              kind: "assistant.thinking",
+              payload: {
+                content: "Orphan thinking from a stale history group.",
+                openclaw_ledger: {
+                  protocol_version: "openclaw.ledger.v1",
+                  seq: 80,
+                  session_id: "session-1",
+                  conversation_id: "session-1",
+                  turn_id: "session-1:turn:history:run-orphan",
+                  run_id: "run-orphan",
+                  active_request_id: "history:run-orphan",
+                  part_id: "session-1:turn:history:run-orphan:thinking:80",
+                  part_type: "thinking",
+                  event_type: "part.replace",
+                  operation: "replace",
+                  visibility: "final",
+                  text: "Orphan thinking from a stale history group.",
+                  created_at: "2026-06-11T09:08:01.000Z",
+                  raw_event_ref: "session-1:80:session-1:history:8:thinking"
+                }
+              },
+              createdAt: "2026-06-11T09:08:01.000Z"
+            }
+          ]
+        }
+      })
+    );
+
+    const server = await createFakeHubServer();
+    cleanupServers.push(server.close);
+
+    const gateway = new FakeGateway();
+    gateway.eventsBySession.set("session-1", [
+      {
+        id: "run-started",
+        sessionId: "session-1",
+        seq: 1,
+        kind: "run.started",
+        payload: { runId: "run-current" },
+        createdAt: "2026-06-11T09:00:00.000Z"
+      },
+      {
+        id: "answer-final",
+        sessionId: "session-1",
+        seq: 2,
+        kind: "assistant.message",
+        payload: { content: "Current answer.", runId: "run-current" },
+        createdAt: "2026-06-11T09:00:01.000Z"
+      },
+      {
+        id: "run-completed",
+        sessionId: "session-1",
+        seq: 3,
+        kind: "run.completed",
+        payload: { runId: "run-current" },
+        createdAt: "2026-06-11T09:00:02.000Z"
+      }
+    ]);
+
+    const bridge = createHub53AIBridge({
+      stateDir,
+      config: {
+        enabled: true,
+        botId: "bot-123",
+        secret: "sk-secret",
+        wsUrl: server.url,
+        accessPolicy: "open",
+        allowFrom: [],
+        sendThinkingMessage: false,
+        reconnectBaseMs: 20,
+        maxReconnectAttempts: 2
+      },
+      gateway,
+      callbacks: {
+        onSessionUpsert: async (session) => {
+          gateway.upsertSession(session);
+        },
+        onUserMessage: async () => undefined,
+        onSessionStatus: async () => undefined,
+        onEnsureSessionStream: async () => undefined,
+        listSessionEvents: () => [],
+        getLastEventSeq: () => 0,
+        onStatusChange: () => undefined
+      }
+    });
+
+    await bridge.start();
+    try {
+      const connection = await server.connected;
+      connection.socket.send(
+        JSON.stringify({
+          req_id: "rpc-history-backfill-orphan-snapshot",
+          action: "sessions.snapshot",
+          status: "request",
+          data: { session_id: "session-1" }
+        })
+      );
+
+      await waitFor(() => {
+        const frame = frameByReq(server.frames, "rpc-history-backfill-orphan-snapshot");
+        expect(frame).toMatchObject({
+          action: "sessions.snapshot",
+          status: "done",
+          data: {
+            active_turns: []
+          }
+        });
+
+        const events = frame?.data?.recent_events || [];
+        expect(events.some((event: any) => event.run_id === "run-orphan")).toBe(false);
+        expect(events.some((event: any) => String(event.text || "").includes("Orphan thinking"))).toBe(false);
+        expect(events.some((event: any) => event.run_id === "run-current" && event.event_type === "turn.completed")).toBe(true);
+      });
+    } finally {
+      await bridge.stop();
+    }
+  });
+
+  it("does not expose historical running turn when same run already completed", async () => {
+    const stateDir = await mkdtemp(join(tmpdir(), "claw-53aihub-rpc-history-running-completed-run-"));
+    cleanupPaths.push(stateDir);
+    await writeFile(
+      join(stateDir, "claw-control-center-53aihub.json"),
+      JSON.stringify({
+        mappings: {},
+        outbox: [],
+        canonicalEventsBySession: {
+          "session-1": [
+            {
+              id: "session-1:46:run.started",
+              sessionId: "session-1",
+              seq: 46,
+              kind: "run.started",
+              payload: {
+                openclaw_ledger: {
+                  protocol_version: "openclaw.ledger.v1",
+                  seq: 46,
+                  session_id: "session-1",
+                  conversation_id: "session-1",
+                  turn_id: "session-1:turn:req-live",
+                  run_id: "run-shared",
+                  active_request_id: "req-live",
+                  part_id: "session-1:turn:req-live:status",
+                  part_type: "status",
+                  event_type: "turn.started",
+                  operation: "noop",
+                  visibility: "hidden",
+                  terminal_status: "running",
+                  created_at: "2026-06-11T09:00:00.000Z",
+                  raw_event_ref: "session-1:46:run.started"
+                }
+              },
+              createdAt: "2026-06-11T09:00:00.000Z"
+            },
+            {
+              id: "session-1:53:assistant.message",
+              sessionId: "session-1",
+              seq: 53,
+              kind: "assistant.message",
+              payload: {
+                content: "Live final answer.",
+                openclaw_ledger: {
+                  protocol_version: "openclaw.ledger.v1",
+                  seq: 53,
+                  session_id: "session-1",
+                  conversation_id: "session-1",
+                  turn_id: "session-1:turn:req-live",
+                  run_id: "run-shared",
+                  active_request_id: "req-live",
+                  part_id: "session-1:turn:req-live:answer:0",
+                  part_type: "answer",
+                  event_type: "part.replace",
+                  operation: "replace",
+                  visibility: "final",
+                  text: "Live final answer.",
+                  created_at: "2026-06-11T09:00:05.000Z",
+                  raw_event_ref: "session-1:53:assistant.message"
+                }
+              },
+              createdAt: "2026-06-11T09:00:05.000Z"
+            },
+            {
+              id: "session-1:57:run.completed",
+              sessionId: "session-1",
+              seq: 57,
+              kind: "run.completed",
+              payload: {
+                openclaw_ledger: {
+                  protocol_version: "openclaw.ledger.v1",
+                  seq: 57,
+                  session_id: "session-1",
+                  conversation_id: "session-1",
+                  turn_id: "session-1:turn:req-live",
+                  run_id: "run-shared",
+                  active_request_id: "req-live",
+                  part_id: "session-1:turn:req-live:status",
+                  part_type: "status",
+                  event_type: "turn.completed",
+                  operation: "close",
+                  visibility: "hidden",
+                  terminal_status: "completed",
+                  created_at: "2026-06-11T09:00:07.000Z",
+                  raw_event_ref: "session-1:57:run.completed"
+                }
+              },
+              createdAt: "2026-06-11T09:00:07.000Z"
+            },
+            {
+              id: "session-1:history:8:thinking",
+              sessionId: "session-1",
+              seq: 80,
+              kind: "assistant.thinking",
+              payload: {
+                content: "Historical thinking replay.",
+                openclaw_ledger: {
+                  protocol_version: "openclaw.ledger.v1",
+                  seq: 80,
+                  session_id: "session-1",
+                  conversation_id: "session-1",
+                  turn_id: "session-1:turn:history:run-shared",
+                  run_id: "run-shared",
+                  active_request_id: "history:run-shared",
+                  part_id: "session-1:turn:history:run-shared:thinking:80",
+                  part_type: "thinking",
+                  event_type: "part.replace",
+                  operation: "replace",
+                  visibility: "final",
+                  text: "Historical thinking replay.",
+                  created_at: "2026-06-11T09:00:08.000Z",
+                  raw_event_ref: "session-1:80:session-1:history:8:thinking"
+                }
+              },
+              createdAt: "2026-06-11T09:00:08.000Z"
+            }
+          ]
+        }
+      })
+    );
+
+    const server = await createFakeHubServer();
+    cleanupServers.push(server.close);
+
+    const gateway = new FakeGateway();
+    const bridge = createHub53AIBridge({
+      stateDir,
+      config: {
+        enabled: true,
+        botId: "bot-123",
+        secret: "sk-secret",
+        wsUrl: server.url,
+        accessPolicy: "open",
+        allowFrom: [],
+        sendThinkingMessage: false,
+        reconnectBaseMs: 20,
+        maxReconnectAttempts: 2
+      },
+      gateway,
+      callbacks: {
+        onSessionUpsert: async (session) => {
+          gateway.upsertSession(session);
+        },
+        onUserMessage: async () => undefined,
+        onSessionStatus: async () => undefined,
+        onEnsureSessionStream: async () => undefined,
+        listSessionEvents: () => [],
+        getLastEventSeq: () => 0,
+        onStatusChange: () => undefined
+      }
+    });
+
+    await bridge.start();
+    try {
+      const connection = await server.connected;
+      connection.socket.send(
+        JSON.stringify({
+          req_id: "rpc-history-running-completed-run-snapshot",
+          action: "sessions.snapshot",
+          status: "request",
+          data: { session_id: "session-1" }
+        })
+      );
+
+      await waitFor(() => {
+        const frame = frameByReq(server.frames, "rpc-history-running-completed-run-snapshot");
+        expect(frame).toMatchObject({
+          action: "sessions.snapshot",
+          status: "done",
+          data: {
+            active_turns: []
+          }
+        });
+      });
+    } finally {
+      await bridge.stop();
+    }
+  });
+
+  it("dedupes historical answer backfill when a live canonical answer exists for the same run", async () => {
+    const stateDir = await mkdtemp(join(tmpdir(), "claw-53aihub-rpc-history-answer-dedupe-"));
+    cleanupPaths.push(stateDir);
+    await writeFile(
+      join(stateDir, "claw-control-center-53aihub.json"),
+      JSON.stringify({
+        mappings: {},
+        outbox: [],
+        canonicalEventsBySession: {
+          "session-1": [
+            {
+              id: "session-1:46:run.started",
+              sessionId: "session-1",
+              seq: 46,
+              kind: "run.started",
+              payload: {
+                openclaw_ledger: {
+                  protocol_version: "openclaw.ledger.v1",
+                  seq: 46,
+                  session_id: "session-1",
+                  conversation_id: "session-1",
+                  turn_id: "session-1:turn:req-live",
+                  run_id: "run-shared",
+                  active_request_id: "req-live",
+                  part_id: "session-1:turn:req-live:status",
+                  part_type: "status",
+                  event_type: "turn.started",
+                  operation: "noop",
+                  visibility: "hidden",
+                  terminal_status: "running",
+                  created_at: "2026-06-11T09:00:00.000Z",
+                  raw_event_ref: "session-1:46:run.started"
+                }
+              },
+              createdAt: "2026-06-11T09:00:00.000Z"
+            },
+            {
+              id: "session-1:53:assistant.message",
+              sessionId: "session-1",
+              seq: 53,
+              kind: "assistant.message",
+              payload: {
+                content: "Shared final answer.",
+                openclaw_ledger: {
+                  protocol_version: "openclaw.ledger.v1",
+                  seq: 53,
+                  session_id: "session-1",
+                  conversation_id: "session-1",
+                  turn_id: "session-1:turn:req-live",
+                  run_id: "run-shared",
+                  active_request_id: "req-live",
+                  part_id: "session-1:turn:req-live:answer:0",
+                  part_type: "answer",
+                  event_type: "part.replace",
+                  operation: "replace",
+                  visibility: "final",
+                  text: "Shared final answer.",
+                  payload: { source_kind: "assistant.message" },
+                  created_at: "2026-06-11T09:00:05.000Z",
+                  raw_event_ref: "session-1:53:assistant.message"
+                }
+              },
+              createdAt: "2026-06-11T09:00:05.000Z"
+            },
+            {
+              id: "session-1:57:run.completed",
+              sessionId: "session-1",
+              seq: 57,
+              kind: "run.completed",
+              payload: {
+                openclaw_ledger: {
+                  protocol_version: "openclaw.ledger.v1",
+                  seq: 57,
+                  session_id: "session-1",
+                  conversation_id: "session-1",
+                  turn_id: "session-1:turn:req-live",
+                  run_id: "run-shared",
+                  active_request_id: "req-live",
+                  part_id: "session-1:turn:req-live:status",
+                  part_type: "status",
+                  event_type: "turn.completed",
+                  operation: "close",
+                  visibility: "hidden",
+                  terminal_status: "completed",
+                  created_at: "2026-06-11T09:00:07.000Z",
+                  raw_event_ref: "session-1:57:run.completed"
+                }
+              },
+              createdAt: "2026-06-11T09:00:07.000Z"
+            },
+            {
+              id: "session-1:history:8:answer",
+              sessionId: "session-1",
+              seq: 80,
+              kind: "assistant.message",
+              payload: {
+                content: "Shared final answer.",
+                openclaw_ledger: {
+                  protocol_version: "openclaw.ledger.v1",
+                  seq: 80,
+                  session_id: "session-1",
+                  conversation_id: "session-1",
+                  turn_id: "session-1:turn:history:run-shared",
+                  run_id: "run-shared",
+                  active_request_id: "history:run-shared",
+                  part_id: "session-1:turn:history:run-shared:answer:0",
+                  part_type: "answer",
+                  event_type: "part.replace",
+                  operation: "replace",
+                  visibility: "final",
+                  text: "Shared final answer.",
+                  payload: { source_kind: "assistant.message" },
+                  created_at: "2026-06-11T09:00:08.000Z",
+                  raw_event_ref: "session-1:80:session-1:history:8:answer"
+                }
+              },
+              createdAt: "2026-06-11T09:00:08.000Z"
+            }
+          ]
+        }
+      })
+    );
+
+    const server = await createFakeHubServer();
+    cleanupServers.push(server.close);
+
+    const gateway = new FakeGateway();
+    const bridge = createHub53AIBridge({
+      stateDir,
+      config: {
+        enabled: true,
+        botId: "bot-123",
+        secret: "sk-secret",
+        wsUrl: server.url,
+        accessPolicy: "open",
+        allowFrom: [],
+        sendThinkingMessage: false,
+        reconnectBaseMs: 20,
+        maxReconnectAttempts: 2
+      },
+      gateway,
+      callbacks: {
+        onSessionUpsert: async (session) => {
+          gateway.upsertSession(session);
+        },
+        onUserMessage: async () => undefined,
+        onSessionStatus: async () => undefined,
+        onEnsureSessionStream: async () => undefined,
+        listSessionEvents: () => [],
+        getLastEventSeq: () => 0,
+        onStatusChange: () => undefined
+      }
+    });
+
+    await bridge.start();
+    try {
+      const connection = await server.connected;
+      connection.socket.send(
+        JSON.stringify({
+          req_id: "rpc-history-answer-dedupe-snapshot",
+          action: "sessions.snapshot",
+          status: "request",
+          data: { session_id: "session-1" }
+        })
+      );
+      connection.socket.send(
+        JSON.stringify({
+          req_id: "rpc-history-answer-dedupe-events",
+          action: "sessions.events",
+          status: "request",
+          data: { session_id: "session-1", after_seq: 57, limit: 20, offset: 0 }
+        })
+      );
+
+      await waitFor(() => {
+        const snapshotFrame = frameByReq(server.frames, "rpc-history-answer-dedupe-snapshot");
+        const snapshotAnswers = (snapshotFrame?.data?.recent_events || []).filter(
+          (event: any) => event.part_type === "answer"
+        );
+        expect(snapshotAnswers).toHaveLength(1);
+        expect(snapshotAnswers[0]).toMatchObject({
+          run_id: "run-shared",
+          active_request_id: "req-live",
+          part_id: "session-1:turn:req-live:answer:0",
+          text: "Shared final answer."
+        });
+
+        const eventsFrame = frameByReq(server.frames, "rpc-history-answer-dedupe-events");
+        const replayAnswers = (eventsFrame?.data?.ledger_events || []).filter(
+          (event: any) => event.part_type === "answer"
+        );
+        expect(replayAnswers).toHaveLength(0);
+      });
+    } finally {
+      await bridge.stop();
+    }
+  });
+
+  it("filters stale history turns and mismatched output files when replaying a completed live run", async () => {
+    const stateDir = await mkdtemp(join(tmpdir(), "claw-53aihub-rpc-history-output-scope-"));
+    cleanupPaths.push(stateDir);
+    const sessionId = "session-1";
+    const liveTurnId = `${sessionId}:turn:req-five`;
+    const historyTurnId = `${sessionId}:turn:history:run-five`;
+    const fiveFile = {
+      id: "local:/tmp/test_document_5words.txt",
+      file_name: "test_document_5words.txt",
+      mime_type: "text/plain",
+      size: 15,
+      content: "测试用文档",
+      source_kind: "tool.write"
+    };
+    const staleFiveFile = {
+      id: "local-history-five-stale",
+      file_name: "test_document_5words.txt",
+      mime_type: "text/plain",
+      size: 18,
+      base64: "5rWL6K+V5paH5qGj5YaF5a65"
+    };
+    const leakedFifteenFile = {
+      id: "local-history-fifteen",
+      file_name: "test_document_15words.txt",
+      mime_type: "text/plain",
+      size: 45,
+      base64: "6L+Z5piv5LiA5Liq5YyF5ZCr5Y2B5LqU5Liq5a2X55qE5rWL6K+V5paH5qGj"
+    };
+    const eventWithLedger = (
+      id: string,
+      seq: number,
+      kind: GatewayEvent["kind"],
+      ledger: Record<string, unknown>,
+      extraPayload: Record<string, unknown> = {}
+    ) => ({
+      id,
+      sessionId,
+      seq,
+      kind,
+      payload: {
+        ...extraPayload,
+        openclaw_ledger: {
+          protocol_version: "openclaw.ledger.v1",
+          seq,
+          session_id: sessionId,
+          conversation_id: sessionId,
+          created_at: "2026-06-12T02:20:00.000Z",
+          raw_event_ref: `${sessionId}:${seq}:${id}`,
+          ...ledger
+        }
+      },
+      createdAt: "2026-06-12T02:20:00.000Z"
+    });
+    const outputFileEvent = (
+      id: string,
+      seq: number,
+      ledger: Record<string, unknown>,
+      files: unknown[]
+    ) =>
+      eventWithLedger(
+        id,
+        seq,
+        "process.step",
+        {
+          part_type: "output_file",
+          event_type: "part.replace",
+          operation: "replace",
+          visibility: "final",
+          payload: {
+            process_step: {
+              step_code: "output_files",
+              status: "completed",
+              data: { files }
+            }
+          },
+          ...ledger
+        },
+        {
+          process_step: {
+            step_code: "output_files",
+            status: "completed",
+            data: { files }
+          }
+        }
+      );
+
+    await writeFile(
+      join(stateDir, "claw-control-center-53aihub.json"),
+      JSON.stringify({
+        mappings: {},
+        outbox: [],
+        canonicalEventsBySession: {
+          [sessionId]: [
+            eventWithLedger("live-answer", 10, "assistant.message", {
+              turn_id: liveTurnId,
+              run_id: "run-five",
+              active_request_id: "req-five",
+              part_id: `${liveTurnId}:answer:1`,
+              part_type: "answer",
+              event_type: "part.replace",
+              operation: "replace",
+              visibility: "final",
+              text: "完成！我已经为您生成了一个包含5个字的纯文本测试文档。"
+            }, { content: "完成！我已经为您生成了一个包含5个字的纯文本测试文档。" }),
+            outputFileEvent("live-five-stale-file", 11, {
+              turn_id: liveTurnId,
+              run_id: "run-five",
+              active_request_id: "req-five",
+              part_id: `${liveTurnId}:output_files:name:test_document_5words.txt`
+            }, [staleFiveFile]),
+            outputFileEvent("live-five-final-file", 12, {
+              turn_id: liveTurnId,
+              run_id: "run-five",
+              active_request_id: "req-five",
+              part_id: `${liveTurnId}:output_files:name:test_document_5words.txt`
+            }, [fiveFile]),
+            eventWithLedger("live-completed", 12, "run.completed", {
+              turn_id: liveTurnId,
+              run_id: "run-five",
+              active_request_id: "req-five",
+              part_id: `${liveTurnId}:status`,
+              part_type: "status",
+              event_type: "turn.completed",
+              operation: "close",
+              visibility: "hidden",
+              terminal_status: "completed"
+            }),
+            eventWithLedger("history-duplicate-answer", 12, "assistant.message", {
+              turn_id: historyTurnId,
+              run_id: "run-five",
+              active_request_id: "history:run-five",
+              part_id: `${historyTurnId}:answer:0`,
+              part_type: "answer",
+              event_type: "part.replace",
+              operation: "replace",
+              visibility: "final",
+              text: "完成！我已经为您生成了一个包含5个字的纯文本测试文档。"
+            }, { content: "完成！我已经为您生成了一个包含5个字的纯文本测试文档。" }),
+            outputFileEvent("history-leaked-fifteen-file", 12, {
+              turn_id: historyTurnId,
+              run_id: "run-fifteen",
+              active_request_id: "history:run-five",
+              part_id: `${historyTurnId}:output_files:name:test_document_15words.txt`
+            }, [leakedFifteenFile])
+          ]
+        }
+      })
+    );
+
+    const server = await createFakeHubServer();
+    cleanupServers.push(server.close);
+
+    const gateway = new FakeGateway();
+    const bridge = createHub53AIBridge({
+      stateDir,
+      config: {
+        enabled: true,
+        botId: "bot-123",
+        secret: "sk-secret",
+        wsUrl: server.url,
+        accessPolicy: "open",
+        allowFrom: [],
+        sendThinkingMessage: false,
+        reconnectBaseMs: 20,
+        maxReconnectAttempts: 2
+      },
+      gateway,
+      callbacks: {
+        onSessionUpsert: async (session) => {
+          gateway.upsertSession(session);
+        },
+        onUserMessage: async () => undefined,
+        onSessionStatus: async () => undefined,
+        onEnsureSessionStream: async () => undefined,
+        listSessionEvents: () => [],
+        getLastEventSeq: () => 0,
+        onStatusChange: () => undefined
+      }
+    });
+
+    await bridge.start();
+    try {
+      const connection = await server.connected;
+      connection.socket.send(
+        JSON.stringify({
+          req_id: "rpc-history-output-scope-snapshot",
+          action: "sessions.snapshot",
+          status: "request",
+          data: { session_id: sessionId }
+        })
+      );
+
+      await waitFor(() => {
+        const frame = frameByReq(server.frames, "rpc-history-output-scope-snapshot");
+        const events = frame?.data?.recent_events || [];
+        const answers = events.filter((event: any) => event.part_type === "answer");
+        const outputFiles = events.filter((event: any) => event.part_type === "output_file");
+        expect(answers).toHaveLength(1);
+        expect(answers[0]).toMatchObject({
+          active_request_id: "req-five",
+          part_id: `${liveTurnId}:answer:0`
+        });
+        expect(events.some((event: any) => event.active_request_id === "history:run-five")).toBe(false);
+        expect(JSON.stringify(events)).not.toContain("test_document_15words.txt");
+        expect(outputFiles).toHaveLength(1);
+        expect(outputFiles[0].payload.process_step.data.files).toEqual([
+          expect.objectContaining({
+            file_name: "test_document_5words.txt",
+            content: "测试用文档"
+          })
+        ]);
+        const seqs = events.map((event: any) => event.seq);
+        expect(new Set(seqs).size).toBe(seqs.length);
+      });
+    } finally {
+      await bridge.stop();
+    }
+  });
+
+  it("synthesizes interrupted terminal for orphaned running turn after host restart", async () => {
+    const stateDir = await mkdtemp(join(tmpdir(), "claw-53aihub-rpc-orphan-running-turn-"));
+    cleanupPaths.push(stateDir);
+    await writeFile(
+      join(stateDir, "claw-control-center-53aihub.json"),
+      JSON.stringify({
+        mappings: {},
+        outbox: [],
+        canonicalEventsBySession: {
+          "session-1": [
+            {
+              id: "session-1:1:run.started",
+              sessionId: "session-1",
+              seq: 1,
+              kind: "run.started",
+              payload: {
+                openclaw_ledger: {
+                  protocol_version: "openclaw.ledger.v1",
+                  seq: 1,
+                  session_id: "session-1",
+                  conversation_id: "session-1",
+                  turn_id: "session-1:turn:req-orphan",
+                  run_id: "run-orphan",
+                  active_request_id: "req-orphan",
+                  part_id: "session-1:turn:req-orphan:status",
+                  part_type: "status",
+                  event_type: "turn.started",
+                  operation: "noop",
+                  visibility: "hidden",
+                  terminal_status: "running",
+                  created_at: "2026-06-11T08:00:00.000Z",
+                  raw_event_ref: "session-1:1:run.started"
+                }
+              },
+              createdAt: "2026-06-11T08:00:00.000Z"
+            },
+            {
+              id: "session-1:2:assistant.message",
+              sessionId: "session-1",
+              seq: 2,
+              kind: "assistant.message",
+              payload: {
+                content: "Partial answer before QClaw restarted.",
+                openclaw_ledger: {
+                  protocol_version: "openclaw.ledger.v1",
+                  seq: 2,
+                  session_id: "session-1",
+                  conversation_id: "session-1",
+                  turn_id: "session-1:turn:req-orphan",
+                  run_id: "run-orphan",
+                  active_request_id: "req-orphan",
+                  part_id: "session-1:turn:req-orphan:answer:0",
+                  part_type: "answer",
+                  event_type: "part.replace",
+                  operation: "replace",
+                  visibility: "final",
+                  text: "Partial answer before QClaw restarted.",
+                  created_at: "2026-06-11T08:00:01.000Z",
+                  raw_event_ref: "session-1:2:assistant.message"
+                }
+              },
+              createdAt: "2026-06-11T08:00:01.000Z"
+            }
+          ]
+        }
+      })
+    );
+
+    const server = await createFakeHubServer();
+    cleanupServers.push(server.close);
+
+    const gateway = new FakeGateway();
+    const bridge = createHub53AIBridge({
+      stateDir,
+      config: {
+        enabled: true,
+        botId: "bot-123",
+        secret: "sk-secret",
+        wsUrl: server.url,
+        accessPolicy: "open",
+        allowFrom: [],
+        sendThinkingMessage: false,
+        reconnectBaseMs: 20,
+        maxReconnectAttempts: 2
+      },
+      gateway,
+      callbacks: {
+        onSessionUpsert: async (session) => {
+          gateway.upsertSession(session);
+        },
+        onUserMessage: async () => undefined,
+        onSessionStatus: async () => undefined,
+        onEnsureSessionStream: async () => undefined,
+        listSessionEvents: () => [],
+        getLastEventSeq: () => 0,
+        onStatusChange: () => undefined
+      }
+    });
+
+    await bridge.start();
+    try {
+      const connection = await server.connected;
+      connection.socket.send(
+        JSON.stringify({
+          req_id: "rpc-orphan-running-turn-snapshot",
+          action: "sessions.snapshot",
+          status: "request",
+          data: { session_id: "session-1" }
+        })
+      );
+
+      await waitFor(() => {
+        const frame = frameByReq(server.frames, "rpc-orphan-running-turn-snapshot");
+        expect(frame).toMatchObject({
+          action: "sessions.snapshot",
+          status: "done",
+          data: {
+            active_turns: []
+          }
+        });
+
+        const terminal = frame?.data?.recent_events?.find(
+          (event: any) =>
+            event.turn_id === "session-1:turn:req-orphan" &&
+            event.event_type === "turn.interrupted" &&
+            event.terminal_status === "interrupted"
+        );
+        expect(terminal).toMatchObject({
+          active_request_id: "req-orphan",
+          run_id: "run-orphan",
+          raw_event_ref: expect.stringContaining("orphaned_running_turn_after_host_restart")
+        });
+      });
+    } finally {
+      await bridge.stop();
+    }
+  });
+
   it("filters synthetic bridge tool placeholder thinking events from sessions.events history", async () => {
     const stateDir = await mkdtemp(join(tmpdir(), "claw-53aihub-rpc-events-"));
     cleanupPaths.push(stateDir);
@@ -4697,6 +6954,232 @@ describe("53AIHub client", () => {
             pagination: { limit: 10, offset: 0, total: 3, hasMore: false }
           }
         });
+      });
+    } finally {
+      await bridge.stop();
+    }
+  });
+
+  it("normalizes cumulative answer snapshots after write tools and emits canonical output files", async () => {
+    const stateDir = await mkdtemp(join(tmpdir(), "claw-53aihub-cumulative-write-output-"));
+    cleanupPaths.push(stateDir);
+
+    const server = await createFakeHubServer();
+    cleanupServers.push(server.close);
+
+    const gateway = new FakeGateway();
+    const sessionId = "agent:main:dashboard:cumulative-write";
+    const intro = "好的！我来为您生成一个包含15个字的纯文本测试文档。";
+    const final = [
+      "完成！我已经为您生成了一个包含15个字的纯文本测试文档。",
+      "",
+      "**文件信息：**",
+      "- 文件路径：`/tmp/test_document_15words.txt`",
+      "- 文件内容：`这是一个包含十五个字的测试文档`",
+    ].join("\n");
+    gateway.upsertSession({
+      id: sessionId,
+      title: "53AI Hub-Alex：测试",
+      status: "idle",
+      hostKind: "openclaw",
+      runnerCommand: "gateway",
+      createdAt: "2026-06-12T01:57:00.000Z",
+      updatedAt: "2026-06-12T01:57:00.000Z",
+      lastEventSeq: 0
+    });
+    gateway.eventsToEmit = [
+      {
+        id: "run-started",
+        sessionId,
+        seq: 1,
+        kind: "run.started",
+        payload: { runId: "run-write" },
+        createdAt: "2026-06-12T01:57:00.000Z"
+      },
+      {
+        id: "answer-intro",
+        sessionId,
+        seq: 2,
+        kind: "assistant.delta",
+        payload: { content: intro, runId: "run-write", rawSeq: 53 },
+        createdAt: "2026-06-12T01:57:05.000Z"
+      },
+      {
+        id: "thinking-before-intro-but-late",
+        sessionId,
+        seq: 3,
+        kind: "assistant.thinking",
+        payload: { content: "先分析十五字文档。", runId: "run-write", rawSeq: 49 },
+        createdAt: "2026-06-12T01:57:01.000Z"
+      },
+      {
+        id: "tool-call-write",
+        sessionId,
+        seq: 4,
+        kind: "tool.call",
+        payload: {
+          runId: "run-write",
+          rawSeq: 54,
+          data: {
+            phase: "start",
+            name: "write",
+            toolCallId: "tool-write-1",
+            args: {
+              path: "/tmp/test_document_15words.txt",
+              content: "这是一个包含十五个字的测试文档"
+            }
+          }
+        },
+        createdAt: "2026-06-12T01:57:06.000Z"
+      },
+      {
+        id: "tool-result-write",
+        sessionId,
+        seq: 5,
+        kind: "tool.result",
+        payload: {
+          runId: "run-write",
+          rawSeq: 56,
+          data: {
+            phase: "result",
+            name: "write",
+            toolCallId: "tool-write-1",
+            isError: false
+          }
+        },
+        createdAt: "2026-06-12T01:57:07.000Z"
+      },
+      {
+        id: "answer-cumulative",
+        sessionId,
+        seq: 6,
+        kind: "assistant.delta",
+        payload: {
+          content: `${intro}${final}`,
+          runId: "run-write",
+          rawSeq: 129,
+          mode: "replace",
+          replace: true
+        },
+        createdAt: "2026-06-12T01:57:12.000Z"
+      },
+      {
+        id: "thinking-delayed-before-final",
+        sessionId,
+        seq: 7,
+        kind: "assistant.thinking",
+        payload: { content: "复核工具写入结果。", runId: "run-write", rawSeq: 51 },
+        createdAt: "2026-06-12T01:57:08.000Z"
+      },
+      {
+        id: "answer-final-cumulative",
+        sessionId,
+        seq: 8,
+        kind: "assistant.message",
+        payload: {
+          content: `${intro}${final}`,
+          runId: "run-write",
+          rawSeq: 136,
+          mode: "replace"
+        },
+        createdAt: "2026-06-12T01:57:13.000Z"
+      },
+      {
+        id: "run-completed",
+        sessionId,
+        seq: 9,
+        kind: "run.completed",
+        payload: { runId: "run-write" },
+        createdAt: "2026-06-12T01:57:14.000Z"
+      }
+    ];
+
+    const bridge = createHub53AIBridge({
+      stateDir,
+      config: {
+        enabled: true,
+        botId: "bot-123",
+        secret: "sk-secret",
+        wsUrl: server.url,
+        accessPolicy: "open",
+        allowFrom: [],
+        sendThinkingMessage: false,
+        reconnectBaseMs: 20,
+        maxReconnectAttempts: 2
+      },
+      gateway,
+      callbacks: {
+        onSessionUpsert: async (session) => {
+          gateway.upsertSession(session);
+        },
+        onUserMessage: async () => undefined,
+        onSessionStatus: async () => undefined,
+        onEnsureSessionStream: async () => undefined,
+        getLastEventSeq: () => 0,
+        onStatusChange: () => undefined
+      }
+    });
+
+    await bridge.start();
+    try {
+      const connection = await server.connected;
+      connection.socket.send(
+        JSON.stringify({
+          req_id: "req-cumulative-write",
+          action: "chat",
+          data: {
+            user: "agenthub_u2001",
+            conversation_id: sessionId,
+            metadata: { openclaw_client_message_id: "client-cumulative-write" },
+            messages: [{ role: "user", content: "生成一个十五字的测试文档" }]
+          }
+        })
+      );
+
+      await waitFor(() => {
+        expect(server.frames.some((frame) => frame.req_id === "req-cumulative-write" && frame.status === "done")).toBe(true);
+      });
+
+      connection.socket.send(
+        JSON.stringify({
+          req_id: "rpc-cumulative-write-snapshot",
+          action: "sessions.snapshot",
+          status: "request",
+          data: { session_id: sessionId }
+        })
+      );
+
+      await waitFor(() => {
+        const frame = frameByReq(server.frames, "rpc-cumulative-write-snapshot");
+        const events = frame?.data?.recent_events || [];
+        const answers = events.filter((event: any) => event.part_type === "answer");
+        const finalAnswer = answers.find((event: any) => String(event.part_id).endsWith(":answer:0") && event.visibility === "final");
+        expect(answers.map((event: any) => event.part_id.split(":").slice(-2).join(":"))).not.toContain("answer:1");
+        expect(finalAnswer).toMatchObject({
+          part_type: "answer",
+          operation: "replace",
+          text: `${intro}${final}`
+        });
+        expect(finalAnswer.text).toBe(`${intro}${final}`);
+        expect(events).toEqual(
+          expect.arrayContaining([
+            expect.objectContaining({
+              part_type: "output_file",
+              payload: expect.objectContaining({
+                process_step: expect.objectContaining({
+                  data: expect.objectContaining({
+                    files: expect.arrayContaining([
+                      expect.objectContaining({
+                        file_name: "test_document_15words.txt",
+                        content: "这是一个包含十五个字的测试文档"
+                      })
+                    ])
+                  })
+                })
+              })
+            })
+          ])
+        );
       });
     } finally {
       await bridge.stop();
