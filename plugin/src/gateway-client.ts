@@ -2150,6 +2150,7 @@ function normalizeMessage(sessionId: string, payload: unknown, index = 0): Sessi
 
   const message = payload as Record<string, unknown>;
   const role = typeof message.role === "string" ? message.role : "assistant";
+  const typedTextSegments = extractTextSegments(message.content);
   const content = extractTextContent(message.content) ?? (typeof message.content === "string" ? message.content : "");
   if (!content.trim()) {
     return null;
@@ -2170,6 +2171,18 @@ function normalizeMessage(sessionId: string, payload: unknown, index = 0): Sessi
   const existingPayload = toRecord(message.payload);
   const existingMetadata = toRecord(message.metadata);
   const existingData = toRecord(message.data);
+  const responseId = stringProperty(message, ["responseId", "response_id"]);
+  const runId = stringProperty(message, ["runId", "run_id"]);
+  const typedTranscriptMeta = {
+    ...(typedTextSegments.length > 0
+      ? {
+          openclaw_typed_text_segments: typedTextSegments,
+          openclaw_typed_text_segment_count: typedTextSegments.length
+        }
+      : {}),
+    ...(responseId ? { responseId, response_id: responseId } : {}),
+    ...(runId ? { runId, run_id: runId } : {})
+  };
   const seqMeta =
     seq > 0
       ? {
@@ -2193,34 +2206,38 @@ function normalizeMessage(sessionId: string, payload: unknown, index = 0): Sessi
           message_seq: seq
         }
       : {}),
-    ...(Object.keys(existingPayload).length > 0 || seq > 0
+    ...(Object.keys(existingPayload).length > 0 || Object.keys(typedTranscriptMeta).length > 0 || seq > 0
       ? {
           payload: {
             ...existingPayload,
+            ...typedTranscriptMeta,
             ...seqMeta
           }
         }
       : {}),
-    ...(Object.keys(existingMetadata).length > 0 || seq > 0
+    ...(Object.keys(existingMetadata).length > 0 || Object.keys(typedTranscriptMeta).length > 0 || seq > 0
       ? {
           metadata: {
             ...existingMetadata,
+            ...typedTranscriptMeta,
             ...seqMeta
           }
         }
       : {}),
-    ...(Object.keys(existingData).length > 0 || seq > 0
+    ...(Object.keys(existingData).length > 0 || Object.keys(typedTranscriptMeta).length > 0 || seq > 0
       ? {
           data: {
             ...existingData,
+            ...typedTranscriptMeta,
             ...seqMeta
           }
         }
       : {}),
-    ...(Object.keys(rawMeta).length > 0 || seq > 0
+    ...(Object.keys(rawMeta).length > 0 || Object.keys(typedTranscriptMeta).length > 0 || seq > 0
       ? {
           __openclaw: {
             ...rawMeta,
+            ...typedTranscriptMeta,
             ...(seq > 0 ? { seq } : {})
           }
         }
@@ -2997,11 +3014,17 @@ function extractTextContent(content: unknown): string | null {
   if (typeof content === "string") {
     return content;
   }
+  const lines = extractTextSegments(content);
+
+  return lines.length > 0 ? lines.join("\n") : null;
+}
+
+function extractTextSegments(content: unknown): string[] {
   if (!Array.isArray(content)) {
-    return null;
+    return [];
   }
 
-  const lines = content
+  return content
     .flatMap((item) => {
       if (!item || typeof item !== "object") {
         return [];
@@ -3013,8 +3036,6 @@ function extractTextContent(content: unknown): string | null {
       return [];
     })
     .filter((value) => value.trim().length > 0);
-
-  return lines.length > 0 ? lines.join("\n") : null;
 }
 
 function extractThinkingContent(content: unknown): string | null {
