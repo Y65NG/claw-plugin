@@ -17,8 +17,8 @@ echo "Installing 53AI-OpenClaw into the current Claw host..."
 echo "The installer will auto-detect local Claw paths and ask when multiple hosts are found."
 
 if ! command -v npx >/dev/null 2>&1; then
-  echo "npx is required to install claw-control-center. Please install Node.js and npm first." >&2
+  echo "npx is required to install @53ai/53ai-openclaw. Please install Node.js and npm first." >&2
   exit 1
 fi
 
-exec npx --yes --registry=https://registry.npmjs.org/ claw-control-center install "$@"
+exec npx --yes --registry=https://registry.npmjs.org/ @53ai/53ai-openclaw@latest install "$@"

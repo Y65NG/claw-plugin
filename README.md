@@ -27,7 +27,7 @@
   -> CHANGELOG.md          # 旧版 release 记录与新版分支说明
 ```
 
-当前插件 ID 为 `claw-control-center`，其中包含 53AIHub bridge。发布到公司 npm 作用域时，可按发布策略将包名调整为 `@53ai/53ai-openclaw`。
+当前 npm 包名为 `@53ai/53ai-openclaw`，OpenClaw 插件 ID 保持为 `claw-control-center`，其中包含 53AIHub bridge。
 
 ## 安装方式
 
@@ -46,7 +46,7 @@ curl -fsSL https://raw.githubusercontent.com/53AI/53AI-OpenClaw/main/install.sh 
 
 如果用户是在普通终端手动执行同一条 curl 命令，安装器会扫描当前用户电脑上的 QClaw / OpenClaw / Hermes / WorkBuddy。只发现一个兼容宿主时会直接安装；发现多个宿主时会显示安装位置列表，让用户选择一个写入插件。OpenClaw / QClaw 会安装 `openclaw.plugin.json` 扩展；Hermes 会安装 `plugin.yaml` 平台适配器，并把 53AIHub 连接参数写入 `~/.hermes/.env`；WorkBuddy 会安装 CodeBuddy Channel 插件并写入本地 marketplace。
 
-如发布包名调整为 `@53ai/53ai-openclaw`，`install.sh` 中调用的 npm 包名也应同步调整。
+`install.sh` 中调用的 npm 包名为 `@53ai/53ai-openclaw`，插件写入 OpenClaw / QClaw 配置时仍使用插件 ID `claw-control-center`。
 
 ### 方式二：本地开发调试安装
 
@@ -98,7 +98,7 @@ node plugin/bin/install-qclaw.mjs install \
 WorkBuddy / CodeBuddy 不使用 OpenClaw Gateway Protocol。发布后的云端命令仍然使用统一的 `install` 子命令；安装器会把 WorkBuddy 作为兼容宿主自动发现，并在用户选择 WorkBuddy 后安装到本地 marketplace `my-experts`：
 
 ```bash
-npx claw-control-center@latest install \
+npx @53ai/53ai-openclaw@latest install \
   --hub-bot-id "<bot-id>" \
   --hub-secret "<secret>" \
   --hub-ws-url "ws://kmapitest.53ai.com/api/v1/openclaw/ws/connect"
@@ -199,7 +199,7 @@ pnpm pack
 2. 宿主集成安装：OpenClaw / QClaw / Hermes 可显式传入 `--config-path` 与 `--extensions-dir`，由宿主决定安装位置；WorkBuddy 可显式传入 `--workbuddy-home`。
 
 ```bash
-npx claw-control-center install \
+npx @53ai/53ai-openclaw@latest install \
   --hub-bot-id "<bot-id>" \
   --hub-secret "<secret>" \
   --hub-ws-url "<hub-ws-url>"
@@ -210,7 +210,7 @@ npx claw-control-center install \
 如果宿主提供精确路径，则使用：
 
 ```bash
-npx claw-control-center install \
+npx @53ai/53ai-openclaw@latest install \
   --config-path "<claw-openclaw-json-path>" \
   --extensions-dir "<claw-extensions-dir>" \
   --hub-bot-id "<bot-id>" \

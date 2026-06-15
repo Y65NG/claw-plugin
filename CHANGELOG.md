@@ -4,6 +4,12 @@ All notable changes to this project will be documented in this file.
 
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/).
 
+## [1.1.2] - 2026-06-15
+
+### Changed
+- 将 npm 发布包名切换为 `@53ai/53ai-openclaw`，并保留 OpenClaw 插件 ID `claw-control-center` 以兼容既有本地配置。
+- 更新一键安装脚本和工作区脚本，使发布后的安装入口指向公司 npm 作用域包。
+
 ## [0.1.8] - 2026-06-01
 
 ### Added
