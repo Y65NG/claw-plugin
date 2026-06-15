@@ -3,9 +3,9 @@
   "private": true,
   "packageManager": "pnpm@10.33.0",
   "scripts": {
-    "build": "pnpm --filter @claw-plugin/web build && pnpm --filter claw-control-center build",
-    "test": "pnpm --filter claw-control-center test && pnpm --filter @claw-plugin/web test",
-    "test:plugin": "pnpm --filter claw-control-center test",
+    "build": "pnpm --filter @claw-plugin/web build && pnpm --filter @53ai/53ai-openclaw build",
+    "test": "pnpm --filter @53ai/53ai-openclaw test && pnpm --filter @claw-plugin/web test",
+    "test:plugin": "pnpm --filter @53ai/53ai-openclaw test",
     "test:web": "pnpm --filter @claw-plugin/web test"
   }
 }
