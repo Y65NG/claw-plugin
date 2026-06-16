@@ -87,7 +87,10 @@ type ParsedArgs = {
   "console-host"?: string;
   "console-port"?: string;
   "workbuddy-home"?: string;
+  "host-kind"?: string;
 };
+
+type InstallHostKind = "openclaw" | "qclaw" | "hermes" | "workbuddy" | "codex";
 
 export type HostDefinition = {
   id: string;
@@ -113,6 +116,19 @@ export type PromptSelectHost = (
   hosts: HostDefinition[],
   incompatibleHosts: HostDefinition[]
 ) => Promise<HostDefinition>;
+
+export type FastSearchExec = (
+  file: string,
+  args: string[],
+  options: { timeout: number; maxBuffer: number }
+) => Promise<{ stdout?: unknown; stderr?: unknown }>;
+
+export type HostDetectionOptions = {
+  platform?: NodeJS.Platform;
+  env?: NodeJS.ProcessEnv;
+  homeDir?: string;
+  fastSearchExec?: FastSearchExec;
+};
 
 type OpenClawConfig = {
   gateway?: {
@@ -184,6 +200,9 @@ const WORKBUDDY_SHARED_SESSION_ID = "53aihub-workbuddy-shared";
 const WORKBUDDY_HISTORY_SCOPE = "all";
 const CODEX_CHANNEL_INSTALL_ROOT = join(homedir(), ".53ai", "codex-channel");
 const CODEX_CHANNEL_LAUNCH_AGENT_LABEL = "com.53ai.codex-channel";
+const FAST_SEARCH_TIMEOUT_MS = 3_000;
+const FAST_SEARCH_MAX_BUFFER = 256 * 1024;
+const FAST_SEARCH_MAX_RESULTS = 40;
 const HERMES_ENV_KEYS = {
   botId: "HUB53AI_BOT_ID",
   secret: "HUB53AI_SECRET",
@@ -204,8 +223,10 @@ const SUPPORTED_ARGS = new Set([
   "config-path",
   "console-host",
   "console-port",
-  "workbuddy-home"
+  "workbuddy-home",
+  "host-kind"
 ]);
+const INSTALL_HOST_KINDS = new Set<InstallHostKind>(["openclaw", "qclaw", "hermes", "workbuddy", "codex"]);
 
 export async function installIntoQClaw(input: InstallInput): Promise<{
   configPath: string;
@@ -713,6 +734,10 @@ export async function runInstallCommand(input: {
   selectHost?: (hosts: HostDefinition[]) => Promise<HostDefinition>;
   promptSelectHost?: PromptSelectHost;
   ttyPath?: string;
+  platform?: NodeJS.Platform;
+  env?: NodeJS.ProcessEnv;
+  homeDir?: string;
+  fastSearchExec?: FastSearchExec;
 }): Promise<void> {
   const argv = input.argv ?? process.argv.slice(2);
   if (argv[0] !== "install" && argv[0] !== "install-workbuddy" && argv[0] !== "install-codex") {
@@ -758,7 +783,11 @@ export async function runInstallCommand(input: {
     selectHosts: input.selectHosts,
     selectHost: input.selectHost,
     promptSelectHost: input.promptSelectHost,
-    ttyPath: input.ttyPath
+    ttyPath: input.ttyPath,
+    platform: input.platform,
+    env: input.env,
+    homeDir: input.homeDir,
+    fastSearchExec: input.fastSearchExec
   });
 
   for (const destination of destinations) {
@@ -841,22 +870,29 @@ async function resolveInstallDestinations(
     selectHost?: (hosts: HostDefinition[]) => Promise<HostDefinition>;
     promptSelectHost?: PromptSelectHost;
     ttyPath?: string;
-  } = {}
+  } & HostDetectionOptions = {}
 ): Promise<InstallDestination[]> {
   const explicitConfigPath = args["config-path"] ? resolve(args["config-path"]) : undefined;
   const explicitExtensionsDir = args["extensions-dir"] ? resolve(args["extensions-dir"]) : undefined;
   const explicitWorkBuddyHome = args["workbuddy-home"] ? resolve(args["workbuddy-home"]) : undefined;
+  const hostKind = parseInstallHostKind(args["host-kind"]);
 
   if (explicitWorkBuddyHome) {
     if (explicitConfigPath || explicitExtensionsDir) {
       throw new Error("pass --workbuddy-home by itself, or pass --config-path and --extensions-dir together for Claw-style hosts");
     }
+    if (hostKind && hostKind !== "workbuddy") {
+      throw new Error(`--workbuddy-home can only be combined with --host-kind workbuddy, got ${hostKind}`);
+    }
     return [toInstallDestination(createWorkBuddyHostDefinition(explicitWorkBuddyHome))];
   }
 
   if (explicitConfigPath && explicitExtensionsDir) {
-    const hermes = isHermesDestination(explicitConfigPath, explicitExtensionsDir);
-    const clawLabel = inferDetectedClawLabel(explicitConfigPath, explicitExtensionsDir);
+    if (hostKind === "codex" || hostKind === "workbuddy") {
+      throw new Error(`--host-kind ${hostKind} cannot be combined with --config-path and --extensions-dir`);
+    }
+    const hermes = hostKind === "hermes" || isHermesDestination(explicitConfigPath, explicitExtensionsDir);
+    const clawLabel = hostKind ? labelForHostKind(hostKind) : inferDetectedClawLabel(explicitConfigPath, explicitExtensionsDir);
     return [{
       configPath: explicitConfigPath,
       extensionsDir: hermes ? normalizeHermesPlatformsDir(explicitExtensionsDir) : explicitExtensionsDir,
@@ -869,9 +905,18 @@ async function resolveInstallDestinations(
     throw new Error("pass --config-path and --extensions-dir together, or omit both to auto-detect compatible agents");
   }
 
-  const detected = detectInstallHosts(options.hostDefinitions ?? getDefaultHostDefinitions());
-  const compatible = detected;
+  const hostDefinitions = options.hostDefinitions ?? getDefaultHostDefinitions(options);
+  const detected = await detectInstallHostsWithSearch(
+    hostDefinitions,
+    hostKind,
+    options,
+    Boolean(options.hostDefinitions) && !options.fastSearchExec
+  );
+  const compatible = hostKind ? filterHostsByKind(detected, hostKind) : detected;
   const incompatible: HostDefinition[] = [];
+  if (hostKind && compatible.length > 0) {
+    return [toInstallDestination(compatible[0]!)];
+  }
   if (compatible.length > 0) {
     const selected = options.selectHosts
       ? validateSingleSelectedHost(await options.selectHosts(compatible, incompatible), compatible)
@@ -882,30 +927,32 @@ async function resolveInstallDestinations(
   }
   throw new Error(
     [
-      "could not auto-detect an installed compatible agent.",
+      hostKind
+        ? `could not auto-detect an installed ${labelForHostKind(hostKind)} agent.`
+        : "could not auto-detect an installed compatible agent.",
       "Pass --config-path and --extensions-dir to install into a specific Claw-style host.",
       "Pass --workbuddy-home to install into a specific WorkBuddy home.",
-      "Use install-codex to install the 53AIHub Codex channel when Codex is installed locally.",
+      "Use --host-kind openclaw, --host-kind qclaw, or --host-kind codex to skip cross-agent selection.",
       "",
       "Supported default locations:",
-      ...formatHostList(options.hostDefinitions ?? getDefaultHostDefinitions())
+      ...formatHostList(hostKind ? filterHostsByKind(hostDefinitions, hostKind) : hostDefinitions)
     ].join("\n")
   );
 }
 
-function getDefaultHostDefinitions(): HostDefinition[] {
-  const home = homedir();
+function getDefaultHostDefinitions(options: HostDetectionOptions = {}): HostDefinition[] {
+  const home = getDetectionHomeDir(options);
   const qclawHome = resolve(home, ".qclaw");
   const openClawHome = resolve(home, ".openclaw");
   const hermesHome = resolve(home, ".hermes");
   const workbuddyHome = resolve(home, ".workbuddy");
-  const codexHost = createCodexHostDefinition();
+  const codexHost = createCodexHostDefinition(options);
   return [
     {
       id: "qclaw",
       label: "QClaw",
       configPath: join(qclawHome, "openclaw.json"),
-      extensionsDir: resolve(home, "Library/Application Support/QClaw/openclaw/config/extensions")
+      extensionsDir: getQClawExtensionsDirCandidates(options)[0] ?? resolve(qclawHome, "extensions")
     },
     {
       id: "openclaw",
@@ -925,11 +972,274 @@ function getDefaultHostDefinitions(): HostDefinition[] {
   ];
 }
 
+export function getQClawExtensionsDirCandidates(options: HostDetectionOptions = {}): string[] {
+  const home = getDetectionHomeDir(options);
+  const env = options.env ?? process.env;
+  const platform = options.platform ?? process.platform;
+  const candidates: string[] = [];
+
+  if (platform === "darwin") {
+    candidates.push(join(home, "Library", "Application Support", "QClaw", "openclaw", "config", "extensions"));
+  } else if (platform === "win32") {
+    const appData = env.APPDATA || join(home, "AppData", "Roaming");
+    const localAppData = env.LOCALAPPDATA || join(home, "AppData", "Local");
+    candidates.push(
+      join(appData, "QClaw", "openclaw", "config", "extensions"),
+      join(localAppData, "QClaw", "openclaw", "config", "extensions")
+    );
+  } else {
+    const xdgConfigHome = env.XDG_CONFIG_HOME || join(home, ".config");
+    const xdgDataHome = env.XDG_DATA_HOME || join(home, ".local", "share");
+    candidates.push(
+      join(xdgConfigHome, "QClaw", "openclaw", "config", "extensions"),
+      join(xdgDataHome, "QClaw", "openclaw", "config", "extensions")
+    );
+  }
+
+  candidates.push(join(home, ".qclaw", "extensions"));
+  return dedupeStrings(candidates.map((candidate) => resolve(candidate)));
+}
+
+async function detectInstallHostsWithSearch(
+  hostDefinitions: HostDefinition[],
+  hostKind: InstallHostKind | undefined,
+  options: HostDetectionOptions,
+  skipSearch: boolean
+): Promise<HostDefinition[]> {
+  const detected = detectInstallHosts(hostDefinitions);
+  if (skipSearch || (!hostKind && detected.length > 0) || (hostKind && filterHostsByKind(detected, hostKind).length > 0)) {
+    return detected;
+  }
+
+  const searched = await searchInstallHostDefinitions(hostKind, options);
+  return detectInstallHosts([...hostDefinitions, ...searched]);
+}
+
+async function searchInstallHostDefinitions(
+  hostKind: InstallHostKind | undefined,
+  options: HostDetectionOptions
+): Promise<HostDefinition[]> {
+  if (hostKind === "codex" || hostKind === "workbuddy" || hostKind === "hermes") {
+    return [];
+  }
+
+  const configPaths = await fastSearchOpenClawConfigPaths(options);
+  return configPaths
+    .map((configPath) => createSearchedClawHostDefinition(configPath, options))
+    .filter((host): host is HostDefinition => Boolean(host))
+    .filter((host) => !hostKind || getHostKind(host) === hostKind);
+}
+
+async function fastSearchOpenClawConfigPaths(options: HostDetectionOptions): Promise<string[]> {
+  const exec = options.fastSearchExec ?? (execFileAsync as FastSearchExec);
+  const platform = options.platform ?? process.platform;
+  const roots = getBoundedSearchRoots(options).filter((root) => existsSync(root));
+  const results: string[] = [];
+
+  for (const root of roots) {
+    if (results.length >= FAST_SEARCH_MAX_RESULTS) {
+      break;
+    }
+    const remaining = FAST_SEARCH_MAX_RESULTS - results.length;
+    const found = await runFastSearchCommand(exec, platform, root, remaining);
+    results.push(...found);
+  }
+
+  return dedupeStrings(results.map((entry) => resolve(entry.trim())).filter(Boolean)).slice(0, FAST_SEARCH_MAX_RESULTS);
+}
+
+async function runFastSearchCommand(
+  exec: FastSearchExec,
+  platform: NodeJS.Platform,
+  root: string,
+  maxResults: number
+): Promise<string[]> {
+  if (platform === "darwin") {
+    const mdfind = await tryFastSearch(exec, "mdfind", ["-onlyin", root, "kMDItemFSName == 'openclaw.json'"]);
+    return mdfind.slice(0, maxResults);
+  }
+
+  if (platform === "win32") {
+    const command = [
+      "Get-ChildItem",
+      "-LiteralPath",
+      quotePowerShellLiteral(root),
+      "-Filter",
+      "openclaw.json",
+      "-File",
+      "-Recurse",
+      "-ErrorAction",
+      "SilentlyContinue",
+      "|",
+      "Select-Object",
+      "-First",
+      String(maxResults),
+      "-ExpandProperty",
+      "FullName"
+    ].join(" ");
+    const powershell = await tryFastSearch(exec, "powershell.exe", ["-NoProfile", "-Command", command]);
+    return powershell.slice(0, maxResults);
+  }
+
+  const fd = await tryFastSearch(exec, "fd", [
+    "--absolute-path",
+    "--type",
+    "file",
+    "--max-depth",
+    "6",
+    "^openclaw\\.json$",
+    root
+  ]);
+  if (fd.length > 0) {
+    return fd.slice(0, maxResults);
+  }
+
+  const find = await tryFastSearch(exec, "find", [root, "-maxdepth", "6", "-type", "f", "-name", "openclaw.json"]);
+  return find.slice(0, maxResults);
+}
+
+async function tryFastSearch(exec: FastSearchExec, file: string, args: string[]): Promise<string[]> {
+  try {
+    const result = await exec(file, args, {
+      timeout: FAST_SEARCH_TIMEOUT_MS,
+      maxBuffer: FAST_SEARCH_MAX_BUFFER
+    });
+    return String(result.stdout || "")
+      .split(/\r?\n/)
+      .map((entry) => entry.trim())
+      .filter(Boolean);
+  } catch {
+    return [];
+  }
+}
+
+function createSearchedClawHostDefinition(configPath: string, options: HostDetectionOptions): HostDefinition | undefined {
+  const kind = inferHostKindFromSearchedConfigPath(configPath);
+  if (!kind) {
+    return undefined;
+  }
+
+  if (kind === "qclaw") {
+    return createQClawHostDefinition(configPath, options);
+  }
+
+  return {
+    id: "openclaw",
+    label: "OpenClaw",
+    configPath,
+    extensionsDir: inferSiblingExtensionsDir(configPath)
+  };
+}
+
+function createQClawHostDefinition(configPath: string, options: HostDetectionOptions): HostDefinition {
+  return {
+    id: "qclaw",
+    label: "QClaw",
+    configPath,
+    extensionsDir: inferQClawExtensionsDir(configPath, options)
+  };
+}
+
+function inferQClawExtensionsDir(configPath: string, options: HostDetectionOptions): string {
+  const normalizedDir = normalizePath(dirname(configPath));
+  if (normalizedDir.endsWith("/openclaw/config") || normalizedDir.includes("/qclaw/openclaw/config")) {
+    return join(dirname(configPath), "extensions");
+  }
+  return getQClawExtensionsDirCandidates(options)[0] ?? join(dirname(configPath), "extensions");
+}
+
+function inferSiblingExtensionsDir(configPath: string): string {
+  return join(dirname(configPath), "extensions");
+}
+
+function inferHostKindFromSearchedConfigPath(configPath: string): "openclaw" | "qclaw" | undefined {
+  const normalized = normalizePath(configPath);
+  if (normalized.includes("/.qclaw/") || normalized.includes("/qclaw/openclaw/config/")) {
+    return "qclaw";
+  }
+  if (normalized.includes("/.openclaw/") || normalized.includes("/openclaw/openclaw/config/")) {
+    return "openclaw";
+  }
+  return undefined;
+}
+
+function getBoundedSearchRoots(options: HostDetectionOptions): string[] {
+  const home = getDetectionHomeDir(options);
+  const env = options.env ?? process.env;
+  const platform = options.platform ?? process.platform;
+
+  if (platform === "darwin") {
+    return dedupeStrings([join(home, "Library", "Application Support"), home, "/Applications"].map((entry) => resolve(entry)));
+  }
+
+  if (platform === "win32") {
+    return dedupeStrings([
+      env.APPDATA || join(home, "AppData", "Roaming"),
+      env.LOCALAPPDATA || join(home, "AppData", "Local"),
+      home
+    ].map((entry) => resolve(entry)));
+  }
+
+  return dedupeStrings([
+    env.XDG_CONFIG_HOME || join(home, ".config"),
+    env.XDG_DATA_HOME || join(home, ".local", "share"),
+    home
+  ].map((entry) => resolve(entry)));
+}
+
+function quotePowerShellLiteral(value: string): string {
+  return `'${value.replace(/'/g, "''")}'`;
+}
+
+function getDetectionHomeDir(options: HostDetectionOptions): string {
+  return options.homeDir ? resolve(options.homeDir) : homedir();
+}
+
+function normalizePath(path: string): string {
+  return path.replace(/\\/g, "/").toLowerCase();
+}
+
 function inferDetectedClawLabel(configPath: string, extensionsDir: string): "QClaw" | "OpenClaw" | "Hermes" | "WorkBuddy" {
   const kind = detectHostKind(`${configPath}\n${extensionsDir}`);
   if (kind === "qclaw") return "QClaw";
   if (kind === "hermes") return "Hermes";
   if (kind === "workbuddy") return "WorkBuddy";
+  return "OpenClaw";
+}
+
+function parseInstallHostKind(value: string | undefined): InstallHostKind | undefined {
+  if (!value) {
+    return undefined;
+  }
+  const normalized = value.trim().toLowerCase();
+  if (INSTALL_HOST_KINDS.has(normalized as InstallHostKind)) {
+    return normalized as InstallHostKind;
+  }
+  throw new Error(`invalid --host-kind: ${value}. Expected one of: ${Array.from(INSTALL_HOST_KINDS).join(", ")}`);
+}
+
+function filterHostsByKind(hosts: HostDefinition[], kind: InstallHostKind): HostDefinition[] {
+  return hosts.filter((host) => getHostKind(host) === kind);
+}
+
+function getHostKind(host: HostDefinition): InstallHostKind {
+  if (host.installKind === "codex" || host.installKind === "hermes" || host.installKind === "workbuddy") {
+    return host.installKind;
+  }
+  if (host.id === "qclaw") {
+    return "qclaw";
+  }
+  if (host.id === "openclaw") {
+    return "openclaw";
+  }
+  return inferHostKindFromSearchedConfigPath(host.configPath) ?? inferHostKindFromSearchedConfigPath(host.extensionsDir) ?? "openclaw";
+}
+
+function labelForHostKind(kind: InstallHostKind): string {
+  if (kind === "qclaw") return "QClaw";
+  if (kind === "hermes") return "Hermes";
+  if (kind === "workbuddy") return "WorkBuddy";
+  if (kind === "codex") return "Codex";
   return "OpenClaw";
 }
 
@@ -944,8 +1254,8 @@ function createWorkBuddyHostDefinition(workbuddyHome: string): HostDefinition {
   };
 }
 
-function createCodexHostDefinition(): HostDefinition | undefined {
-  const detected = getDefaultCodexBinaryCandidates().find((candidate) => existsSync(candidate.path));
+function createCodexHostDefinition(options: HostDetectionOptions = {}): HostDefinition | undefined {
+  const detected = getDefaultCodexBinaryCandidates(options.env).find((candidate) => existsSync(candidate.path));
   if (!detected) {
     return undefined;
   }
@@ -1005,7 +1315,7 @@ async function promptForInstallHost(
     throw new Error(
       [
         "multiple compatible agents were detected, but no interactive terminal was available.",
-        "Run the installer again in an interactive terminal, pass --config-path and --extensions-dir, pass --workbuddy-home, or use install-codex.",
+        "Run the installer again with --host-kind, use an interactive terminal, pass explicit path options, pass --workbuddy-home, or use install-codex.",
         "",
         "Detected locations:",
         ...formatHostList(hosts),

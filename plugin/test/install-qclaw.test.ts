@@ -1,10 +1,17 @@
 import { afterEach, describe, expect, it, vi } from "vitest";
 import { access, chmod, mkdtemp, mkdir, readFile, rm, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
-import { join } from "node:path";
+import { dirname, join } from "node:path";
 import { parse as parseYaml } from "yaml";
 
-import { installIntoCodex, installIntoOpenClaw, installIntoQClaw, installIntoWorkBuddy, runInstallCommand } from "../src/install-qclaw";
+import {
+  getQClawExtensionsDirCandidates,
+  installIntoCodex,
+  installIntoOpenClaw,
+  installIntoQClaw,
+  installIntoWorkBuddy,
+  runInstallCommand
+} from "../src/install-qclaw";
 import type { HostDefinition } from "../src/install-qclaw";
 
 const cleanupPaths: string[] = [];
@@ -795,6 +802,92 @@ describe("QClaw installer", () => {
     expect(chunks.join("")).toContain("Installed claw-control-center into OpenClaw.");
   });
 
+  it("uses --host-kind to select QClaw without prompting when multiple hosts exist", async () => {
+    const tempRoot = await mkdtemp(join(tmpdir(), "openclaw-install-"));
+    cleanupPaths.push(tempRoot);
+
+    const qclawConfigPath = join(tempRoot, ".qclaw", "openclaw.json");
+    const qclawExtensionsDir = join(tempRoot, "Library/Application Support/QClaw/openclaw/config/extensions");
+    const openClawConfigPath = join(tempRoot, ".openclaw", "openclaw.json");
+    const openClawExtensionsDir = join(tempRoot, ".openclaw", "extensions");
+    const packageRoot = await createPackageRoot(tempRoot);
+    await mkdir(join(tempRoot, ".qclaw"), { recursive: true });
+    await mkdir(join(tempRoot, ".openclaw"), { recursive: true });
+    await writeGatewayConfig(qclawConfigPath, 28789, "qclaw-token");
+    await writeGatewayConfig(openClawConfigPath, 18789, "openclaw-token");
+
+    let promptCalled = false;
+    const chunks: string[] = [];
+    await withCapturedStdout(chunks, async () => {
+      await runInstallCommand({
+        packageRoot,
+        argv: ["install", "--host-kind", "qclaw"],
+        hostDefinitions: [
+          {
+            id: "qclaw",
+            label: "QClaw",
+            configPath: qclawConfigPath,
+            extensionsDir: qclawExtensionsDir
+          },
+          {
+            id: "openclaw",
+            label: "OpenClaw",
+            configPath: openClawConfigPath,
+            extensionsDir: openClawExtensionsDir
+          }
+        ],
+        promptSelectHost: async (detected) => {
+          promptCalled = true;
+          return detected[0]!;
+        }
+      });
+    });
+
+    const qclawConfig = JSON.parse(await readFile(qclawConfigPath, "utf8")) as {
+      plugins: {
+        allow: string[];
+        load: { paths: string[] };
+      };
+    };
+    const openClawConfig = JSON.parse(await readFile(openClawConfigPath, "utf8")) as {
+      plugins?: {
+        allow?: string[];
+      };
+    };
+
+    expect(promptCalled).toBe(false);
+    expect(qclawConfig.plugins.allow).toContain("claw-control-center");
+    expect(qclawConfig.plugins.load.paths).toContain(qclawExtensionsDir);
+    expect(openClawConfig.plugins?.allow).toBeUndefined();
+    expect(chunks.join("")).toContain("Installed claw-control-center into QClaw.");
+  });
+
+  it("uses platform-specific QClaw extension directory candidates", () => {
+    const home = join(tmpdir(), "qclaw-home");
+
+    expect(getQClawExtensionsDirCandidates({ platform: "darwin", homeDir: home })[0]).toBe(
+      join(home, "Library", "Application Support", "QClaw", "openclaw", "config", "extensions")
+    );
+    const windowsCandidate = getQClawExtensionsDirCandidates({
+      platform: "win32",
+      homeDir: home,
+      env: {
+        APPDATA: "C:\\Users\\tester\\AppData\\Roaming",
+        LOCALAPPDATA: "C:\\Users\\tester\\AppData\\Local"
+      }
+    })[0]!.replace(/\\/g, "/");
+    expect(windowsCandidate).toContain("AppData/Roaming/QClaw/openclaw/config/extensions");
+    expect(
+      getQClawExtensionsDirCandidates({
+        platform: "linux",
+        homeDir: home,
+        env: {
+          XDG_CONFIG_HOME: join(home, ".config")
+        }
+      })[0]
+    ).toBe(join(home, ".config", "QClaw", "openclaw", "config", "extensions"));
+  });
+
   it("uses the cross-platform keyboard prompt to select one Claw host when multiple hosts are detected", async () => {
     const tempRoot = await mkdtemp(join(tmpdir(), "openclaw-install-"));
     cleanupPaths.push(tempRoot);
@@ -1424,6 +1517,44 @@ describe("QClaw installer", () => {
         ]
       })
     ).rejects.toThrow("could not auto-detect an installed compatible agent");
+  });
+
+  it("uses bounded fast search as a fallback for --host-kind qclaw", async () => {
+    const tempRoot = await mkdtemp(join(tmpdir(), "openclaw-install-search-"));
+    cleanupPaths.push(tempRoot);
+
+    const configPath = join(tempRoot, "nested", ".qclaw", "openclaw.json");
+    const packageRoot = await createPackageRoot(tempRoot);
+    await mkdir(dirname(configPath), { recursive: true });
+    await writeGatewayConfig(configPath, 28789, "qclaw-token");
+
+    const searchedCommands: string[] = [];
+    const chunks: string[] = [];
+    await withCapturedStdout(chunks, async () => {
+      await runInstallCommand({
+        packageRoot,
+        argv: ["install", "--host-kind", "qclaw"],
+        hostDefinitions: [],
+        platform: "linux",
+        homeDir: tempRoot,
+        fastSearchExec: async (file) => {
+          searchedCommands.push(file);
+          return { stdout: `${configPath}\n` };
+        }
+      });
+    });
+
+    const updated = JSON.parse(await readFile(configPath, "utf8")) as {
+      plugins: {
+        allow: string[];
+        load: { paths: string[] };
+      };
+    };
+
+    expect(searchedCommands).toContain("fd");
+    expect(updated.plugins.allow).toContain("claw-control-center");
+    expect(updated.plugins.load.paths[0]).toContain("QClaw");
+    expect(chunks.join("")).toContain("Installed claw-control-center into QClaw.");
   });
 
   it("rejects the removed target option with a clear error", async () => {

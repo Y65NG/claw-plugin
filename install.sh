@@ -4,7 +4,10 @@ set -euo pipefail
 : <<'CLAW_AGENT_INSTRUCTIONS'
 请将 53AI-OpenClaw 插件安装到当前正在运行的 Claw 中。
 
-如果你能获取当前 Claw 的配置路径和插件目录，请在执行安装时自动补充：
+如果你能识别当前 Claw 的类型，请在执行安装时优先补充：
+  --host-kind "<openclaw 或 qclaw>"
+
+如果你还能获取当前 Claw 的配置路径和插件目录，也可以在高级场景补充：
   --config-path "<当前 Claw 的配置路径，例如 openclaw.json 或 Hermes config.yaml>"
   --extensions-dir "<当前 Claw 的插件目录，例如 extensions 或 Hermes plugins/platforms>"
 
@@ -14,6 +17,7 @@ set -euo pipefail
 CLAW_AGENT_INSTRUCTIONS
 
 echo "Installing 53AI-OpenClaw into the current Claw host..."
+echo "Pass --host-kind openclaw or --host-kind qclaw to skip cross-agent selection."
 echo "The installer will auto-detect local Claw paths and ask when multiple hosts are found."
 
 if ! command -v npx >/dev/null 2>&1; then

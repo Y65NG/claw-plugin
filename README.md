@@ -37,14 +37,15 @@
 
 ```bash
 curl -fsSL https://raw.githubusercontent.com/53AI/53AI-OpenClaw/main/install.sh | bash -s -- \
+  --host-kind qclaw \
   --hub-bot-id "<bot-id>" \
   --hub-secret "<secret>" \
   --hub-ws-url "wss://kmapirc.53ai.com/api/v1/openclaw/ws/connect"
 ```
 
-`install.sh` 内部包含给 Claw 智能体 (agent) 的提示词：优先安装到当前正在运行的 Claw；如果能识别当前 Claw 的 `openclaw.json` 和 extensions 目录，可以自动补充精确路径；否则由安装器自动检测本机 Claw。
+`--host-kind` 用于指定要接入的本机智能体 (agent)，可选值包括 `openclaw`、`qclaw`、`codex`。安装器会在插件内部判断该智能体的本机安装位置；不需要在命令中暴露 `openclaw.json` 或 extensions 目录。
 
-如果用户是在普通终端手动执行同一条 curl 命令，安装器会扫描当前用户电脑上的 QClaw / OpenClaw / Hermes / WorkBuddy。只发现一个兼容宿主时会直接安装；发现多个宿主时会显示安装位置列表，让用户选择一个写入插件。OpenClaw / QClaw 会安装 `openclaw.plugin.json` 扩展；Hermes 会安装 `plugin.yaml` 平台适配器，并把 53AIHub 连接参数写入 `~/.hermes/.env`；WorkBuddy 会安装 CodeBuddy Channel 插件并写入本地 marketplace。
+如果用户是在普通终端手动执行同一条 curl 命令且没有传 `--host-kind`，安装器会扫描当前用户电脑上的 QClaw / OpenClaw / Hermes / WorkBuddy。只发现一个兼容宿主时会直接安装；发现多个宿主时会显示安装位置列表，让用户选择一个写入插件。OpenClaw / QClaw 会安装 `openclaw.plugin.json` 扩展；Hermes 会安装 `plugin.yaml` 平台适配器，并把 53AIHub 连接参数写入 `~/.hermes/.env`；WorkBuddy 会安装 CodeBuddy Channel 插件并写入本地 marketplace。
 
 `install.sh` 中调用的 npm 包名为 `@53ai/53ai-openclaw`，插件写入 OpenClaw / QClaw 配置时仍使用插件 ID `claw-control-center`。
 
@@ -63,12 +64,11 @@ pnpm build
 node plugin/bin/install-qclaw.mjs install
 ```
 
-如果当前电脑有多个兼容宿主，安装器会显示可选安装位置，并让用户选择一个安装目标。若需要跳过选择，OpenClaw / QClaw / Hermes 可以显式传入配置文件和扩展目录：
+如果当前电脑有多个兼容宿主，安装器会显示可选安装位置，并让用户选择一个安装目标。若需要跳过不同宿主类型之间的选择，可以显式传入目标智能体类型：
 
 ```bash
 node plugin/bin/install-qclaw.mjs install \
-  --config-path "<claw-openclaw-json-path>" \
-  --extensions-dir "<claw-extensions-dir>"
+  --host-kind qclaw
 ```
 
 如果需要同时写入 53AIHub 鉴权配置：
@@ -80,7 +80,7 @@ node plugin/bin/install-qclaw.mjs install \
   --hub-secret "<secret>"
 ```
 
-如果由 Claw 宿主或 53AIHub 生成精确安装路径，也可以显式传入配置文件和扩展目录：
+如果由 Claw 宿主或高级调试流程生成精确安装路径，也可以显式传入配置文件和扩展目录：
 
 ```bash
 node plugin/bin/install-qclaw.mjs install \
@@ -98,7 +98,7 @@ node plugin/bin/install-qclaw.mjs install \
 WorkBuddy / CodeBuddy 不使用 OpenClaw Gateway Protocol。发布后的云端命令仍然使用统一的 `install` 子命令；安装器会把 WorkBuddy 作为兼容宿主自动发现，并在用户选择 WorkBuddy 后安装到本地 marketplace `my-experts`：
 
 ```bash
-npx @53ai/53ai-openclaw@latest install \
+npx --yes @53ai/53ai-openclaw@latest install \
   --hub-bot-id "<bot-id>" \
   --hub-secret "<secret>" \
   --hub-ws-url "ws://kmapitest.53ai.com/api/v1/openclaw/ws/connect"
@@ -196,21 +196,22 @@ pnpm pack
 安装脚本支持两种路径：
 
 1. 用户一键安装：不传安装目标参数，安装器自动发现当前用户电脑上的 QClaw / OpenClaw / Hermes / WorkBuddy。
-2. 宿主集成安装：OpenClaw / QClaw / Hermes 可显式传入 `--config-path` 与 `--extensions-dir`，由宿主决定安装位置；WorkBuddy 可显式传入 `--workbuddy-home`。
+2. 宿主集成安装：推荐传入 `--host-kind openclaw|qclaw|codex`，由安装器内部检测该类型智能体的位置；OpenClaw / QClaw / Hermes 仍可在高级场景显式传入 `--config-path` 与 `--extensions-dir`，WorkBuddy 可显式传入 `--workbuddy-home`。
 
 ```bash
-npx @53ai/53ai-openclaw@latest install \
+npx --yes @53ai/53ai-openclaw@latest install \
+  --host-kind qclaw \
   --hub-bot-id "<bot-id>" \
   --hub-secret "<secret>" \
   --hub-ws-url "<hub-ws-url>"
 ```
 
-如果只检测到一个宿主，安装器会直接安装并打印实际写入位置。OpenClaw / QClaw / Hermes 会打印 `Extensions` 与 `Config`；WorkBuddy 会打印插件目录与 marketplace 文件。如果检测到多个宿主，安装器会显示编号列表，让用户选择一个安装位置。由于 `curl | bash` 会占用标准输入 (stdin)，安装器会通过 `/dev/tty` 读取用户选择，以便普通终端手动安装时仍能交互。
+如果传入 `--host-kind`，安装器会只检测该类型的宿主并打印实际写入位置。没有传 `--host-kind` 时，如果只检测到一个宿主，安装器会直接安装；如果检测到多个宿主，安装器会显示编号列表，让用户选择一个安装位置。由于 `curl | bash` 会占用标准输入 (stdin)，安装器会通过 `/dev/tty` 读取用户选择，以便普通终端手动安装时仍能交互。
 
 如果宿主提供精确路径，则使用：
 
 ```bash
-npx @53ai/53ai-openclaw@latest install \
+npx --yes @53ai/53ai-openclaw@latest install \
   --config-path "<claw-openclaw-json-path>" \
   --extensions-dir "<claw-extensions-dir>" \
   --hub-bot-id "<bot-id>" \
@@ -218,7 +219,7 @@ npx @53ai/53ai-openclaw@latest install \
   --hub-ws-url "<hub-ws-url>"
 ```
 
-`--target` 已删除。继续传入 `--target` 会报错，并提示改用自动发现或显式路径参数。
+`--target` 已删除。继续传入 `--target` 会报错；请改用 `--host-kind`、自动发现或显式路径参数。
 
 无论哪种方式，OpenClaw / QClaw 未显式传入 `--gateway` / `--secret` 时，插件都会在运行时读取宿主当前 Gateway 配置，避免把某台机器上的临时端口写死到插件配置中。Hermes 不使用 OpenClaw Gateway Protocol，而是通过原生 Hermes 平台适配器收发消息。WorkBuddy / CodeBuddy 通过 Channel MCP server 连接 53AIHub，不需要本地 Gateway 配置。
 
