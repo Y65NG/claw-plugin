@@ -1,6 +1,6 @@
 {
-  "name": "claw-control-center",
-  "version": "0.1.21",
+  "name": "@53ai/53ai-openclaw",
+  "version": "1.1.3",
   "type": "module",
   "main": "dist/index.cjs",
   "types": "dist/index.d.ts",
@@ -14,7 +14,9 @@
     ".mcp.json",
     "bin",
     "web-dist",
-    "hermes"
+    "hermes/platforms/53aihub/__init__.py",
+    "hermes/platforms/53aihub/adapter.py",
+    "hermes/platforms/53aihub/plugin.yaml"
   ],
   "scripts": {
     "build": "node ./scripts/sync-web-dist.mjs && tsup",

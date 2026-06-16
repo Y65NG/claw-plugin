@@ -1,10 +1,17 @@
-import { afterEach, describe, expect, it } from "vitest";
-import { access, mkdtemp, mkdir, readFile, rm, writeFile } from "node:fs/promises";
+import { afterEach, describe, expect, it, vi } from "vitest";
+import { access, chmod, mkdtemp, mkdir, readFile, rm, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
-import { join } from "node:path";
+import { dirname, join } from "node:path";
 import { parse as parseYaml } from "yaml";
 
-import { installIntoOpenClaw, installIntoQClaw, installIntoWorkBuddy, runInstallCommand } from "../src/install-qclaw";
+import {
+  getQClawExtensionsDirCandidates,
+  installIntoCodex,
+  installIntoOpenClaw,
+  installIntoQClaw,
+  installIntoWorkBuddy,
+  runInstallCommand
+} from "../src/install-qclaw";
 import type { HostDefinition } from "../src/install-qclaw";
 
 const cleanupPaths: string[] = [];
@@ -795,6 +802,92 @@ describe("QClaw installer", () => {
     expect(chunks.join("")).toContain("Installed claw-control-center into OpenClaw.");
   });
 
+  it("uses --host-kind to select QClaw without prompting when multiple hosts exist", async () => {
+    const tempRoot = await mkdtemp(join(tmpdir(), "openclaw-install-"));
+    cleanupPaths.push(tempRoot);
+
+    const qclawConfigPath = join(tempRoot, ".qclaw", "openclaw.json");
+    const qclawExtensionsDir = join(tempRoot, "Library/Application Support/QClaw/openclaw/config/extensions");
+    const openClawConfigPath = join(tempRoot, ".openclaw", "openclaw.json");
+    const openClawExtensionsDir = join(tempRoot, ".openclaw", "extensions");
+    const packageRoot = await createPackageRoot(tempRoot);
+    await mkdir(join(tempRoot, ".qclaw"), { recursive: true });
+    await mkdir(join(tempRoot, ".openclaw"), { recursive: true });
+    await writeGatewayConfig(qclawConfigPath, 28789, "qclaw-token");
+    await writeGatewayConfig(openClawConfigPath, 18789, "openclaw-token");
+
+    let promptCalled = false;
+    const chunks: string[] = [];
+    await withCapturedStdout(chunks, async () => {
+      await runInstallCommand({
+        packageRoot,
+        argv: ["install", "--host-kind", "qclaw"],
+        hostDefinitions: [
+          {
+            id: "qclaw",
+            label: "QClaw",
+            configPath: qclawConfigPath,
+            extensionsDir: qclawExtensionsDir
+          },
+          {
+            id: "openclaw",
+            label: "OpenClaw",
+            configPath: openClawConfigPath,
+            extensionsDir: openClawExtensionsDir
+          }
+        ],
+        promptSelectHost: async (detected) => {
+          promptCalled = true;
+          return detected[0]!;
+        }
+      });
+    });
+
+    const qclawConfig = JSON.parse(await readFile(qclawConfigPath, "utf8")) as {
+      plugins: {
+        allow: string[];
+        load: { paths: string[] };
+      };
+    };
+    const openClawConfig = JSON.parse(await readFile(openClawConfigPath, "utf8")) as {
+      plugins?: {
+        allow?: string[];
+      };
+    };
+
+    expect(promptCalled).toBe(false);
+    expect(qclawConfig.plugins.allow).toContain("claw-control-center");
+    expect(qclawConfig.plugins.load.paths).toContain(qclawExtensionsDir);
+    expect(openClawConfig.plugins?.allow).toBeUndefined();
+    expect(chunks.join("")).toContain("Installed claw-control-center into QClaw.");
+  });
+
+  it("uses platform-specific QClaw extension directory candidates", () => {
+    const home = join(tmpdir(), "qclaw-home");
+
+    expect(getQClawExtensionsDirCandidates({ platform: "darwin", homeDir: home })[0]).toBe(
+      join(home, "Library", "Application Support", "QClaw", "openclaw", "config", "extensions")
+    );
+    const windowsCandidate = getQClawExtensionsDirCandidates({
+      platform: "win32",
+      homeDir: home,
+      env: {
+        APPDATA: "C:\\Users\\tester\\AppData\\Roaming",
+        LOCALAPPDATA: "C:\\Users\\tester\\AppData\\Local"
+      }
+    })[0]!.replace(/\\/g, "/");
+    expect(windowsCandidate).toContain("AppData/Roaming/QClaw/openclaw/config/extensions");
+    expect(
+      getQClawExtensionsDirCandidates({
+        platform: "linux",
+        homeDir: home,
+        env: {
+          XDG_CONFIG_HOME: join(home, ".config")
+        }
+      })[0]
+    ).toBe(join(home, ".config", "QClaw", "openclaw", "config", "extensions"));
+  });
+
   it("uses the cross-platform keyboard prompt to select one Claw host when multiple hosts are detected", async () => {
     const tempRoot = await mkdtemp(join(tmpdir(), "openclaw-install-"));
     cleanupPaths.push(tempRoot);
@@ -1199,6 +1292,103 @@ describe("QClaw installer", () => {
     );
   });
 
+  it("installs a Codex App Server channel with auto-detected Codex and hidden workspace root", async () => {
+    const tempRoot = await mkdtemp(join(tmpdir(), "codex-install-"));
+    cleanupPaths.push(tempRoot);
+
+    const packageRoot = await createPackageRoot(tempRoot);
+    const fakeCodex = join(tempRoot, "bin", "codex");
+    const fakeNode = join(tempRoot, "bin", "node");
+    await mkdir(join(tempRoot, "bin"), { recursive: true });
+    await writeFile(fakeCodex, "#!/bin/sh\necho codex-cli 0.134.0\n");
+    await writeFile(fakeNode, "#!/bin/sh\nexit 0\n");
+    await chmod(fakeCodex, 0o755);
+    await chmod(fakeNode, 0o755);
+
+    const launchctlCalls: string[][] = [];
+    const launchAgent = {
+      launchAgentsDir: join(tempRoot, "Library", "LaunchAgents"),
+      logDir: join(tempRoot, ".53ai", "codex-channel", "logs"),
+      uid: 501,
+      platform: "darwin" as const,
+      runLaunchctl: vi.fn(async (args: string[]) => {
+        launchctlCalls.push(args);
+      })
+    };
+
+    const result = await installIntoCodex({
+      packageRoot,
+      installRoot: join(tempRoot, ".53ai", "codex-channel"),
+      workspaceRoot: join(tempRoot, ".53ai", "codex-workspaces"),
+      codexBinPath: fakeCodex,
+      nodeBinPath: fakeNode,
+      hubWsUrl: "wss://hub.example.com/api/v1/openclaw/ws/connect",
+      hubBotId: "hub-bot",
+      hubSecret: "hub-secret",
+      launchAgent
+    });
+
+    const config = JSON.parse(await readFile(result.configPath, "utf8")) as any;
+    const startScript = await readFile(result.startScriptPath, "utf8");
+    const plist = await readFile(result.launchAgent.plistPath, "utf8");
+
+    expect(result.codexBinPath).toBe(fakeCodex);
+    expect(result.codexVersion).toBe("codex-cli 0.134.0");
+    expect(result.hubBotId).toBe("hub-bot");
+    expect(result.workspaceRoot).toBe(join(tempRoot, ".53ai", "codex-workspaces"));
+    expect(config).toMatchObject({
+      wsUrl: "wss://hub.example.com/api/v1/openclaw/ws/connect",
+      botId: "hub-bot",
+      secret: "hub-secret",
+      codexBinPath: fakeCodex,
+      codexVersion: "codex-cli 0.134.0",
+      workspaceRoot: join(tempRoot, ".53ai", "codex-workspaces"),
+      runnerCommand: "codex-app-server",
+      hostKind: "codex"
+    });
+    expect(startScript).toContain("HUB53AI_CODEX_CHANNEL_CONFIG=");
+    expect(startScript).toContain(`exec '${fakeNode}'`);
+    expect(startScript).not.toContain("exec node ");
+    expect(startScript).toContain("codex-channel.cjs");
+    expect(result.launchAgent).toMatchObject({
+      enabled: true,
+      loaded: true,
+      label: "com.53ai.codex-channel",
+      serviceTarget: "gui/501/com.53ai.codex-channel"
+    });
+    expect(plist).toContain("<key>RunAtLoad</key>");
+    expect(plist).toContain("<key>KeepAlive</key>");
+    expect(plist).toContain(fakeNode);
+    expect(plist).toContain(result.channelEntryPath);
+    expect(plist).toContain("HUB53AI_CODEX_CHANNEL_CONFIG");
+    expect(plist).toContain(result.configPath);
+    expect(plist).toContain(result.startScriptPath);
+    expect(plist).toContain(result.launchAgent.stdoutPath);
+    expect(launchctlCalls).toEqual([
+      ["bootout", "gui/501", result.launchAgent.plistPath],
+      ["bootstrap", "gui/501", result.launchAgent.plistPath],
+      ["enable", "gui/501/com.53ai.codex-channel"],
+      ["kickstart", "-k", "gui/501/com.53ai.codex-channel"],
+      ["print", "gui/501/com.53ai.codex-channel"]
+    ]);
+    await access(join(result.destination, "dist", "codex-channel.cjs"));
+    await access(join(tempRoot, ".53ai", "codex-workspaces"));
+
+    launchctlCalls.length = 0;
+    await installIntoCodex({
+      packageRoot,
+      installRoot: join(tempRoot, ".53ai", "codex-channel"),
+      workspaceRoot: join(tempRoot, ".53ai", "codex-workspaces"),
+      codexBinPath: fakeCodex,
+      nodeBinPath: fakeNode,
+      hubWsUrl: "wss://hub.example.com/api/v1/openclaw/ws/connect",
+      hubBotId: "hub-bot",
+      hubSecret: "hub-secret",
+      launchAgent
+    });
+    expect(launchctlCalls.map((args) => args[0])).toEqual(["bootout", "bootstrap", "enable", "kickstart", "print"]);
+  });
+
   it("offers WorkBuddy through the normal install command", async () => {
     const tempRoot = await mkdtemp(join(tmpdir(), "workbuddy-auto-command-"));
     cleanupPaths.push(tempRoot);
@@ -1329,6 +1519,44 @@ describe("QClaw installer", () => {
     ).rejects.toThrow("could not auto-detect an installed compatible agent");
   });
 
+  it("uses bounded fast search as a fallback for --host-kind qclaw", async () => {
+    const tempRoot = await mkdtemp(join(tmpdir(), "openclaw-install-search-"));
+    cleanupPaths.push(tempRoot);
+
+    const configPath = join(tempRoot, "nested", ".qclaw", "openclaw.json");
+    const packageRoot = await createPackageRoot(tempRoot);
+    await mkdir(dirname(configPath), { recursive: true });
+    await writeGatewayConfig(configPath, 28789, "qclaw-token");
+
+    const searchedCommands: string[] = [];
+    const chunks: string[] = [];
+    await withCapturedStdout(chunks, async () => {
+      await runInstallCommand({
+        packageRoot,
+        argv: ["install", "--host-kind", "qclaw"],
+        hostDefinitions: [],
+        platform: "linux",
+        homeDir: tempRoot,
+        fastSearchExec: async (file) => {
+          searchedCommands.push(file);
+          return { stdout: `${configPath}\n` };
+        }
+      });
+    });
+
+    const updated = JSON.parse(await readFile(configPath, "utf8")) as {
+      plugins: {
+        allow: string[];
+        load: { paths: string[] };
+      };
+    };
+
+    expect(searchedCommands).toContain("fd");
+    expect(updated.plugins.allow).toContain("claw-control-center");
+    expect(updated.plugins.load.paths[0]).toContain("QClaw");
+    expect(chunks.join("")).toContain("Installed claw-control-center into QClaw.");
+  });
+
   it("rejects the removed target option with a clear error", async () => {
     const tempRoot = await mkdtemp(join(tmpdir(), "openclaw-install-"));
     cleanupPaths.push(tempRoot);
@@ -1366,6 +1594,7 @@ async function createPackageRoot(tempRoot: string): Promise<string> {
   );
   await writeFile(join(packageRoot, "dist", "index.cjs"), "module.exports = {};\n");
   await writeFile(join(packageRoot, "dist", "codebuddy-channel.cjs"), "module.exports = {};\n");
+  await writeFile(join(packageRoot, "dist", "codex-channel.cjs"), "module.exports = {};\n");
   await writeFile(join(packageRoot, "dist", "workbuddy-supervisor.cjs"), "module.exports = {};\n");
   await writeFile(join(packageRoot, "hermes", "platforms", "53aihub", "plugin.yaml"), "name: 53aihub\nversion: 0.1.0\nkind: platform\n");
   await writeFile(join(packageRoot, "hermes", "platforms", "53aihub", "__init__.py"), "from .adapter import register\n");

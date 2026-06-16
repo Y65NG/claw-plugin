@@ -66,7 +66,7 @@ export {
 } from "./53aihub-client";
 export { createConsoleServer } from "./console-server";
 export { createGatewayClient } from "./gateway-client";
-export { installIntoOpenClaw, installIntoQClaw, installIntoWorkBuddy, runInstallCommand } from "./install-qclaw";
+export { installIntoCodex, installIntoOpenClaw, installIntoQClaw, installIntoWorkBuddy, runInstallCommand } from "./install-qclaw";
 export {
   createCodeBuddyChannelBridge,
   loadCodeBuddyChannelConfig,
@@ -116,6 +116,35 @@ export {
   parseIncomingMessage as parseHub53AIProtocolIncomingMessage,
   type Hub53AIBaseConfig
 } from "./53aihub-protocol";
+export {
+  createCodexChannelBridge,
+  loadCodexChannelConfig,
+  startCodexChannelServer,
+  writeCodexChannelInstallConfig,
+  type CodexChannelConfig,
+  type CodexChannelStatusSnapshot
+} from "./codex-channel";
+export {
+  CodexAppServerClient,
+  createCodexAppServerTurnRunner,
+  type CodexAppServerNotification,
+  type CodexRunTurnInput,
+  type CodexRunTurnResult,
+  type CodexTurnRunner
+} from "./codex-app-server";
+export {
+  DEFAULT_CODEX_WORKSPACE_ROOT,
+  ensureCodexConversationWorkspace,
+  readCodexWorkspaceMappings,
+  sanitizeCodexWorkspacePart,
+  updateCodexWorkspaceThread,
+  type CodexWorkspaceMapping
+} from "./codex-workspace";
+export {
+  detectCodexInstallation,
+  getDefaultCodexBinaryCandidates,
+  type CodexInstallation
+} from "./codex-runtime";
 
 function resolveConfigPath(ctx: { stateDir: string }): string {
   const candidates = [

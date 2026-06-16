@@ -1,6 +1,6 @@
 import { createHash } from "node:crypto";
 import { execFile } from "node:child_process";
-import { cp, mkdir, readFile, rm, writeFile } from "node:fs/promises";
+import { chmod, cp, mkdir, readFile, rm, writeFile } from "node:fs/promises";
 import { existsSync } from "node:fs";
 import { homedir } from "node:os";
 import { dirname, join, resolve } from "node:path";
@@ -8,6 +8,9 @@ import { promisify } from "node:util";
 import { select } from "@inquirer/prompts";
 import { parse as parseYaml, stringify as stringifyYaml } from "yaml";
 import { detectHostKind } from "./host";
+import { writeCodexChannelInstallConfig } from "./codex-channel";
+import { DEFAULT_CODEX_WORKSPACE_ROOT } from "./codex-workspace";
+import { detectCodexInstallation, getDefaultCodexBinaryCandidates } from "./codex-runtime";
 
 type InstallInput = {
   packageRoot: string;
@@ -35,6 +38,40 @@ type WorkBuddyInstallInput = {
   cleanupWorkBuddyChannelProcesses?: (targets: string[]) => Promise<void>;
 };
 
+type CodexInstallInput = {
+  packageRoot: string;
+  installRoot: string;
+  hubWsUrl?: string;
+  hubBotId?: string;
+  hubSecret?: string;
+  codexBinPath?: string;
+  nodeBinPath?: string;
+  workspaceRoot?: string;
+  launchAgent?: CodexLaunchAgentOptions;
+};
+
+type CodexLaunchAgentOptions = {
+  enabled?: boolean;
+  label?: string;
+  launchAgentsDir?: string;
+  logDir?: string;
+  uid?: number;
+  platform?: NodeJS.Platform;
+  runLaunchctl?: LaunchctlRunner;
+};
+
+type LaunchctlRunner = (args: string[]) => Promise<unknown>;
+
+type CodexLaunchAgentStatus = {
+  enabled: boolean;
+  label: string;
+  plistPath: string;
+  stdoutPath: string;
+  stderrPath: string;
+  loaded: boolean;
+  serviceTarget: string;
+};
+
 type ParsedArgs = {
   gateway?: string;
   "bot-id"?: string;
@@ -50,15 +87,19 @@ type ParsedArgs = {
   "console-host"?: string;
   "console-port"?: string;
   "workbuddy-home"?: string;
+  "host-kind"?: string;
 };
+
+type InstallHostKind = "openclaw" | "qclaw" | "hermes" | "workbuddy" | "codex";
 
 export type HostDefinition = {
   id: string;
   label: string;
   configPath: string;
   extensionsDir: string;
-  installKind?: "openclaw" | "hermes" | "workbuddy";
+  installKind?: "openclaw" | "hermes" | "workbuddy" | "codex";
   workbuddyHome?: string;
+  codexBinPath?: string;
   incompatibilityReason?: string;
 };
 
@@ -66,14 +107,28 @@ type InstallDestination = {
   configPath: string;
   extensionsDir: string;
   label: string;
-  installKind: "openclaw" | "hermes" | "workbuddy";
+  installKind: "openclaw" | "hermes" | "workbuddy" | "codex";
   workbuddyHome?: string;
+  codexBinPath?: string;
 };
 
 export type PromptSelectHost = (
   hosts: HostDefinition[],
   incompatibleHosts: HostDefinition[]
 ) => Promise<HostDefinition>;
+
+export type FastSearchExec = (
+  file: string,
+  args: string[],
+  options: { timeout: number; maxBuffer: number }
+) => Promise<{ stdout?: unknown; stderr?: unknown }>;
+
+export type HostDetectionOptions = {
+  platform?: NodeJS.Platform;
+  env?: NodeJS.ProcessEnv;
+  homeDir?: string;
+  fastSearchExec?: FastSearchExec;
+};
 
 type OpenClawConfig = {
   gateway?: {
@@ -143,6 +198,11 @@ const WORKBUDDY_MARKETPLACE_ID = "my-experts";
 const WORKBUDDY_PLUGIN_ID = "53aihub-workbuddy";
 const WORKBUDDY_SHARED_SESSION_ID = "53aihub-workbuddy-shared";
 const WORKBUDDY_HISTORY_SCOPE = "all";
+const CODEX_CHANNEL_INSTALL_ROOT = join(homedir(), ".53ai", "codex-channel");
+const CODEX_CHANNEL_LAUNCH_AGENT_LABEL = "com.53ai.codex-channel";
+const FAST_SEARCH_TIMEOUT_MS = 3_000;
+const FAST_SEARCH_MAX_BUFFER = 256 * 1024;
+const FAST_SEARCH_MAX_RESULTS = 40;
 const HERMES_ENV_KEYS = {
   botId: "HUB53AI_BOT_ID",
   secret: "HUB53AI_SECRET",
@@ -163,8 +223,10 @@ const SUPPORTED_ARGS = new Set([
   "config-path",
   "console-host",
   "console-port",
-  "workbuddy-home"
+  "workbuddy-home",
+  "host-kind"
 ]);
+const INSTALL_HOST_KINDS = new Set<InstallHostKind>(["openclaw", "qclaw", "hermes", "workbuddy", "codex"]);
 
 export async function installIntoQClaw(input: InstallInput): Promise<{
   configPath: string;
@@ -272,6 +334,248 @@ export async function installIntoWorkBuddy(input: WorkBuddyInstallInput): Promis
     hub53aiConfigured: true,
     pluginBuild: await readPluginBuildInfo(destination)
   };
+}
+
+export async function installIntoCodex(input: CodexInstallInput): Promise<{
+  installRoot: string;
+  destination: string;
+  configPath: string;
+  startScriptPath: string;
+  channelEntryPath: string;
+  workspaceRoot: string;
+  codexBinPath: string;
+  codexVersion: string;
+  hubBotId: string;
+  launchAgent: CodexLaunchAgentStatus;
+  hub53aiConfigured: boolean;
+  pluginBuild: string;
+}> {
+  const hubWsUrl = input.hubWsUrl?.trim();
+  const hubBotId = input.hubBotId?.trim();
+  const hubSecret = input.hubSecret?.trim();
+  if (!hubWsUrl || !hubBotId || !hubSecret) {
+    throw new Error("Codex install requires --hub-ws-url, --hub-bot-id, and --hub-secret");
+  }
+
+  const detectedCodex = await detectCodexInstallation(
+    input.codexBinPath ? { candidatePaths: [input.codexBinPath] } : {}
+  );
+  const installRoot = resolve(input.installRoot);
+  const destination = join(installRoot, "plugin");
+  const configPath = join(installRoot, "config.json");
+  const startScriptPath = join(installRoot, "start-codex-channel.sh");
+  const workspaceRoot = resolve(input.workspaceRoot || DEFAULT_CODEX_WORKSPACE_ROOT);
+  const channelEntryPath = join(destination, "dist", "codex-channel.cjs");
+  const nodeBinPath = input.nodeBinPath || process.execPath;
+
+  await mkdir(destination, { recursive: true });
+  await copyPublishablePackage(input.packageRoot, destination);
+  await writeCodexChannelInstallConfig(configPath, {
+    wsUrl: hubWsUrl,
+    botId: hubBotId,
+    secret: hubSecret,
+    codexBinPath: detectedCodex.binPath,
+    codexVersion: detectedCodex.version,
+    workspaceRoot,
+    channelEntryPath
+  });
+  await writeCodexChannelStartScript(startScriptPath, configPath, channelEntryPath, nodeBinPath);
+  const launchAgent = await installCodexLaunchAgent({
+    installRoot,
+    startScriptPath,
+    configPath,
+    channelEntryPath,
+    nodeBinPath,
+    options: input.launchAgent
+  });
+
+  return {
+    installRoot,
+    destination,
+    configPath,
+    startScriptPath,
+    channelEntryPath,
+    workspaceRoot,
+    codexBinPath: detectedCodex.binPath,
+    codexVersion: detectedCodex.version,
+    hubBotId,
+    launchAgent,
+    hub53aiConfigured: true,
+    pluginBuild: await readPluginBuildInfo(destination)
+  };
+}
+
+function formatCodexInstallResult(result: Awaited<ReturnType<typeof installIntoCodex>>): string[] {
+  return [
+    "Installed 53AIHub Codex channel.",
+    `Plugin: ${result.destination}`,
+    `Config: ${result.configPath}`,
+    `Start script: ${result.startScriptPath}`,
+    `Codex: ${result.codexBinPath} (${result.codexVersion})`,
+    `Workspace root: ${result.workspaceRoot}`,
+    `Bot ID: ${result.hubBotId}`,
+    `LaunchAgent: ${result.launchAgent.label} (${result.launchAgent.loaded ? "loaded" : "not loaded"})`,
+    `LaunchAgent plist: ${result.launchAgent.plistPath}`,
+    `Logs: ${result.launchAgent.stdoutPath} ${result.launchAgent.stderrPath}`,
+    `53AIHub: ${result.hub53aiConfigured ? "configured" : "not configured"}`,
+    `Plugin build: ${result.pluginBuild}`,
+    "Codex channel is managed by LaunchAgent and should connect automatically."
+  ];
+}
+
+async function writeCodexChannelStartScript(
+  startScriptPath: string,
+  configPath: string,
+  channelEntryPath: string,
+  nodeBinPath: string
+): Promise<void> {
+  await mkdir(dirname(startScriptPath), { recursive: true });
+  await writeFile(
+    startScriptPath,
+    [
+      "#!/bin/sh",
+      "set -eu",
+      `export HUB53AI_CODEX_CHANNEL_CONFIG=${quoteShellValue(configPath)}`,
+      `exec ${quoteShellValue(nodeBinPath)} ${quoteShellValue(channelEntryPath)}`,
+      ""
+    ].join("\n")
+  );
+  await chmod(startScriptPath, 0o755);
+}
+
+async function installCodexLaunchAgent(input: {
+  installRoot: string;
+  startScriptPath: string;
+  configPath: string;
+  channelEntryPath: string;
+  nodeBinPath: string;
+  options?: CodexLaunchAgentOptions;
+}): Promise<CodexLaunchAgentStatus> {
+  const options = input.options ?? {};
+  const label = options.label || CODEX_CHANNEL_LAUNCH_AGENT_LABEL;
+  const launchAgentsDir = options.launchAgentsDir || join(homedir(), "Library", "LaunchAgents");
+  const logDir = options.logDir || join(input.installRoot, "logs");
+  const plistPath = join(launchAgentsDir, `${label}.plist`);
+  const stdoutPath = join(logDir, "codex-channel.out.log");
+  const stderrPath = join(logDir, "codex-channel.err.log");
+  const platform = options.platform || process.platform;
+  const uid = options.uid ?? (typeof process.getuid === "function" ? process.getuid() : undefined);
+  const enabled = options.enabled ?? platform === "darwin";
+  const serviceTarget = uid === undefined ? "" : `gui/${uid}/${label}`;
+
+  await mkdir(launchAgentsDir, { recursive: true });
+  await mkdir(logDir, { recursive: true });
+  await writeFile(
+    plistPath,
+    buildCodexLaunchAgentPlist({
+      label,
+      startScriptPath: input.startScriptPath,
+      configPath: input.configPath,
+      channelEntryPath: input.channelEntryPath,
+      nodeBinPath: input.nodeBinPath,
+      workingDirectory: input.installRoot,
+      stdoutPath,
+      stderrPath
+    })
+  );
+
+  if (!enabled) {
+    return {
+      enabled: false,
+      label,
+      plistPath,
+      stdoutPath,
+      stderrPath,
+      loaded: false,
+      serviceTarget
+    };
+  }
+  if (platform !== "darwin") {
+    throw new Error("Codex LaunchAgent autostart is only supported on macOS");
+  }
+  if (uid === undefined) {
+    throw new Error("Cannot determine user id for Codex LaunchAgent");
+  }
+
+  const runLaunchctl = options.runLaunchctl || defaultLaunchctlRunner;
+  const domain = `gui/${uid}`;
+  await runLaunchctl(["bootout", domain, plistPath]).catch(() => undefined);
+  await runLaunchctl(["bootstrap", domain, plistPath]);
+  await runLaunchctl(["enable", serviceTarget]);
+  await runLaunchctl(["kickstart", "-k", serviceTarget]);
+  await runLaunchctl(["print", serviceTarget]);
+
+  return {
+    enabled: true,
+    label,
+    plistPath,
+    stdoutPath,
+    stderrPath,
+    loaded: true,
+    serviceTarget
+  };
+}
+
+async function defaultLaunchctlRunner(args: string[]): Promise<void> {
+  await execFileAsync("launchctl", args);
+}
+
+function buildCodexLaunchAgentPlist(input: {
+  label: string;
+  startScriptPath: string;
+  configPath: string;
+  channelEntryPath: string;
+  nodeBinPath: string;
+  workingDirectory: string;
+  stdoutPath: string;
+  stderrPath: string;
+}): string {
+  return [
+    `<?xml version="1.0" encoding="UTF-8"?>`,
+    `<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">`,
+    `<plist version="1.0">`,
+    `<dict>`,
+    `  <key>Label</key>`,
+    `  <string>${escapePlistString(input.label)}</string>`,
+    `  <key>ProgramArguments</key>`,
+    `  <array>`,
+    `    <string>${escapePlistString(input.nodeBinPath)}</string>`,
+    `    <string>${escapePlistString(input.channelEntryPath)}</string>`,
+    `  </array>`,
+    `  <key>EnvironmentVariables</key>`,
+    `  <dict>`,
+    `    <key>HUB53AI_CODEX_CHANNEL_CONFIG</key>`,
+    `    <string>${escapePlistString(input.configPath)}</string>`,
+    `    <key>HUB53AI_CODEX_CHANNEL_START_SCRIPT</key>`,
+    `    <string>${escapePlistString(input.startScriptPath)}</string>`,
+    `  </dict>`,
+    `  <key>WorkingDirectory</key>`,
+    `  <string>${escapePlistString(input.workingDirectory)}</string>`,
+    `  <key>RunAtLoad</key>`,
+    `  <true/>`,
+    `  <key>KeepAlive</key>`,
+    `  <true/>`,
+    `  <key>ProcessType</key>`,
+    `  <string>Interactive</string>`,
+    `  <key>ThrottleInterval</key>`,
+    `  <integer>10</integer>`,
+    `  <key>StandardOutPath</key>`,
+    `  <string>${escapePlistString(input.stdoutPath)}</string>`,
+    `  <key>StandardErrorPath</key>`,
+    `  <string>${escapePlistString(input.stderrPath)}</string>`,
+    `</dict>`,
+    `</plist>`,
+    ``
+  ].join("\n");
+}
+
+function escapePlistString(value: string): string {
+  return value
+    .replace(/&/g, "&amp;")
+    .replace(/</g, "&lt;")
+    .replace(/>/g, "&gt;")
+    .replace(/"/g, "&quot;")
+    .replace(/'/g, "&apos;");
 }
 
 async function installIntoHost(
@@ -430,13 +734,29 @@ export async function runInstallCommand(input: {
   selectHost?: (hosts: HostDefinition[]) => Promise<HostDefinition>;
   promptSelectHost?: PromptSelectHost;
   ttyPath?: string;
+  platform?: NodeJS.Platform;
+  env?: NodeJS.ProcessEnv;
+  homeDir?: string;
+  fastSearchExec?: FastSearchExec;
 }): Promise<void> {
   const argv = input.argv ?? process.argv.slice(2);
-  if (argv[0] !== "install" && argv[0] !== "install-workbuddy") {
-    throw new Error("expected subcommand: install or install-workbuddy");
+  if (argv[0] !== "install" && argv[0] !== "install-workbuddy" && argv[0] !== "install-codex") {
+    throw new Error("expected subcommand: install, install-workbuddy, or install-codex");
   }
 
   const args = parseArgs(argv.slice(1));
+  if (argv[0] === "install-codex") {
+    const result = await installIntoCodex({
+      packageRoot: input.packageRoot,
+      installRoot: CODEX_CHANNEL_INSTALL_ROOT,
+      hubWsUrl: args["hub-ws-url"],
+      hubBotId: args["hub-bot-id"],
+      hubSecret: args["hub-secret"]
+    });
+    process.stdout.write(formatCodexInstallResult(result).join("\n") + "\n");
+    return;
+  }
+
   if (argv[0] === "install-workbuddy") {
     const result = await installIntoWorkBuddy({
       packageRoot: input.packageRoot,
@@ -463,10 +783,28 @@ export async function runInstallCommand(input: {
     selectHosts: input.selectHosts,
     selectHost: input.selectHost,
     promptSelectHost: input.promptSelectHost,
-    ttyPath: input.ttyPath
+    ttyPath: input.ttyPath,
+    platform: input.platform,
+    env: input.env,
+    homeDir: input.homeDir,
+    fastSearchExec: input.fastSearchExec
   });
 
   for (const destination of destinations) {
+    if (destination.installKind === "codex") {
+      const result = await installIntoCodex({
+        packageRoot: input.packageRoot,
+        installRoot: destination.extensionsDir,
+        hubWsUrl: args["hub-ws-url"],
+        hubBotId: args["hub-bot-id"],
+        hubSecret: args["hub-secret"],
+        codexBinPath: destination.codexBinPath || destination.configPath
+      });
+
+      process.stdout.write(formatCodexInstallResult(result).join("\n") + "\n");
+      continue;
+    }
+
     if (destination.installKind === "workbuddy") {
       const result = await installIntoWorkBuddy({
         packageRoot: input.packageRoot,
@@ -532,22 +870,29 @@ async function resolveInstallDestinations(
     selectHost?: (hosts: HostDefinition[]) => Promise<HostDefinition>;
     promptSelectHost?: PromptSelectHost;
     ttyPath?: string;
-  } = {}
+  } & HostDetectionOptions = {}
 ): Promise<InstallDestination[]> {
   const explicitConfigPath = args["config-path"] ? resolve(args["config-path"]) : undefined;
   const explicitExtensionsDir = args["extensions-dir"] ? resolve(args["extensions-dir"]) : undefined;
   const explicitWorkBuddyHome = args["workbuddy-home"] ? resolve(args["workbuddy-home"]) : undefined;
+  const hostKind = parseInstallHostKind(args["host-kind"]);
 
   if (explicitWorkBuddyHome) {
     if (explicitConfigPath || explicitExtensionsDir) {
       throw new Error("pass --workbuddy-home by itself, or pass --config-path and --extensions-dir together for Claw-style hosts");
     }
+    if (hostKind && hostKind !== "workbuddy") {
+      throw new Error(`--workbuddy-home can only be combined with --host-kind workbuddy, got ${hostKind}`);
+    }
     return [toInstallDestination(createWorkBuddyHostDefinition(explicitWorkBuddyHome))];
   }
 
   if (explicitConfigPath && explicitExtensionsDir) {
-    const hermes = isHermesDestination(explicitConfigPath, explicitExtensionsDir);
-    const clawLabel = inferDetectedClawLabel(explicitConfigPath, explicitExtensionsDir);
+    if (hostKind === "codex" || hostKind === "workbuddy") {
+      throw new Error(`--host-kind ${hostKind} cannot be combined with --config-path and --extensions-dir`);
+    }
+    const hermes = hostKind === "hermes" || isHermesDestination(explicitConfigPath, explicitExtensionsDir);
+    const clawLabel = hostKind ? labelForHostKind(hostKind) : inferDetectedClawLabel(explicitConfigPath, explicitExtensionsDir);
     return [{
       configPath: explicitConfigPath,
       extensionsDir: hermes ? normalizeHermesPlatformsDir(explicitExtensionsDir) : explicitExtensionsDir,
@@ -560,9 +905,18 @@ async function resolveInstallDestinations(
     throw new Error("pass --config-path and --extensions-dir together, or omit both to auto-detect compatible agents");
   }
 
-  const detected = detectInstallHosts(options.hostDefinitions ?? getDefaultHostDefinitions());
-  const compatible = detected;
+  const hostDefinitions = options.hostDefinitions ?? getDefaultHostDefinitions(options);
+  const detected = await detectInstallHostsWithSearch(
+    hostDefinitions,
+    hostKind,
+    options,
+    Boolean(options.hostDefinitions) && !options.fastSearchExec
+  );
+  const compatible = hostKind ? filterHostsByKind(detected, hostKind) : detected;
   const incompatible: HostDefinition[] = [];
+  if (hostKind && compatible.length > 0) {
+    return [toInstallDestination(compatible[0]!)];
+  }
   if (compatible.length > 0) {
     const selected = options.selectHosts
       ? validateSingleSelectedHost(await options.selectHosts(compatible, incompatible), compatible)
@@ -573,28 +927,32 @@ async function resolveInstallDestinations(
   }
   throw new Error(
     [
-      "could not auto-detect an installed compatible agent.",
+      hostKind
+        ? `could not auto-detect an installed ${labelForHostKind(hostKind)} agent.`
+        : "could not auto-detect an installed compatible agent.",
       "Pass --config-path and --extensions-dir to install into a specific Claw-style host.",
       "Pass --workbuddy-home to install into a specific WorkBuddy home.",
+      "Use --host-kind openclaw, --host-kind qclaw, or --host-kind codex to skip cross-agent selection.",
       "",
       "Supported default locations:",
-      ...formatHostList(options.hostDefinitions ?? getDefaultHostDefinitions())
+      ...formatHostList(hostKind ? filterHostsByKind(hostDefinitions, hostKind) : hostDefinitions)
     ].join("\n")
   );
 }
 
-function getDefaultHostDefinitions(): HostDefinition[] {
-  const home = homedir();
+function getDefaultHostDefinitions(options: HostDetectionOptions = {}): HostDefinition[] {
+  const home = getDetectionHomeDir(options);
   const qclawHome = resolve(home, ".qclaw");
   const openClawHome = resolve(home, ".openclaw");
   const hermesHome = resolve(home, ".hermes");
   const workbuddyHome = resolve(home, ".workbuddy");
+  const codexHost = createCodexHostDefinition(options);
   return [
     {
       id: "qclaw",
       label: "QClaw",
       configPath: join(qclawHome, "openclaw.json"),
-      extensionsDir: resolve(home, "Library/Application Support/QClaw/openclaw/config/extensions")
+      extensionsDir: getQClawExtensionsDirCandidates(options)[0] ?? resolve(qclawHome, "extensions")
     },
     {
       id: "openclaw",
@@ -609,8 +967,236 @@ function getDefaultHostDefinitions(): HostDefinition[] {
       extensionsDir: resolve(hermesHome, "plugins", "platforms"),
       installKind: "hermes"
     },
-    createWorkBuddyHostDefinition(workbuddyHome)
+    createWorkBuddyHostDefinition(workbuddyHome),
+    ...(codexHost ? [codexHost] : [])
   ];
+}
+
+export function getQClawExtensionsDirCandidates(options: HostDetectionOptions = {}): string[] {
+  const home = getDetectionHomeDir(options);
+  const env = options.env ?? process.env;
+  const platform = options.platform ?? process.platform;
+  const candidates: string[] = [];
+
+  if (platform === "darwin") {
+    candidates.push(join(home, "Library", "Application Support", "QClaw", "openclaw", "config", "extensions"));
+  } else if (platform === "win32") {
+    const appData = env.APPDATA || join(home, "AppData", "Roaming");
+    const localAppData = env.LOCALAPPDATA || join(home, "AppData", "Local");
+    candidates.push(
+      join(appData, "QClaw", "openclaw", "config", "extensions"),
+      join(localAppData, "QClaw", "openclaw", "config", "extensions")
+    );
+  } else {
+    const xdgConfigHome = env.XDG_CONFIG_HOME || join(home, ".config");
+    const xdgDataHome = env.XDG_DATA_HOME || join(home, ".local", "share");
+    candidates.push(
+      join(xdgConfigHome, "QClaw", "openclaw", "config", "extensions"),
+      join(xdgDataHome, "QClaw", "openclaw", "config", "extensions")
+    );
+  }
+
+  candidates.push(join(home, ".qclaw", "extensions"));
+  return dedupeStrings(candidates.map((candidate) => resolve(candidate)));
+}
+
+async function detectInstallHostsWithSearch(
+  hostDefinitions: HostDefinition[],
+  hostKind: InstallHostKind | undefined,
+  options: HostDetectionOptions,
+  skipSearch: boolean
+): Promise<HostDefinition[]> {
+  const detected = detectInstallHosts(hostDefinitions);
+  if (skipSearch || (!hostKind && detected.length > 0) || (hostKind && filterHostsByKind(detected, hostKind).length > 0)) {
+    return detected;
+  }
+
+  const searched = await searchInstallHostDefinitions(hostKind, options);
+  return detectInstallHosts([...hostDefinitions, ...searched]);
+}
+
+async function searchInstallHostDefinitions(
+  hostKind: InstallHostKind | undefined,
+  options: HostDetectionOptions
+): Promise<HostDefinition[]> {
+  if (hostKind === "codex" || hostKind === "workbuddy" || hostKind === "hermes") {
+    return [];
+  }
+
+  const configPaths = await fastSearchOpenClawConfigPaths(options);
+  return configPaths
+    .map((configPath) => createSearchedClawHostDefinition(configPath, options))
+    .filter((host): host is HostDefinition => Boolean(host))
+    .filter((host) => !hostKind || getHostKind(host) === hostKind);
+}
+
+async function fastSearchOpenClawConfigPaths(options: HostDetectionOptions): Promise<string[]> {
+  const exec = options.fastSearchExec ?? (execFileAsync as FastSearchExec);
+  const platform = options.platform ?? process.platform;
+  const roots = getBoundedSearchRoots(options).filter((root) => existsSync(root));
+  const results: string[] = [];
+
+  for (const root of roots) {
+    if (results.length >= FAST_SEARCH_MAX_RESULTS) {
+      break;
+    }
+    const remaining = FAST_SEARCH_MAX_RESULTS - results.length;
+    const found = await runFastSearchCommand(exec, platform, root, remaining);
+    results.push(...found);
+  }
+
+  return dedupeStrings(results.map((entry) => resolve(entry.trim())).filter(Boolean)).slice(0, FAST_SEARCH_MAX_RESULTS);
+}
+
+async function runFastSearchCommand(
+  exec: FastSearchExec,
+  platform: NodeJS.Platform,
+  root: string,
+  maxResults: number
+): Promise<string[]> {
+  if (platform === "darwin") {
+    const mdfind = await tryFastSearch(exec, "mdfind", ["-onlyin", root, "kMDItemFSName == 'openclaw.json'"]);
+    return mdfind.slice(0, maxResults);
+  }
+
+  if (platform === "win32") {
+    const command = [
+      "Get-ChildItem",
+      "-LiteralPath",
+      quotePowerShellLiteral(root),
+      "-Filter",
+      "openclaw.json",
+      "-File",
+      "-Recurse",
+      "-ErrorAction",
+      "SilentlyContinue",
+      "|",
+      "Select-Object",
+      "-First",
+      String(maxResults),
+      "-ExpandProperty",
+      "FullName"
+    ].join(" ");
+    const powershell = await tryFastSearch(exec, "powershell.exe", ["-NoProfile", "-Command", command]);
+    return powershell.slice(0, maxResults);
+  }
+
+  const fd = await tryFastSearch(exec, "fd", [
+    "--absolute-path",
+    "--type",
+    "file",
+    "--max-depth",
+    "6",
+    "^openclaw\\.json$",
+    root
+  ]);
+  if (fd.length > 0) {
+    return fd.slice(0, maxResults);
+  }
+
+  const find = await tryFastSearch(exec, "find", [root, "-maxdepth", "6", "-type", "f", "-name", "openclaw.json"]);
+  return find.slice(0, maxResults);
+}
+
+async function tryFastSearch(exec: FastSearchExec, file: string, args: string[]): Promise<string[]> {
+  try {
+    const result = await exec(file, args, {
+      timeout: FAST_SEARCH_TIMEOUT_MS,
+      maxBuffer: FAST_SEARCH_MAX_BUFFER
+    });
+    return String(result.stdout || "")
+      .split(/\r?\n/)
+      .map((entry) => entry.trim())
+      .filter(Boolean);
+  } catch {
+    return [];
+  }
+}
+
+function createSearchedClawHostDefinition(configPath: string, options: HostDetectionOptions): HostDefinition | undefined {
+  const kind = inferHostKindFromSearchedConfigPath(configPath);
+  if (!kind) {
+    return undefined;
+  }
+
+  if (kind === "qclaw") {
+    return createQClawHostDefinition(configPath, options);
+  }
+
+  return {
+    id: "openclaw",
+    label: "OpenClaw",
+    configPath,
+    extensionsDir: inferSiblingExtensionsDir(configPath)
+  };
+}
+
+function createQClawHostDefinition(configPath: string, options: HostDetectionOptions): HostDefinition {
+  return {
+    id: "qclaw",
+    label: "QClaw",
+    configPath,
+    extensionsDir: inferQClawExtensionsDir(configPath, options)
+  };
+}
+
+function inferQClawExtensionsDir(configPath: string, options: HostDetectionOptions): string {
+  const normalizedDir = normalizePath(dirname(configPath));
+  if (normalizedDir.endsWith("/openclaw/config") || normalizedDir.includes("/qclaw/openclaw/config")) {
+    return join(dirname(configPath), "extensions");
+  }
+  return getQClawExtensionsDirCandidates(options)[0] ?? join(dirname(configPath), "extensions");
+}
+
+function inferSiblingExtensionsDir(configPath: string): string {
+  return join(dirname(configPath), "extensions");
+}
+
+function inferHostKindFromSearchedConfigPath(configPath: string): "openclaw" | "qclaw" | undefined {
+  const normalized = normalizePath(configPath);
+  if (normalized.includes("/.qclaw/") || normalized.includes("/qclaw/openclaw/config/")) {
+    return "qclaw";
+  }
+  if (normalized.includes("/.openclaw/") || normalized.includes("/openclaw/openclaw/config/")) {
+    return "openclaw";
+  }
+  return undefined;
+}
+
+function getBoundedSearchRoots(options: HostDetectionOptions): string[] {
+  const home = getDetectionHomeDir(options);
+  const env = options.env ?? process.env;
+  const platform = options.platform ?? process.platform;
+
+  if (platform === "darwin") {
+    return dedupeStrings([join(home, "Library", "Application Support"), home, "/Applications"].map((entry) => resolve(entry)));
+  }
+
+  if (platform === "win32") {
+    return dedupeStrings([
+      env.APPDATA || join(home, "AppData", "Roaming"),
+      env.LOCALAPPDATA || join(home, "AppData", "Local"),
+      home
+    ].map((entry) => resolve(entry)));
+  }
+
+  return dedupeStrings([
+    env.XDG_CONFIG_HOME || join(home, ".config"),
+    env.XDG_DATA_HOME || join(home, ".local", "share"),
+    home
+  ].map((entry) => resolve(entry)));
+}
+
+function quotePowerShellLiteral(value: string): string {
+  return `'${value.replace(/'/g, "''")}'`;
+}
+
+function getDetectionHomeDir(options: HostDetectionOptions): string {
+  return options.homeDir ? resolve(options.homeDir) : homedir();
+}
+
+function normalizePath(path: string): string {
+  return path.replace(/\\/g, "/").toLowerCase();
 }
 
 function inferDetectedClawLabel(configPath: string, extensionsDir: string): "QClaw" | "OpenClaw" | "Hermes" | "WorkBuddy" {
@@ -618,6 +1204,42 @@ function inferDetectedClawLabel(configPath: string, extensionsDir: string): "QCl
   if (kind === "qclaw") return "QClaw";
   if (kind === "hermes") return "Hermes";
   if (kind === "workbuddy") return "WorkBuddy";
+  return "OpenClaw";
+}
+
+function parseInstallHostKind(value: string | undefined): InstallHostKind | undefined {
+  if (!value) {
+    return undefined;
+  }
+  const normalized = value.trim().toLowerCase();
+  if (INSTALL_HOST_KINDS.has(normalized as InstallHostKind)) {
+    return normalized as InstallHostKind;
+  }
+  throw new Error(`invalid --host-kind: ${value}. Expected one of: ${Array.from(INSTALL_HOST_KINDS).join(", ")}`);
+}
+
+function filterHostsByKind(hosts: HostDefinition[], kind: InstallHostKind): HostDefinition[] {
+  return hosts.filter((host) => getHostKind(host) === kind);
+}
+
+function getHostKind(host: HostDefinition): InstallHostKind {
+  if (host.installKind === "codex" || host.installKind === "hermes" || host.installKind === "workbuddy") {
+    return host.installKind;
+  }
+  if (host.id === "qclaw") {
+    return "qclaw";
+  }
+  if (host.id === "openclaw") {
+    return "openclaw";
+  }
+  return inferHostKindFromSearchedConfigPath(host.configPath) ?? inferHostKindFromSearchedConfigPath(host.extensionsDir) ?? "openclaw";
+}
+
+function labelForHostKind(kind: InstallHostKind): string {
+  if (kind === "qclaw") return "QClaw";
+  if (kind === "hermes") return "Hermes";
+  if (kind === "workbuddy") return "WorkBuddy";
+  if (kind === "codex") return "Codex";
   return "OpenClaw";
 }
 
@@ -629,6 +1251,21 @@ function createWorkBuddyHostDefinition(workbuddyHome: string): HostDefinition {
     extensionsDir: join(workbuddyHome, "plugins", "marketplaces", WORKBUDDY_MARKETPLACE_ID, "plugins"),
     installKind: "workbuddy",
     workbuddyHome
+  };
+}
+
+function createCodexHostDefinition(options: HostDetectionOptions = {}): HostDefinition | undefined {
+  const detected = getDefaultCodexBinaryCandidates(options.env).find((candidate) => existsSync(candidate.path));
+  if (!detected) {
+    return undefined;
+  }
+  return {
+    id: "codex",
+    label: "Codex",
+    configPath: detected.path,
+    extensionsDir: CODEX_CHANNEL_INSTALL_ROOT,
+    installKind: "codex",
+    codexBinPath: detected.path
   };
 }
 
@@ -678,7 +1315,7 @@ async function promptForInstallHost(
     throw new Error(
       [
         "multiple compatible agents were detected, but no interactive terminal was available.",
-        "Run the installer again in an interactive terminal, pass --config-path and --extensions-dir, or pass --workbuddy-home.",
+        "Run the installer again with --host-kind, use an interactive terminal, pass explicit path options, pass --workbuddy-home, or use install-codex.",
         "",
         "Detected locations:",
         ...formatHostList(hosts),
@@ -694,7 +1331,8 @@ function toInstallDestination(host: HostDefinition): InstallDestination {
     extensionsDir: resolve(host.extensionsDir),
     label: host.label,
     installKind: host.installKind ?? "openclaw",
-    workbuddyHome: host.workbuddyHome ? resolve(host.workbuddyHome) : undefined
+    workbuddyHome: host.workbuddyHome ? resolve(host.workbuddyHome) : undefined,
+    codexBinPath: host.codexBinPath ? resolve(host.codexBinPath) : undefined
   };
 }
 
@@ -1064,6 +1702,10 @@ async function updateHermesEnv(configPath: string, values: { botId: string; secr
 
 function quoteEnvValue(value: string): string {
   return JSON.stringify(value);
+}
+
+function quoteShellValue(value: string): string {
+  return `'${value.replace(/'/g, "'\\''")}'`;
 }
 
 function isHermesDestination(configPath: string, extensionsDir: string): boolean {

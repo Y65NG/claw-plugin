@@ -2138,6 +2138,111 @@ describe("gateway client", () => {
     await new Promise<void>((resolve) => wss.close(() => resolve()));
   });
 
+  it("normalizes live used_exec tool payloads and preserves command input", async () => {
+    const received: Array<{ kind: string; name?: unknown; command?: unknown }> = [];
+    const httpServer = createServer();
+    servers.add(httpServer);
+    const wss = new WebSocketServer({ noServer: true });
+
+    httpServer.on("upgrade", (request, socket, head) => {
+      wss.handleUpgrade(request, socket, head, (client) => {
+        client.send(
+          JSON.stringify({
+            type: "event",
+            event: "connect.challenge",
+            payload: { nonce: "nonce-1" }
+          })
+        );
+
+        client.on("message", (data) => {
+          const frame = JSON.parse(data.toString()) as {
+            id: string;
+            method: string;
+          };
+
+          if (frame.method === "connect") {
+            client.send(JSON.stringify({ type: "res", id: frame.id, ok: true, payload: { protocol: 4 } }));
+            return;
+          }
+
+          client.send(JSON.stringify({ type: "res", id: frame.id, ok: true, payload: { ok: true } }));
+
+          if (frame.method === "sessions.messages.subscribe") {
+            client.send(
+              JSON.stringify({
+                type: "event",
+                event: "session.tool",
+                payload: {
+                  sessionKey: "agent:main:test-session",
+                  seq: 9,
+                  data: {
+                    phase: "call",
+                    name: "used_exec",
+                    toolCallId: "call-weather",
+                    args: {
+                      command: 'curl -s \\"wttr.in/Shanghai?2\\"',
+                      timeout: 10
+                    }
+                  }
+                }
+              })
+            );
+            client.send(
+              JSON.stringify({
+                type: "event",
+                event: "session.tool",
+                payload: {
+                  sessionKey: "agent:main:test-session",
+                  seq: 10,
+                  data: {
+                    phase: "result",
+                    name: "used_exec",
+                    toolCallId: "call-weather",
+                    result: "Shanghai weather"
+                  }
+                }
+              })
+            );
+          }
+        });
+      });
+    });
+
+    const address = await listen(httpServer);
+    const client = createGatewayClient({
+      baseUrl: address.replace("http://", "ws://"),
+      secret: "shared-token"
+    });
+
+    const close = client.subscribe("agent:main:test-session", 0, {
+      onEvent: (event) =>
+        received.push({
+          kind: event.kind,
+          name: (event.payload as { data?: { name?: unknown } }).data?.name,
+          command: (event.payload as { data?: { args?: { command?: unknown } } }).data?.args?.command
+        }),
+      onDisconnect: () => {}
+    });
+
+    await eventually(() =>
+      expect(received).toEqual([
+        {
+          kind: "tool.call",
+          name: "exec",
+          command: 'curl -s "wttr.in/Shanghai?2"'
+        },
+        {
+          kind: "tool.result",
+          name: "exec",
+          command: 'curl -s "wttr.in/Shanghai?2"'
+        }
+      ])
+    );
+    close();
+    await client.stop();
+    await new Promise<void>((resolve) => wss.close(() => resolve()));
+  });
+
   it("renumbers live session.tool events above the subscription cursor while preserving raw seq", async () => {
     const received: Array<{ kind: string; seq: number; rawSeq?: unknown; name?: unknown }> = [];
     const httpServer = createServer();

@@ -129,6 +129,8 @@ type SessionSubscription = {
   renderedAssistantTextByRun: Map<string, string>;
   skippedSessionAssistantText: Set<string>;
   renderedThinkingTextByRun: Map<string, string>;
+  toolCallDataById: Map<string, Record<string, unknown>>;
+  lastToolCallDataByName: Map<string, Record<string, unknown>>;
 };
 
 const DEFAULT_SCOPES = ["operator.read", "operator.write"];
@@ -208,7 +210,9 @@ export function createGatewayClient(config: Partial<GatewayConfig>): GatewayClie
       activeRunIds: new Set<string>(),
       renderedAssistantTextByRun: new Map<string, string>(),
       skippedSessionAssistantText: new Set<string>(),
-      renderedThinkingTextByRun: new Map<string, string>()
+      renderedThinkingTextByRun: new Map<string, string>(),
+      toolCallDataById: new Map<string, Record<string, unknown>>(),
+      lastToolCallDataByName: new Map<string, Record<string, unknown>>()
     };
     subscription.lastSeq = Math.max(subscription.lastSeq, afterSeq);
     subscription.handlers.add(handlers);
@@ -2150,6 +2154,7 @@ function normalizeMessage(sessionId: string, payload: unknown, index = 0): Sessi
 
   const message = payload as Record<string, unknown>;
   const role = typeof message.role === "string" ? message.role : "assistant";
+  const typedTextSegments = extractTextSegments(message.content);
   const content = extractTextContent(message.content) ?? (typeof message.content === "string" ? message.content : "");
   if (!content.trim()) {
     return null;
@@ -2170,6 +2175,18 @@ function normalizeMessage(sessionId: string, payload: unknown, index = 0): Sessi
   const existingPayload = toRecord(message.payload);
   const existingMetadata = toRecord(message.metadata);
   const existingData = toRecord(message.data);
+  const responseId = stringProperty(message, ["responseId", "response_id"]);
+  const runId = stringProperty(message, ["runId", "run_id"]);
+  const typedTranscriptMeta = {
+    ...(typedTextSegments.length > 0
+      ? {
+          openclaw_typed_text_segments: typedTextSegments,
+          openclaw_typed_text_segment_count: typedTextSegments.length
+        }
+      : {}),
+    ...(responseId ? { responseId, response_id: responseId } : {}),
+    ...(runId ? { runId, run_id: runId } : {})
+  };
   const seqMeta =
     seq > 0
       ? {
@@ -2193,34 +2210,38 @@ function normalizeMessage(sessionId: string, payload: unknown, index = 0): Sessi
           message_seq: seq
         }
       : {}),
-    ...(Object.keys(existingPayload).length > 0 || seq > 0
+    ...(Object.keys(existingPayload).length > 0 || Object.keys(typedTranscriptMeta).length > 0 || seq > 0
       ? {
           payload: {
             ...existingPayload,
+            ...typedTranscriptMeta,
             ...seqMeta
           }
         }
       : {}),
-    ...(Object.keys(existingMetadata).length > 0 || seq > 0
+    ...(Object.keys(existingMetadata).length > 0 || Object.keys(typedTranscriptMeta).length > 0 || seq > 0
       ? {
           metadata: {
             ...existingMetadata,
+            ...typedTranscriptMeta,
             ...seqMeta
           }
         }
       : {}),
-    ...(Object.keys(existingData).length > 0 || seq > 0
+    ...(Object.keys(existingData).length > 0 || Object.keys(typedTranscriptMeta).length > 0 || seq > 0
       ? {
           data: {
             ...existingData,
+            ...typedTranscriptMeta,
             ...seqMeta
           }
         }
       : {}),
-    ...(Object.keys(rawMeta).length > 0 || seq > 0
+    ...(Object.keys(rawMeta).length > 0 || Object.keys(typedTranscriptMeta).length > 0 || seq > 0
       ? {
           __openclaw: {
             ...rawMeta,
+            ...typedTranscriptMeta,
             ...(seq > 0 ? { seq } : {})
           }
         }
@@ -2433,6 +2454,139 @@ function normalizeToolArguments(value: unknown): unknown {
   } catch {
     return trimmed;
   }
+}
+
+function normalizeCommandText(value: string): string {
+  return value.replace(/\r\n/g, "\n").replace(/\\"/g, "\"").replace(/\\'/g, "'").trim();
+}
+
+function isExecToolName(name: string): boolean {
+  const normalized = name.replace(/[\s-]+/g, "_").toLowerCase();
+  return normalized === "exec" || normalized === "used_exec" || normalized === "bash" || normalized === "shell" || normalized === "run_command";
+}
+
+function normalizeToolName(value: string): string {
+  const normalized = value.trim();
+  return isExecToolName(normalized) ? "exec" : normalized;
+}
+
+function readToolCallId(record: Record<string, unknown>): string | undefined {
+  return stringProperty(record, ["toolCallId", "tool_call_id", "callId", "call_id", "id"]);
+}
+
+function parseToolArgumentsRecord(value: unknown): Record<string, unknown> {
+  const normalized = normalizeToolArguments(value);
+  return toRecord(normalized);
+}
+
+function firstToolArgumentsRecord(...values: unknown[]): Record<string, unknown> {
+  for (const value of values) {
+    const record = parseToolArgumentsRecord(value);
+    if (Object.keys(record).length > 0) {
+      return record;
+    }
+  }
+  return {};
+}
+
+function readExecCommandFromRecords(...records: Record<string, unknown>[]): string {
+  for (const record of records) {
+    const command = stringProperty(record, ["command", "cmd", "script", "shell", "commandLine", "command_line", "code"]);
+    if (command) {
+      return normalizeCommandText(command);
+    }
+  }
+  return "";
+}
+
+function normalizeSessionToolPayload(
+  payload: Record<string, unknown>,
+  subscription?: SessionSubscription
+): Record<string, unknown> {
+  const data = toRecord(payload.data);
+  const fn = toRecord(data.function ?? payload.function);
+  const rawName =
+    stringProperty(data, ["name", "toolName", "tool_name", "tool", "displayName", "display_name", "title"]) ??
+    stringProperty(payload, ["name", "toolName", "tool_name", "tool"]) ??
+    stringProperty(fn, ["name"]) ??
+    "tool";
+  const name = normalizeToolName(rawName);
+  const inherited = lookupSessionToolCallData(data, name, subscription);
+  const inheritedArgs = toRecord(inherited.args);
+  const args = firstToolArgumentsRecord(
+    data.args,
+    data.arguments,
+    data.input,
+    data.parameters,
+    data.toolInput,
+    data.tool_input,
+    payload.args,
+    payload.arguments,
+    payload.input,
+    payload.parameters,
+    payload.toolInput,
+    payload.tool_input,
+    fn.arguments,
+    inherited.args
+  );
+  const command = readExecCommandFromRecords(args, data, payload, inheritedArgs, inherited);
+  const normalizedArgs =
+    command && isExecToolName(name)
+      ? {
+          ...args,
+          command
+        }
+      : args;
+  const toolCallId =
+    readToolCallId(data) ||
+    readToolCallId(payload) ||
+    readToolCallId(fn) ||
+    readToolCallId(inherited);
+
+  return {
+    ...payload,
+    data: {
+      ...data,
+      name,
+      ...(toolCallId ? { toolCallId } : {}),
+      ...(Object.keys(normalizedArgs).length > 0 ? { args: normalizedArgs } : {}),
+      ...(command && isExecToolName(name) ? { command } : {})
+    }
+  };
+}
+
+function lookupSessionToolCallData(
+  data: Record<string, unknown>,
+  name: string,
+  subscription?: SessionSubscription
+): Record<string, unknown> {
+  if (!subscription) {
+    return {};
+  }
+  const callId = readToolCallId(data);
+  if (callId) {
+    const byId = subscription.toolCallDataById.get(callId);
+    if (byId) {
+      return byId;
+    }
+  }
+  return subscription.lastToolCallDataByName.get(name) ?? {};
+}
+
+function rememberSessionToolCallData(
+  eventKind: "tool.call" | "tool.result",
+  data: Record<string, unknown>,
+  subscription?: SessionSubscription
+) {
+  if (!subscription || eventKind !== "tool.call") {
+    return;
+  }
+  const name = stringProperty(data, ["name", "toolName", "tool_name", "tool"]) ?? "tool";
+  const callId = readToolCallId(data);
+  if (callId) {
+    subscription.toolCallDataById.set(callId, data);
+  }
+  subscription.lastToolCallDataByName.set(name, data);
 }
 
 function summarizeToolCallMeta(name: string, args: unknown): string | undefined {
@@ -2780,16 +2934,19 @@ function mapGatewayFrameToEvents(
   if (frame.event === "session.tool") {
     const rawSeq = Number(payload.seq);
     const seq = Number.isFinite(rawSeq) ? Math.max(lastSeq + 1, rawSeq) : lastSeq + 1;
-    const data = toRecord(payload.data);
-    const kind = String(payload.phase ?? data.phase ?? "tool");
+    const normalizedPayload = normalizeSessionToolPayload(payload, subscription);
+    const data = toRecord(normalizedPayload.data);
+    const kind = String(normalizedPayload.phase ?? data.phase ?? "tool");
+    const eventKind = ["result", "done", "output"].includes(kind) ? "tool.result" : "tool.call";
+    rememberSessionToolCallData(eventKind, data, subscription);
     return [
       {
         id: `${sessionId}:tool:${seq}`,
         sessionId,
         seq,
-        kind: ["result", "done", "output"].includes(kind) ? "tool.result" : "tool.call",
+        kind: eventKind,
         payload: {
-          ...(frame.payload ?? {}),
+          ...normalizedPayload,
           ...(Number.isFinite(rawSeq) ? { rawSeq } : {})
         },
         createdAt: new Date().toISOString()
@@ -2997,11 +3154,17 @@ function extractTextContent(content: unknown): string | null {
   if (typeof content === "string") {
     return content;
   }
+  const lines = extractTextSegments(content);
+
+  return lines.length > 0 ? lines.join("\n") : null;
+}
+
+function extractTextSegments(content: unknown): string[] {
   if (!Array.isArray(content)) {
-    return null;
+    return [];
   }
 
-  const lines = content
+  return content
     .flatMap((item) => {
       if (!item || typeof item !== "object") {
         return [];
@@ -3013,8 +3176,6 @@ function extractTextContent(content: unknown): string | null {
       return [];
     })
     .filter((value) => value.trim().length > 0);
-
-  return lines.length > 0 ? lines.join("\n") : null;
 }
 
 function extractThinkingContent(content: unknown): string | null {

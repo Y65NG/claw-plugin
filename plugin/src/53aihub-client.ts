@@ -220,6 +220,32 @@ type OpenClawRunFailureClassification = {
   confidence: "high" | "medium" | "low";
 };
 
+type OpenClawTypedFinalMatchStrategy =
+  | "run_id"
+  | "response_id"
+  | "request_window"
+  | "latest_after_user";
+
+type OpenClawTypedFinalTranscript = {
+  text: string;
+  segmentCount: number;
+  matchStrategy: OpenClawTypedFinalMatchStrategy;
+  messageIds: string[];
+  messageSeqs: number[];
+};
+
+type OpenClawTypedLiveTranscript = OpenClawTypedFinalTranscript;
+
+type OpenClawTypedToolCall = {
+  id: string;
+  name: string;
+  args: Record<string, unknown>;
+  command?: string;
+  meta?: string;
+  sourceEventId?: string;
+  sourceSeq?: number;
+};
+
 export type Hub53AIMediaAttachment = Hub53AIOutputFile & {
   kind: "image" | "audio" | "video" | "text" | "file";
 };
@@ -749,7 +775,19 @@ export function createHub53AIBridge(input: HubBridgeInput) {
         eventScope.currentRunId = group.runId;
       }
 
-      for (const event of group.events) {
+      const orderedEvents = [
+        ...group.events.filter((event) => !isTerminalRunEvent(event)),
+        ...group.events.filter((event) => isTerminalRunEvent(event))
+      ];
+      let typedFinalChecked = false;
+      for (const event of orderedEvents) {
+        if (!typedFinalChecked && isTerminalRunEvent(event)) {
+          typedFinalChecked = true;
+          const typedFinalAppended = await appendTypedFinalReplaceForHistoryGroup(sessionId, group, eventScope, event);
+          if (typedFinalAppended) {
+            appended += 1;
+          }
+        }
         if (!shouldAttachOpenClawTimeline(event)) {
           continue;
         }
@@ -1068,9 +1106,12 @@ export function createHub53AIBridge(input: HubBridgeInput) {
       activityAppliedEventKeys: new Set<string>(),
       answerContentAppliedEventKeys: new Set<string>(),
       answerSegmentTextById: new Map<string, string>(),
+      answerSegmentVisibilityById: new Map<string, OpenClawTimelineV2Visibility>(),
+      answerSegmentTrustedById: new Map<string, boolean>(),
       nextDeltaIndexBySegment: new Map<string, number>(),
       segmentIndexById: new Map<string, number>(),
       timelineMetaByEventKey: new Map<string, OpenClawTimelineV2Meta>(),
+      typedToolCallEnrichedKeys: new Set<string>(),
       currentActivitySeen: false,
       visibleResponseSeen: false,
       lastSeqSeen: 0,
@@ -1078,6 +1119,24 @@ export function createHub53AIBridge(input: HubBridgeInput) {
       referencedLocalOutputPaths: new Set<string>(),
       writeOutputFilesByToolCallId: new Map<string, Hub53AIOutputFile[]>()
     };
+  }
+
+  async function appendTypedFinalReplaceForHistoryGroup(
+    sessionId: string,
+    group: HistoryLedgerBackfillGroup,
+    eventScope: GatewayEventScope,
+    terminalEvent: TimelineEvent
+  ): Promise<boolean> {
+    if (!group.terminalSeen || terminalEvent.kind !== "run.completed") {
+      return false;
+    }
+    return applyTypedTranscriptFinalReplace({
+      sessionId,
+      terminalEvent,
+      eventScope,
+      reqId: eventScope.activeRequestId,
+      sendToHub: false
+    });
   }
 
   function listCanonicalSessionEvents(sessionId: string): TimelineEvent[] {
@@ -1357,6 +1416,7 @@ export function createHub53AIBridge(input: HubBridgeInput) {
     if (event.visibility === "final") score += 200;
     if (event.operation === "replace") score += 80;
     if (event.event_type === "part.replace") score += 40;
+    if (readStringMetadata(event.payload, "source_kind") === "typed_transcript.final_replace") score += 80;
     if (readStringMetadata(event.payload, "source_kind") === "assistant.message") score += 30;
     if (!isOpenClawHistoryLedgerEvent(event)) score += 20;
     if (String(event.text ?? "").trim()) score += 5;
@@ -1602,6 +1662,8 @@ export function createHub53AIBridge(input: HubBridgeInput) {
   function assistantMessageSpecificity(event: TimelineEvent): number {
     const payload = toRecord(event.payload);
     const ledger = normalizeOpenClawLedgerEvent(readOpenClawLedgerFromEvent(event));
+    const ledgerPayload = toRecord(ledger?.payload);
+    const sourceKind = readStringMetadata(payload, "source_kind") || readStringMetadata(ledgerPayload, "source_kind");
     let score = 0;
     if (typeof payload.runId === "string" && payload.runId.trim()) score += 4;
     if (ledger?.run_id) score += 4;
@@ -1611,6 +1673,11 @@ export function createHub53AIBridge(input: HubBridgeInput) {
     if (payload.mode === "replace") score += 1;
     if (ledger?.visibility === "final") score += 1;
     if (ledger?.operation === "replace") score += 1;
+    if (sourceKind === "typed_transcript.final_replace") score += 20;
+    if (sourceKind === "typed_transcript.live_replace") score += 15;
+    if (readBooleanMetadata(payload, "typed_final") === true || readBooleanMetadata(ledgerPayload, "typed_final") === true) score += 20;
+    if (readBooleanMetadata(payload, "typed_live") === true || readBooleanMetadata(ledgerPayload, "typed_live") === true) score += 15;
+    if (readBooleanMetadata(payload, "trusted_answer") === true || readBooleanMetadata(ledgerPayload, "trusted_answer") === true) score += 10;
     return score;
   }
 
@@ -1781,9 +1848,12 @@ export function createHub53AIBridge(input: HubBridgeInput) {
         activityAppliedEventKeys: new Set<string>(),
         answerContentAppliedEventKeys: new Set<string>(),
         answerSegmentTextById: new Map<string, string>(),
+        answerSegmentVisibilityById: new Map<string, OpenClawTimelineV2Visibility>(),
+        answerSegmentTrustedById: new Map<string, boolean>(),
         nextDeltaIndexBySegment: new Map<string, number>(),
         segmentIndexById: new Map<string, number>(),
         timelineMetaByEventKey: new Map<string, OpenClawTimelineV2Meta>(),
+        typedToolCallEnrichedKeys: new Set<string>(),
         currentActivitySeen: false,
         visibleResponseSeen: false,
         lastSeqSeen: 0,
@@ -1801,7 +1871,17 @@ export function createHub53AIBridge(input: HubBridgeInput) {
       const terminalPromise = waitForTerminalEvent(message.reqId);
       close = input.gateway.subscribe(session.id, input.callbacks.getLastEventSeq(session.id), {
         onEvent: (event) => {
-          void handleGatewayEvent(message, event, sessionId, eventScope);
+          eventScope.eventHandlingQueue = (eventScope.eventHandlingQueue ?? Promise.resolve())
+            .catch(() => undefined)
+            .then(() => handleGatewayEvent(message, event, sessionId, eventScope))
+            .catch((error) => {
+              traceOpenClawLedger(input.logger, "event-queue-error", {
+                reqId: message.reqId,
+                sessionId,
+                error: error instanceof Error ? error.message : String(error),
+                event: summarizeTimelineEventForTrace(event)
+              }, input.config);
+            });
         },
         onDisconnect: (error) => {
           const messageText = error instanceof Error ? error.message : "gateway stream disconnected";
@@ -2048,9 +2128,12 @@ export function createHub53AIBridge(input: HubBridgeInput) {
     activityAppliedEventKeys: Set<string>;
     answerContentAppliedEventKeys: Set<string>;
     answerSegmentTextById: Map<string, string>;
+    answerSegmentVisibilityById: Map<string, OpenClawTimelineV2Visibility>;
+    answerSegmentTrustedById: Map<string, boolean>;
     nextDeltaIndexBySegment: Map<string, number>;
     segmentIndexById: Map<string, number>;
     timelineMetaByEventKey: Map<string, OpenClawTimelineV2Meta>;
+    typedToolCallEnrichedKeys: Set<string>;
     currentActivitySeen: boolean;
     visibleResponseSeen: boolean;
     lastSeqSeen: number;
@@ -2060,6 +2143,10 @@ export function createHub53AIBridge(input: HubBridgeInput) {
     referencedLocalOutputPaths: Set<string>;
     writeOutputFilesByToolCallId: Map<string, Hub53AIOutputFile[]>;
     localOutputFilesSent?: boolean;
+    typedLiveLastTextHash?: string;
+    typedLiveLastResolvedAtMs?: number;
+    typedLiveInFlight?: Promise<boolean>;
+    eventHandlingQueue?: Promise<void>;
   };
 
   type ActiveSessionRequest = {
@@ -2157,6 +2244,23 @@ export function createHub53AIBridge(input: HubBridgeInput) {
     await sendWriteToolOutputFilesForEvent(message.reqId, sessionId, event, eventScope);
 
     if (event.kind === "assistant.delta" || event.kind === "assistant.message") {
+      if (isUntrustedRawOpenClawAnswerEvent(event)) {
+        traceOpenClawDuplicate(input.logger, "hub.reply.suppress_untrusted_answer", {
+          reqId: message.reqId,
+          sessionId,
+          event: summarizeTimelineEventForTrace(event)
+        }, input.config);
+        await maybeApplyTypedTranscriptLiveReplace({
+          sessionId,
+          sourceEvent: event,
+          eventScope,
+          reqId: message.reqId
+        });
+        if (event.kind === "assistant.message") {
+          await sendCreatedLocalOutputFiles(message.reqId, sessionId, eventScope);
+        }
+        return;
+      }
       const content = String(event.payload?.content ?? "");
       const replaceReply = isReplyReplaceEvent(event);
       const delta = extractReplyDelta(message.reqId, content, replaceReply);
@@ -2216,7 +2320,28 @@ export function createHub53AIBridge(input: HubBridgeInput) {
     }
 
     if (event.kind === "tool.call" || event.kind === "tool.result") {
-      const summary = summarizeVisibleActivity(event);
+      const enrichment = await enrichToolEventFromTypedHistory(sessionId, event, eventScope);
+      if (enrichment.syntheticCallEvent && input.config.sendThinkingMessage) {
+        applyOpenClawEventScopeActivity(enrichment.syntheticCallEvent, eventScope);
+        const syntheticPayload = augmentPayloadWithEventMeta(enrichment.syntheticCallEvent, eventScope);
+        enrichment.syntheticCallEvent.payload = syntheticPayload;
+        const syntheticSummary = summarizeVisibleActivity(enrichment.syntheticCallEvent);
+        if (syntheticSummary) {
+          await sendReply({
+            reqId: message.reqId,
+            text: syntheticSummary,
+            status: "thinking",
+            sessionId,
+            mode: "replace",
+            replace: true,
+            eventKind: enrichment.syntheticCallEvent.kind,
+            payload: syntheticPayload
+          });
+        }
+      }
+
+      const visibleToolEvent = enrichment.event;
+      const summary = summarizeVisibleActivity(visibleToolEvent);
       if (summary && input.config.sendThinkingMessage) {
         await sendReply({
           reqId: message.reqId,
@@ -2225,27 +2350,21 @@ export function createHub53AIBridge(input: HubBridgeInput) {
           sessionId,
           mode: "append",
           replace: false,
-          eventKind: event.kind,
-          payload: augmentPayloadWithEventMeta(event, eventScope)
+          eventKind: visibleToolEvent.kind,
+          payload: augmentPayloadWithEventMeta(visibleToolEvent, eventScope)
         });
       }
       return;
     }
 
     if (event.kind === "run.completed") {
-      const finalDelta = extractReplyDelta(message.reqId, String(event.payload?.content ?? ""), isReplyReplaceEvent(event));
-      if (finalDelta) {
-        await sendReply({
-          reqId: message.reqId,
-          text: finalDelta,
-          status: "streaming",
-          sessionId,
-          mode: readStringMetadata(event.payload, "mode"),
-          replace: readBooleanMetadata(event.payload, "replace"),
-          eventKind: event.kind,
-          payload: augmentPayloadWithEventMeta(event, eventScope)
-        });
-      }
+      await applyTypedTranscriptFinalReplace({
+        sessionId,
+        terminalEvent: event,
+        eventScope,
+        reqId: message.reqId,
+        sendToHub: true
+      });
       await sendCreatedLocalOutputFiles(message.reqId, sessionId, eventScope);
       await sendReply({
         reqId: message.reqId,
@@ -2344,6 +2463,925 @@ export function createHub53AIBridge(input: HubBridgeInput) {
     });
     lastReplyByReq.delete(message.reqId);
     resolveTerminalEvent(message.reqId);
+  }
+
+  async function applyTypedTranscriptFinalReplace(inputReplace: {
+    sessionId: string;
+    terminalEvent: TimelineEvent;
+    eventScope: GatewayEventScope;
+    reqId: string;
+    sendToHub: boolean;
+  }): Promise<boolean> {
+    if (inputReplace.terminalEvent.kind !== "run.completed") {
+      return false;
+    }
+
+    const typedFinal = await resolveTypedTranscriptFinal(
+      inputReplace.sessionId,
+      inputReplace.terminalEvent,
+      inputReplace.eventScope
+    );
+    if (!typedFinal) {
+      traceOpenClawLedger(input.logger, "typed-final", {
+        result: "miss",
+        sessionId: inputReplace.sessionId,
+        reqId: inputReplace.reqId,
+        terminalEvent: summarizeTimelineEventForTrace(inputReplace.terminalEvent)
+      }, input.config);
+      return false;
+    }
+
+    const currentAnswer = readCurrentOpenClawAnswerText(inputReplace.eventScope, inputReplace.reqId);
+    const typedFinalHash = hashTraceText(typedFinal.text);
+    const shouldPromoteTypedLiveToFinal = Boolean(
+      typedFinalHash && inputReplace.eventScope.typedLiveLastTextHash === typedFinalHash
+    );
+    const currentAnswerIsVisibleOrTrusted = isCurrentOpenClawAnswerVisibleOrTrusted(
+      inputReplace.eventScope,
+      inputReplace.reqId
+    );
+    if (
+      currentAnswer.trim() === typedFinal.text.trim() &&
+      !shouldPromoteTypedLiveToFinal &&
+      currentAnswerIsVisibleOrTrusted
+    ) {
+      traceOpenClawLedger(input.logger, "typed-final", {
+        result: "noop",
+        sessionId: inputReplace.sessionId,
+        reqId: inputReplace.reqId,
+        matchStrategy: typedFinal.matchStrategy,
+        textLength: typedFinal.text.length,
+        textHash: typedFinalHash,
+        segmentCount: typedFinal.segmentCount,
+        currentAnswerIsVisibleOrTrusted
+      }, input.config);
+      return false;
+    }
+
+    const event = buildTypedTranscriptFinalEvent(
+      inputReplace.sessionId,
+      inputReplace.terminalEvent,
+      inputReplace.eventScope,
+      inputReplace.reqId,
+      typedFinal,
+      currentAnswer
+    );
+    applyOpenClawEventScopeActivity(event, inputReplace.eventScope);
+    const payload = augmentPayloadWithEventMeta(event, inputReplace.eventScope);
+    event.payload = payload;
+    inputReplace.eventScope.lastSeqSeen = Math.max(inputReplace.eventScope.lastSeqSeen, event.seq || 0);
+
+    traceOpenClawLedger(input.logger, "typed-final", {
+      result: "replace",
+      sessionId: inputReplace.sessionId,
+      reqId: inputReplace.reqId,
+      matchStrategy: typedFinal.matchStrategy,
+      terminalEvent: summarizeTimelineEventForTrace(inputReplace.terminalEvent),
+      event: summarizeTimelineEventForTrace(event),
+      originalAnswerLength: currentAnswer.length,
+      originalAnswerHash: hashTraceText(currentAnswer),
+      typedFinalLength: typedFinal.text.length,
+      typedFinalHash: hashTraceText(typedFinal.text),
+      segmentCount: typedFinal.segmentCount,
+      messageSeqs: typedFinal.messageSeqs
+    }, input.config);
+
+    if (inputReplace.sendToHub) {
+      const delta = extractReplyDelta(inputReplace.reqId, typedFinal.text, true);
+      if (delta) {
+        await sendReply({
+          reqId: inputReplace.reqId,
+          text: delta,
+          status: "streaming",
+          sessionId: inputReplace.sessionId,
+          mode: "replace",
+          replace: true,
+          eventKind: event.kind,
+          payload
+        });
+      }
+    }
+    return true;
+  }
+
+  async function maybeApplyTypedTranscriptLiveReplace(inputLive: {
+    sessionId: string;
+    sourceEvent: TimelineEvent;
+    eventScope: GatewayEventScope;
+    reqId: string;
+  }): Promise<boolean> {
+    if (inputLive.eventScope.terminalSeen) {
+      return false;
+    }
+    if (inputLive.eventScope.typedLiveInFlight) {
+      return inputLive.eventScope.typedLiveInFlight;
+    }
+
+    const now = Date.now();
+    const lastResolvedAt = inputLive.eventScope.typedLiveLastResolvedAtMs ?? 0;
+    if (lastResolvedAt > 0 && now - lastResolvedAt < 300) {
+      traceOpenClawLedger(input.logger, "typed-live", {
+        result: "throttle",
+        sessionId: inputLive.sessionId,
+        reqId: inputLive.reqId,
+        sourceEvent: summarizeTimelineEventForTrace(inputLive.sourceEvent),
+        elapsedMs: now - lastResolvedAt
+      }, input.config);
+      return false;
+    }
+
+    const promise: Promise<boolean> = applyTypedTranscriptLiveReplace(inputLive)
+      .then((result) => {
+        if (result) {
+          inputLive.eventScope.typedLiveLastResolvedAtMs = Date.now();
+        }
+        return result;
+      })
+      .finally(() => {
+        if (inputLive.eventScope.typedLiveInFlight === promise) {
+          inputLive.eventScope.typedLiveInFlight = undefined;
+        }
+      });
+    inputLive.eventScope.typedLiveInFlight = promise;
+    return promise;
+  }
+
+  async function applyTypedTranscriptLiveReplace(inputLive: {
+    sessionId: string;
+    sourceEvent: TimelineEvent;
+    eventScope: GatewayEventScope;
+    reqId: string;
+  }): Promise<boolean> {
+    const typedLive = await resolveTypedTranscriptLive(
+      inputLive.sessionId,
+      inputLive.sourceEvent,
+      inputLive.eventScope
+    );
+    if (!typedLive) {
+      traceOpenClawLedger(input.logger, "typed-live", {
+        result: "miss",
+        sessionId: inputLive.sessionId,
+        reqId: inputLive.reqId,
+        sourceEvent: summarizeTimelineEventForTrace(inputLive.sourceEvent)
+      }, input.config);
+      return false;
+    }
+
+    const typedLiveHash = hashTraceText(typedLive.text);
+    if (typedLiveHash && typedLiveHash === inputLive.eventScope.typedLiveLastTextHash) {
+      traceOpenClawLedger(input.logger, "typed-live", {
+        result: "noop",
+        sessionId: inputLive.sessionId,
+        reqId: inputLive.reqId,
+        matchStrategy: typedLive.matchStrategy,
+        textLength: typedLive.text.length,
+        textHash: typedLiveHash,
+        segmentCount: typedLive.segmentCount
+      }, input.config);
+      return false;
+    }
+
+    const currentAnswer = readCurrentOpenClawAnswerText(inputLive.eventScope, inputLive.reqId);
+    const event = buildTypedTranscriptLiveEvent(
+      inputLive.sessionId,
+      inputLive.sourceEvent,
+      inputLive.eventScope,
+      inputLive.reqId,
+      typedLive,
+      currentAnswer
+    );
+    applyOpenClawEventScopeActivity(event, inputLive.eventScope);
+    const payload = augmentPayloadWithEventMeta(event, inputLive.eventScope);
+    event.payload = payload;
+    inputLive.eventScope.lastSeqSeen = Math.max(inputLive.eventScope.lastSeqSeen, event.seq || 0);
+    inputLive.eventScope.typedLiveLastTextHash = typedLiveHash;
+
+    traceOpenClawLedger(input.logger, "typed-live", {
+      result: "replace",
+      sessionId: inputLive.sessionId,
+      reqId: inputLive.reqId,
+      matchStrategy: typedLive.matchStrategy,
+      sourceEvent: summarizeTimelineEventForTrace(inputLive.sourceEvent),
+      event: summarizeTimelineEventForTrace(event),
+      originalAnswerLength: currentAnswer.length,
+      originalAnswerHash: hashTraceText(currentAnswer),
+      typedLiveLength: typedLive.text.length,
+      typedLiveHash,
+      segmentCount: typedLive.segmentCount,
+      messageSeqs: typedLive.messageSeqs
+    }, input.config);
+
+    const delta = extractReplyDelta(inputLive.reqId, typedLive.text, true);
+    if (delta) {
+      await sendReply({
+        reqId: inputLive.reqId,
+        text: delta,
+        status: "streaming",
+        sessionId: inputLive.sessionId,
+        mode: "replace",
+        replace: true,
+        eventKind: event.kind,
+        payload
+      });
+    }
+    return true;
+  }
+
+  async function resolveTypedTranscriptLive(
+    sessionId: string,
+    sourceEvent: TimelineEvent,
+    eventScope: GatewayEventScope
+  ): Promise<OpenClawTypedLiveTranscript | null> {
+    let messages: SessionMessage[] = [];
+    try {
+      messages = await input.gateway.getSessionMessages(sessionId, 200);
+    } catch (error) {
+      traceOpenClawLedger(input.logger, "typed-live", {
+        result: "miss",
+        reason: "get_session_messages_failed",
+        sessionId,
+        error: error instanceof Error ? error.message : String(error)
+      }, input.config);
+      return null;
+    }
+
+    const candidates = messages.filter((message) => message.role === "assistant" && readTypedTextSegmentsFromMessage(message).length > 0);
+    if (!candidates.length) {
+      return null;
+    }
+
+    const runId = getGatewayEventRunIdentity(sourceEvent) || eventScope.currentRunId || "";
+    if (runId) {
+      const byRunId = candidates.filter((message) => readSessionMessageRunIdentity(message) === runId);
+      const resolved = buildTypedFinalTranscriptFromMessages(byRunId, "run_id");
+      if (resolved) {
+        return resolved;
+      }
+    }
+
+    const responseId = getGatewayEventResponseIdentity(sourceEvent);
+    if (responseId) {
+      const byResponseId = candidates.filter((message) => readSessionMessageResponseIdentity(message) === responseId);
+      const resolved = buildTypedFinalTranscriptFromMessages(byResponseId, "response_id");
+      if (resolved) {
+        return resolved;
+      }
+    }
+
+    const byWindow = selectTypedTranscriptMessagesInRequestWindow(candidates, sourceEvent, eventScope, 1_000);
+    return buildTypedFinalTranscriptFromMessages(byWindow, "request_window");
+  }
+
+  function buildTypedTranscriptLiveEvent(
+    sessionId: string,
+    sourceEvent: TimelineEvent,
+    eventScope: GatewayEventScope,
+    reqId: string,
+    typedLive: OpenClawTypedLiveTranscript,
+    currentAnswer: string
+  ): TimelineEvent {
+    const runId = getGatewayEventRunIdentity(sourceEvent) || eventScope.currentRunId || "";
+    const turnId = eventScope.currentTurnId || eventScope.turnId;
+    const textHash = hashTraceText(typedLive.text);
+    const id = `typed-live:${reqId || eventScope.activeRequestId}:${runId || sourceEvent.id || "run"}:${textHash || "text"}`;
+    return {
+      id,
+      sessionId,
+      seq: getTypedTranscriptLiveEventSeq(sourceEvent, eventScope),
+      kind: "assistant.delta",
+      payload: {
+        content: typedLive.text,
+        state: "delta",
+        mode: "replace",
+        replace: true,
+        source_kind: "typed_transcript.live_replace",
+        typed_live: true,
+        typed_live_match_strategy: typedLive.matchStrategy,
+        typed_live_text_segment_count: typedLive.segmentCount,
+        typed_live_original_answer_hash: hashTraceText(currentAnswer),
+        typed_live_text_hash: textHash,
+        typed_live_message_ids: typedLive.messageIds,
+        typed_live_message_seqs: typedLive.messageSeqs,
+        typed_live_source_event_id: sourceEvent.id,
+        active_request_id: eventScope.activeRequestId,
+        req_id: reqId,
+        turn_id: turnId,
+        segment_id: `${turnId}:answer:0`,
+        segment_type: "answer",
+        ...(runId ? { runId, run_id: runId } : {})
+      },
+      createdAt: sourceEvent.createdAt || new Date().toISOString()
+    };
+  }
+
+  function getTypedTranscriptLiveEventSeq(sourceEvent: TimelineEvent, eventScope: GatewayEventScope): number {
+    const sourceSeq = typeof sourceEvent.seq === "number" && Number.isFinite(sourceEvent.seq)
+      ? sourceEvent.seq
+      : eventScope.lastSeqSeen;
+    return sourceSeq + 0.05;
+  }
+
+  async function resolveTypedTranscriptFinal(
+    sessionId: string,
+    terminalEvent: TimelineEvent,
+    eventScope: GatewayEventScope
+  ): Promise<OpenClawTypedFinalTranscript | null> {
+    let messages: SessionMessage[] = [];
+    try {
+      messages = await input.gateway.getSessionMessages(sessionId, 200);
+    } catch (error) {
+      traceOpenClawLedger(input.logger, "typed-final", {
+        result: "miss",
+        reason: "get_session_messages_failed",
+        sessionId,
+        error: error instanceof Error ? error.message : String(error)
+      }, input.config);
+      return null;
+    }
+
+    const candidates = messages.filter((message) => message.role === "assistant" && readTypedTextSegmentsFromMessage(message).length > 0);
+    if (!candidates.length) {
+      return null;
+    }
+
+    const runId = getGatewayEventRunIdentity(terminalEvent) || eventScope.currentRunId || "";
+    if (runId) {
+      const byRunId = candidates.filter((message) => readSessionMessageRunIdentity(message) === runId);
+      const resolved = buildTypedFinalTranscriptFromMessages(byRunId, "run_id");
+      if (resolved) {
+        return resolved;
+      }
+    }
+
+    const responseId = getGatewayEventResponseIdentity(terminalEvent);
+    if (responseId) {
+      const byResponseId = candidates.filter((message) => readSessionMessageResponseIdentity(message) === responseId);
+      const resolved = buildTypedFinalTranscriptFromMessages(byResponseId, "response_id");
+      if (resolved) {
+        return resolved;
+      }
+    }
+
+    const byWindow = selectTypedFinalMessagesInRequestWindow(candidates, terminalEvent, eventScope);
+    const windowResolved = buildTypedFinalTranscriptFromMessages(byWindow, "request_window");
+    if (windowResolved) {
+      return windowResolved;
+    }
+
+    const latestAfterUser = selectTypedFinalMessagesAfterLatestUser(messages);
+    return buildTypedFinalTranscriptFromMessages(latestAfterUser, "latest_after_user");
+  }
+
+  function buildTypedTranscriptFinalEvent(
+    sessionId: string,
+    terminalEvent: TimelineEvent,
+    eventScope: GatewayEventScope,
+    reqId: string,
+    typedFinal: OpenClawTypedFinalTranscript,
+    currentAnswer: string
+  ): TimelineEvent {
+    const runId = getGatewayEventRunIdentity(terminalEvent) || eventScope.currentRunId || "";
+    const turnId = eventScope.currentTurnId || eventScope.turnId;
+    const seq = getTypedTranscriptFinalEventSeq(terminalEvent, eventScope);
+    const id = `typed-final:${reqId || eventScope.activeRequestId}:${runId || terminalEvent.id || "run"}`;
+    return {
+      id,
+      sessionId,
+      seq,
+      kind: "assistant.message",
+      payload: {
+        content: typedFinal.text,
+        state: "final",
+        mode: "replace",
+        replace: true,
+        source_kind: "typed_transcript.final_replace",
+        typed_final: true,
+        typed_final_match_strategy: typedFinal.matchStrategy,
+        typed_final_text_segment_count: typedFinal.segmentCount,
+        typed_final_original_answer_hash: hashTraceText(currentAnswer),
+        typed_final_text_hash: hashTraceText(typedFinal.text),
+        typed_final_message_ids: typedFinal.messageIds,
+        typed_final_message_seqs: typedFinal.messageSeqs,
+        typed_final_terminal_event_id: terminalEvent.id,
+        active_request_id: eventScope.activeRequestId,
+        req_id: reqId,
+        turn_id: turnId,
+        segment_id: `${turnId}:answer:0`,
+        segment_type: "answer",
+        ...(runId ? { runId, run_id: runId } : {})
+      },
+      createdAt: terminalEvent.createdAt || new Date().toISOString()
+    };
+  }
+
+  function getTypedTranscriptFinalEventSeq(terminalEvent: TimelineEvent, eventScope: GatewayEventScope): number {
+    const terminalSeq = typeof terminalEvent.seq === "number" && Number.isFinite(terminalEvent.seq)
+      ? terminalEvent.seq
+      : eventScope.lastSeqSeen;
+    return terminalSeq + 0.1;
+  }
+
+  function readCurrentOpenClawAnswerText(eventScope: GatewayEventScope, reqId: string): string {
+    const turnId = eventScope.currentTurnId || eventScope.turnId;
+    const answerText =
+      eventScope.answerSegmentTextById.get(`${turnId}:answer:0`) ||
+      (eventScope.currentAnswerSegmentId ? eventScope.answerSegmentTextById.get(eventScope.currentAnswerSegmentId) : "") ||
+      "";
+    return answerText || lastReplyByReq.get(reqId) || "";
+  }
+
+  function isCurrentOpenClawAnswerVisibleOrTrusted(eventScope: GatewayEventScope, reqId: string): boolean {
+    const turnId = eventScope.currentTurnId || eventScope.turnId;
+    const candidateSegmentIds = [
+      `${turnId}:answer:0`,
+      eventScope.currentAnswerSegmentId
+    ].filter((segmentId): segmentId is string => Boolean(segmentId));
+
+    for (const segmentId of candidateSegmentIds) {
+      if (eventScope.answerSegmentTrustedById.get(segmentId)) {
+        return true;
+      }
+      const visibility = eventScope.answerSegmentVisibilityById.get(segmentId);
+      if (visibility === "stream" || visibility === "final") {
+        return true;
+      }
+    }
+
+    return Boolean(lastReplyByReq.get(reqId));
+  }
+
+  async function enrichToolEventFromTypedHistory(
+    sessionId: string,
+    event: TimelineEvent,
+    eventScope: GatewayEventScope
+  ): Promise<{ event: TimelineEvent; syntheticCallEvent?: TimelineEvent }> {
+    if (!shouldResolveTypedToolCallForEvent(event)) {
+      return { event };
+    }
+
+    const typedCall = await resolveTypedToolCallFromHistory(sessionId, event, eventScope);
+    if (!typedCall) {
+      traceOpenClawLedger(input.logger, "typed-tool", {
+        result: "miss",
+        sessionId,
+        event: summarizeTimelineEventForTrace(event)
+      }, input.config);
+      return { event };
+    }
+
+    const enrichedEvent = mergeTypedToolCallIntoEvent(event, typedCall);
+    const enrichmentKey = `${eventScope.currentTurnId || eventScope.turnId}:${typedCall.id || readToolCallIdFromPayload(event.payload) || typedCall.name}`;
+    let syntheticCallEvent: TimelineEvent | undefined;
+    if (event.kind === "tool.call") {
+      eventScope.typedToolCallEnrichedKeys.add(enrichmentKey);
+    } else if (!eventScope.typedToolCallEnrichedKeys.has(enrichmentKey)) {
+      eventScope.typedToolCallEnrichedKeys.add(enrichmentKey);
+      syntheticCallEvent = buildTypedToolCallEnrichmentEvent(sessionId, event, eventScope, typedCall);
+    }
+
+    traceOpenClawLedger(input.logger, "typed-tool", {
+      result: "enrich",
+      sessionId,
+      event: summarizeTimelineEventForTrace(event),
+      sourceEventId: typedCall.sourceEventId,
+      sourceSeq: typedCall.sourceSeq,
+      toolCallIdHash: hashTraceText(typedCall.id),
+      toolName: typedCall.name,
+      commandLength: typedCall.command?.length ?? 0,
+      commandHash: hashTraceText(typedCall.command || "")
+    }, input.config);
+    return { event: enrichedEvent, syntheticCallEvent };
+  }
+
+  function shouldResolveTypedToolCallForEvent(event: TimelineEvent): boolean {
+    if (event.kind !== "tool.call" && event.kind !== "tool.result") {
+      return false;
+    }
+    const toolName = readToolNameFromPayload(event.payload);
+    if (!isExecToolName(toolName)) {
+      return false;
+    }
+    return !readToolCommandFromPayload(event.payload);
+  }
+
+  async function resolveTypedToolCallFromHistory(
+    sessionId: string,
+    event: TimelineEvent,
+    eventScope: GatewayEventScope
+  ): Promise<OpenClawTypedToolCall | null> {
+    let events: TimelineEvent[] = [];
+    try {
+      events = await input.gateway.listEvents(sessionId, 0);
+    } catch (error) {
+      traceOpenClawLedger(input.logger, "typed-tool", {
+        result: "miss",
+        reason: "list_events_failed",
+        sessionId,
+        error: error instanceof Error ? error.message : String(error)
+      }, input.config);
+      return null;
+    }
+
+    const typedCalls = events
+      .filter((candidate) => candidate.kind === "tool.call")
+      .map(readTypedToolCallFromEvent)
+      .filter((candidate): candidate is OpenClawTypedToolCall => Boolean(candidate && candidate.command));
+    if (!typedCalls.length) {
+      return null;
+    }
+
+    const toolCallId = readToolCallIdFromPayload(event.payload);
+    if (toolCallId) {
+      const byId = typedCalls.find((candidate) => candidate.id === toolCallId);
+      if (byId) {
+        return byId;
+      }
+    }
+
+    const eventToolName = normalizeToolName(readToolNameFromPayload(event.payload));
+    const eventSeq = typeof event.seq === "number" && Number.isFinite(event.seq) ? event.seq : Number.POSITIVE_INFINITY;
+    const sameToolCalls = typedCalls
+      .filter((candidate) => normalizeToolName(candidate.name) === eventToolName)
+      .sort((left, right) => (right.sourceSeq ?? 0) - (left.sourceSeq ?? 0));
+    return sameToolCalls.find((candidate) => (candidate.sourceSeq ?? 0) <= eventSeq) ?? sameToolCalls[0] ?? null;
+  }
+
+  function readTypedToolCallFromEvent(event: TimelineEvent): OpenClawTypedToolCall | null {
+    const payload = toRecord(event.payload);
+    const data = toRecord(payload.data);
+    const name = normalizeToolName(stringOr(data.name, data.toolName, data.tool_name, payload.name, payload.toolName, "tool"));
+    const id = readToolCallIdFromPayload(payload) || `${name}:${event.seq || event.id}`;
+    const args = readToolArgsFromPayload(payload);
+    const command = readToolCommandFromPayload(payload);
+    if (!id || !name || Object.keys(args).length === 0) {
+      return null;
+    }
+    return {
+      id,
+      name,
+      args,
+      ...(command ? { command } : {}),
+      ...(stringOr(data.meta, payload.meta) ? { meta: stringOr(data.meta, payload.meta) } : {}),
+      sourceEventId: event.id,
+      sourceSeq: event.seq
+    };
+  }
+
+  function mergeTypedToolCallIntoEvent(event: TimelineEvent, typedCall: OpenClawTypedToolCall): TimelineEvent {
+    const payload = toRecord(event.payload);
+    const data = toRecord(payload.data);
+    const args = {
+      ...readToolArgsFromPayload(payload),
+      ...typedCall.args,
+      ...(typedCall.command ? { command: typedCall.command } : {})
+    };
+    return {
+      ...event,
+      payload: {
+        ...payload,
+        source_kind: stringOr(payload.source_kind) || event.kind,
+        typed_tool_call_enriched: true,
+        typed_tool_call_source_event_id: typedCall.sourceEventId,
+        typed_tool_call_source_seq: typedCall.sourceSeq,
+        typed_tool_call_command_hash: hashTraceText(typedCall.command || ""),
+        data: {
+          ...data,
+          name: typedCall.name,
+          toolCallId: typedCall.id,
+          args,
+          ...(typedCall.command ? { command: typedCall.command } : {}),
+          ...(typedCall.meta && !stringOr(data.meta) ? { meta: typedCall.meta } : {})
+        }
+      }
+    };
+  }
+
+  function buildTypedToolCallEnrichmentEvent(
+    sessionId: string,
+    sourceEvent: TimelineEvent,
+    eventScope: GatewayEventScope,
+    typedCall: OpenClawTypedToolCall
+  ): TimelineEvent {
+    const payload = toRecord(sourceEvent.payload);
+    const runId = getGatewayEventRunIdentity(sourceEvent) || eventScope.currentRunId || "";
+    return {
+      id: `typed-tool-call:${typedCall.id || sourceEvent.id}:${hashTraceText(typedCall.command || typedCall.name) || "tool"}`,
+      sessionId,
+      seq: getTypedToolCallEnrichmentEventSeq(sourceEvent, eventScope),
+      kind: "tool.call",
+      payload: {
+        source_kind: "typed_transcript.tool_call_enrich",
+        typed_tool_call_enriched: true,
+        typed_tool_call_source_event_id: typedCall.sourceEventId,
+        typed_tool_call_source_seq: typedCall.sourceSeq,
+        typed_tool_call_command_hash: hashTraceText(typedCall.command || ""),
+        active_request_id: eventScope.activeRequestId,
+        turn_id: eventScope.currentTurnId || eventScope.turnId,
+        data: {
+          phase: "call",
+          name: typedCall.name,
+          toolCallId: typedCall.id,
+          args: {
+            ...typedCall.args,
+            ...(typedCall.command ? { command: typedCall.command } : {})
+          },
+          ...(typedCall.command ? { command: typedCall.command } : {}),
+          ...(typedCall.meta ? { meta: typedCall.meta } : {})
+        },
+        ...(runId ? { runId, run_id: runId } : {}),
+        ...(payload.rawSeq ? { rawSeq: payload.rawSeq } : {})
+      },
+      createdAt: sourceEvent.createdAt || new Date().toISOString()
+    };
+  }
+
+  function getTypedToolCallEnrichmentEventSeq(sourceEvent: TimelineEvent, eventScope: GatewayEventScope): number {
+    const sourceSeq = typeof sourceEvent.seq === "number" && Number.isFinite(sourceEvent.seq)
+      ? sourceEvent.seq
+      : eventScope.lastSeqSeen;
+    return sourceSeq - 0.01;
+  }
+
+  function readToolNameFromPayload(payload: unknown): string {
+    const record = toRecord(payload);
+    const data = toRecord(record.data);
+    return normalizeToolName(stringOr(data.name, data.toolName, data.tool_name, data.tool, record.name, record.toolName, record.tool_name, record.tool));
+  }
+
+  function readToolCallIdFromPayload(payload: unknown): string {
+    const record = toRecord(payload);
+    const data = toRecord(record.data);
+    return stringOr(
+      data.toolCallId,
+      data.tool_call_id,
+      data.callId,
+      data.call_id,
+      data.id,
+      record.toolCallId,
+      record.tool_call_id,
+      record.callId,
+      record.call_id,
+      record.id
+    );
+  }
+
+  function readToolArgsFromPayload(payload: unknown): Record<string, unknown> {
+    const record = toRecord(payload);
+    const data = toRecord(record.data);
+    const fn = toRecord(data.function ?? record.function);
+    for (const value of [
+      data.args,
+      data.arguments,
+      data.input,
+      data.parameters,
+      record.args,
+      record.arguments,
+      record.input,
+      record.parameters,
+      fn.arguments
+    ]) {
+      const parsed = parseToolArgumentsRecord(value);
+      if (Object.keys(parsed).length > 0) {
+        return parsed;
+      }
+    }
+    return {};
+  }
+
+  function parseToolArgumentsRecord(value: unknown): Record<string, unknown> {
+    const normalized = normalizeToolArguments(value);
+    return toRecord(normalized);
+  }
+
+  function normalizeToolArguments(value: unknown): unknown {
+    if (typeof value !== "string") {
+      return value;
+    }
+    const trimmed = value.trim();
+    if (!trimmed) {
+      return undefined;
+    }
+    try {
+      return JSON.parse(trimmed);
+    } catch {
+      return trimmed;
+    }
+  }
+
+  function readToolCommandFromPayload(payload: unknown): string {
+    const record = toRecord(payload);
+    const data = toRecord(record.data);
+    const args = readToolArgsFromPayload(record);
+    for (const candidate of [args, data, record]) {
+      const command = normalizeToolCommandText(stringOr(
+        candidate.command,
+        candidate.cmd,
+        candidate.script,
+        candidate.shell,
+        candidate.commandLine,
+        candidate.command_line,
+        candidate.code
+      ));
+      if (command) {
+        return command;
+      }
+    }
+    return "";
+  }
+
+  function normalizeToolCommandText(value: string): string {
+    const command = value.replace(/\r\n/g, "\n").replace(/\\"/g, "\"").replace(/\\'/g, "'").trim();
+    const normalized = command.replace(/\s+/g, " ").trim().toLowerCase();
+    if (!normalized || normalized === "exec" || normalized === "used exec" || normalized === "used tool" || normalized === "tool output") {
+      return "";
+    }
+    return command;
+  }
+
+  function normalizeToolName(value: string): string {
+    const normalized = value.replace(/[\s-]+/g, "_").trim().toLowerCase();
+    return isExecToolName(normalized) ? "exec" : normalized || "tool";
+  }
+
+  function isExecToolName(value: string): boolean {
+    const normalized = value.replace(/[\s-]+/g, "_").trim().toLowerCase();
+    return normalized === "exec" || normalized === "used_exec" || normalized === "bash" || normalized === "shell" || normalized === "run_command";
+  }
+
+  function selectTypedFinalMessagesInRequestWindow(
+    messages: SessionMessage[],
+    terminalEvent: TimelineEvent,
+    eventScope: GatewayEventScope
+  ): SessionMessage[] {
+    return selectTypedTranscriptMessagesInRequestWindow(messages, terminalEvent, eventScope, 10_000);
+  }
+
+  function selectTypedTranscriptMessagesInRequestWindow(
+    messages: SessionMessage[],
+    anchorEvent: TimelineEvent,
+    eventScope: GatewayEventScope,
+    maxAfterAnchorMs: number
+  ): SessionMessage[] {
+    if (!eventScope.eventBoundaryMs) {
+      return [];
+    }
+    const anchorMs = Date.parse(anchorEvent.createdAt || "");
+    const maxMs = Number.isFinite(anchorMs)
+      ? Math.max(anchorMs, Date.now()) + maxAfterAnchorMs
+      : Date.now() + maxAfterAnchorMs;
+    const minMs = eventScope.eventBoundaryMs - 2_000;
+    return messages.filter((message) => {
+      const messageMs = Date.parse(message.createdAt || "");
+      return Number.isFinite(messageMs) && messageMs >= minMs && messageMs <= maxMs;
+    });
+  }
+
+  function selectTypedFinalMessagesAfterLatestUser(messages: SessionMessage[]): SessionMessage[] {
+    const lastUserIndex = findLastSessionMessageIndex(messages, (message) => message.role === "user");
+    return messages
+      .slice(lastUserIndex + 1)
+      .filter((message) => message.role === "assistant" && readTypedTextSegmentsFromMessage(message).length > 0);
+  }
+
+  function findLastSessionMessageIndex(
+    messages: SessionMessage[],
+    predicate: (message: SessionMessage) => boolean
+  ): number {
+    for (let index = messages.length - 1; index >= 0; index -= 1) {
+      if (predicate(messages[index]!)) {
+        return index;
+      }
+    }
+    return -1;
+  }
+
+  function buildTypedFinalTranscriptFromMessages(
+    messages: SessionMessage[],
+    matchStrategy: OpenClawTypedFinalMatchStrategy
+  ): OpenClawTypedFinalTranscript | null {
+    const orderedMessages = [...messages].sort(compareSessionMessageOrder);
+    const segments: string[] = [];
+    const messageIds: string[] = [];
+    const messageSeqs: number[] = [];
+    for (const message of orderedMessages) {
+      const messageSegments = readTypedTextSegmentsFromMessage(message);
+      if (!messageSegments.length) {
+        continue;
+      }
+      segments.push(...messageSegments);
+      messageIds.push(message.id);
+      const seq = readSessionMessageSeq(message);
+      if (seq > 0) {
+        messageSeqs.push(seq);
+      }
+    }
+    const text = joinTypedTranscriptTextSegments(segments);
+    if (!text.trim()) {
+      return null;
+    }
+    return {
+      text,
+      segmentCount: segments.length,
+      matchStrategy,
+      messageIds,
+      messageSeqs
+    };
+  }
+
+  function compareSessionMessageOrder(left: SessionMessage, right: SessionMessage): number {
+    const leftSeq = readSessionMessageSeq(left);
+    const rightSeq = readSessionMessageSeq(right);
+    if (leftSeq !== rightSeq) {
+      if (!leftSeq) return 1;
+      if (!rightSeq) return -1;
+      return leftSeq - rightSeq;
+    }
+    const leftMs = Date.parse(left.createdAt || "");
+    const rightMs = Date.parse(right.createdAt || "");
+    if (Number.isFinite(leftMs) && Number.isFinite(rightMs) && leftMs !== rightMs) {
+      return leftMs - rightMs;
+    }
+    return left.id.localeCompare(right.id);
+  }
+
+  function readTypedTextSegmentsFromMessage(message: SessionMessage): string[] {
+    for (const source of [message.payload, message.metadata, message.data, message.__openclaw]) {
+      const segments = readStringArrayMetadata(toRecord(source).openclaw_typed_text_segments);
+      if (segments.length > 0) {
+        return segments;
+      }
+    }
+    return [];
+  }
+
+  function readStringArrayMetadata(value: unknown): string[] {
+    if (!Array.isArray(value)) {
+      return [];
+    }
+    return value.filter((item): item is string => typeof item === "string" && item.trim().length > 0);
+  }
+
+  function joinTypedTranscriptTextSegments(segments: string[]): string {
+    let output = "";
+    for (const segment of segments) {
+      if (!segment.trim()) {
+        continue;
+      }
+      if (!output) {
+        output = segment;
+        continue;
+      }
+      if (/\s$/.test(output) || /^\s/.test(segment)) {
+        output += segment;
+      } else {
+        output += `\n\n${segment}`;
+      }
+    }
+    return output.trim();
+  }
+
+  function readSessionMessageSeq(message: SessionMessage): number {
+    return firstPositiveNumber(
+      message.seq,
+      message.messageSeq,
+      message.message_seq,
+      toRecord(message.payload).rawSeq,
+      toRecord(message.payload).messageSeq,
+      toRecord(message.payload).message_seq,
+      toRecord(message.metadata).rawSeq,
+      toRecord(message.metadata).messageSeq,
+      toRecord(message.metadata).message_seq,
+      toRecord(message.data).rawSeq,
+      toRecord(message.data).messageSeq,
+      toRecord(message.data).message_seq,
+      toRecord(message.__openclaw).seq
+    );
+  }
+
+  function readSessionMessageRunIdentity(message: SessionMessage): string {
+    return identityStringOr(
+      toRecord(message.payload).runId,
+      toRecord(message.payload).run_id,
+      toRecord(message.metadata).runId,
+      toRecord(message.metadata).run_id,
+      toRecord(message.data).runId,
+      toRecord(message.data).run_id,
+      toRecord(message.__openclaw).runId,
+      toRecord(message.__openclaw).run_id
+    );
+  }
+
+  function readSessionMessageResponseIdentity(message: SessionMessage): string {
+    return identityStringOr(
+      toRecord(message.payload).responseId,
+      toRecord(message.payload).response_id,
+      toRecord(message.metadata).responseId,
+      toRecord(message.metadata).response_id,
+      toRecord(message.data).responseId,
+      toRecord(message.data).response_id,
+      toRecord(message.__openclaw).responseId,
+      toRecord(message.__openclaw).response_id
+    );
   }
 
   function isReplayFromPreviousRun(event: GatewayEvent, eventScope: GatewayEventScope): boolean {
@@ -2452,8 +3490,22 @@ export function createHub53AIBridge(input: HubBridgeInput) {
     );
   }
 
+  function getGatewayEventResponseIdentity(event: TimelineEvent): string {
+    const payload = toRecord(event.payload);
+    const session = toRecord(payload.session);
+    return identityStringOr(
+      payload.responseId,
+      payload.response_id,
+      session.responseId,
+      session.response_id
+    );
+  }
+
   function isVisibleOpenClawResponseEvent(event: GatewayEvent): boolean {
-    if (event.kind === "assistant.delta" || event.kind === "assistant.message" || event.kind === "assistant.thinking") {
+    if (event.kind === "assistant.delta" || event.kind === "assistant.message") {
+      return !isUntrustedRawOpenClawAnswerEvent(event) && String(event.payload?.content ?? "").trim().length > 0;
+    }
+    if (event.kind === "assistant.thinking") {
       return String(event.payload?.content ?? "").trim().length > 0;
     }
     if (event.kind === "tool.call" || event.kind === "tool.result") {
@@ -2463,6 +3515,44 @@ export function createHub53AIBridge(input: HubBridgeInput) {
       return true;
     }
     return false;
+  }
+
+  function isOpenClawAnswerEvent(event: TimelineEvent): boolean {
+    return event.kind === "assistant.delta" || event.kind === "assistant.message";
+  }
+
+  function isTrustedOpenClawAnswerEvent(event: TimelineEvent): boolean {
+    if (!isOpenClawAnswerEvent(event)) {
+      return false;
+    }
+    const payload = toRecord(event.payload);
+    const sourceKind = readStringMetadata(payload, "source_kind");
+    if (sourceKind === "typed_transcript.live_replace" || sourceKind === "typed_transcript.final_replace") {
+      return true;
+    }
+    if (readBooleanMetadata(payload, "typed_live") === true || readBooleanMetadata(payload, "typed_final") === true) {
+      return true;
+    }
+    if (readBooleanMetadata(payload, "trusted_answer") === true) {
+      return true;
+    }
+
+    const eventType = readStringMetadata(payload, "eventType") || readStringMetadata(payload, "event_type");
+    return eventType === "response.output_text.delta" ||
+      eventType === "response.output_text.done" ||
+      eventType === "response.completed";
+  }
+
+  function isUntrustedRawOpenClawAnswerEvent(event: TimelineEvent): boolean {
+    if (!isOpenClawAnswerEvent(event) || isTrustedOpenClawAnswerEvent(event)) {
+      return false;
+    }
+    const payload = toRecord(event.payload);
+    const eventId = event.id || "";
+    return payload.rawSeq !== undefined ||
+      payload.raw_seq !== undefined ||
+      eventId.includes(":chat:") ||
+      eventId.includes(":message:");
   }
 
   function enrichFailedRunEvent(
@@ -2763,8 +3853,7 @@ export function createHub53AIBridge(input: HubBridgeInput) {
       return delta;
     }
 
-    lastReplyByReq.set(reqId, `${previous}${content}`);
-    return content;
+    return "";
   }
 
   async function resolveSession(message: Hub53AIIncomingMessage): Promise<GatewaySession> {
@@ -3004,6 +4093,8 @@ export function createHub53AIBridge(input: HubBridgeInput) {
           ? content
           : existing || content;
     eventScope.answerSegmentTextById.set(timeline.segment_id, next);
+    eventScope.answerSegmentVisibilityById.set(timeline.segment_id, timeline.visibility);
+    eventScope.answerSegmentTrustedById.set(timeline.segment_id, isTrustedOpenClawAnswerEvent(event));
 
     const rawOrder = getOpenClawRawOrder(event);
     if (rawOrder) {
@@ -3059,9 +4150,12 @@ export function createHub53AIBridge(input: HubBridgeInput) {
       activityAppliedEventKeys: new Set<string>(),
       answerContentAppliedEventKeys: new Set<string>(),
       answerSegmentTextById: new Map<string, string>(),
+      answerSegmentVisibilityById: new Map<string, OpenClawTimelineV2Visibility>(),
+      answerSegmentTrustedById: new Map<string, boolean>(),
       nextDeltaIndexBySegment: new Map<string, number>(),
       segmentIndexById: new Map<string, number>(),
       timelineMetaByEventKey: new Map<string, OpenClawTimelineV2Meta>(),
+      typedToolCallEnrichedKeys: new Set<string>(),
       currentActivitySeen: false,
       visibleResponseSeen: false,
       lastSeqSeen: 0,
@@ -3204,9 +4298,10 @@ export function createHub53AIBridge(input: HubBridgeInput) {
     const payload = toRecord(event.payload);
     const rest = { ...payload };
     delete rest.openclaw_ledger;
+    const sourceKind = stringOr(rest.source_kind) || event.kind;
     return {
       ...rest,
-      source_kind: event.kind,
+      source_kind: sourceKind,
       event_id: event.id,
       event_seq: event.seq
     };
@@ -4012,6 +5107,7 @@ export function createHub53AIBridge(input: HubBridgeInput) {
   }
 
   function getDefaultOpenClawVisibility(event: GatewayEvent): OpenClawTimelineV2Visibility {
+    if (isUntrustedRawOpenClawAnswerEvent(event)) return "hidden";
     if (event.kind === "assistant.delta") return "stream";
     return "final";
   }
