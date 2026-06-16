@@ -1,10 +1,10 @@
-import { afterEach, describe, expect, it } from "vitest";
-import { access, mkdtemp, mkdir, readFile, rm, writeFile } from "node:fs/promises";
+import { afterEach, describe, expect, it, vi } from "vitest";
+import { access, chmod, mkdtemp, mkdir, readFile, rm, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { parse as parseYaml } from "yaml";
 
-import { installIntoOpenClaw, installIntoQClaw, installIntoWorkBuddy, runInstallCommand } from "../src/install-qclaw";
+import { installIntoCodex, installIntoOpenClaw, installIntoQClaw, installIntoWorkBuddy, runInstallCommand } from "../src/install-qclaw";
 import type { HostDefinition } from "../src/install-qclaw";
 
 const cleanupPaths: string[] = [];
@@ -1199,6 +1199,103 @@ describe("QClaw installer", () => {
     );
   });
 
+  it("installs a Codex App Server channel with auto-detected Codex and hidden workspace root", async () => {
+    const tempRoot = await mkdtemp(join(tmpdir(), "codex-install-"));
+    cleanupPaths.push(tempRoot);
+
+    const packageRoot = await createPackageRoot(tempRoot);
+    const fakeCodex = join(tempRoot, "bin", "codex");
+    const fakeNode = join(tempRoot, "bin", "node");
+    await mkdir(join(tempRoot, "bin"), { recursive: true });
+    await writeFile(fakeCodex, "#!/bin/sh\necho codex-cli 0.134.0\n");
+    await writeFile(fakeNode, "#!/bin/sh\nexit 0\n");
+    await chmod(fakeCodex, 0o755);
+    await chmod(fakeNode, 0o755);
+
+    const launchctlCalls: string[][] = [];
+    const launchAgent = {
+      launchAgentsDir: join(tempRoot, "Library", "LaunchAgents"),
+      logDir: join(tempRoot, ".53ai", "codex-channel", "logs"),
+      uid: 501,
+      platform: "darwin" as const,
+      runLaunchctl: vi.fn(async (args: string[]) => {
+        launchctlCalls.push(args);
+      })
+    };
+
+    const result = await installIntoCodex({
+      packageRoot,
+      installRoot: join(tempRoot, ".53ai", "codex-channel"),
+      workspaceRoot: join(tempRoot, ".53ai", "codex-workspaces"),
+      codexBinPath: fakeCodex,
+      nodeBinPath: fakeNode,
+      hubWsUrl: "wss://hub.example.com/api/v1/openclaw/ws/connect",
+      hubBotId: "hub-bot",
+      hubSecret: "hub-secret",
+      launchAgent
+    });
+
+    const config = JSON.parse(await readFile(result.configPath, "utf8")) as any;
+    const startScript = await readFile(result.startScriptPath, "utf8");
+    const plist = await readFile(result.launchAgent.plistPath, "utf8");
+
+    expect(result.codexBinPath).toBe(fakeCodex);
+    expect(result.codexVersion).toBe("codex-cli 0.134.0");
+    expect(result.hubBotId).toBe("hub-bot");
+    expect(result.workspaceRoot).toBe(join(tempRoot, ".53ai", "codex-workspaces"));
+    expect(config).toMatchObject({
+      wsUrl: "wss://hub.example.com/api/v1/openclaw/ws/connect",
+      botId: "hub-bot",
+      secret: "hub-secret",
+      codexBinPath: fakeCodex,
+      codexVersion: "codex-cli 0.134.0",
+      workspaceRoot: join(tempRoot, ".53ai", "codex-workspaces"),
+      runnerCommand: "codex-app-server",
+      hostKind: "codex"
+    });
+    expect(startScript).toContain("HUB53AI_CODEX_CHANNEL_CONFIG=");
+    expect(startScript).toContain(`exec '${fakeNode}'`);
+    expect(startScript).not.toContain("exec node ");
+    expect(startScript).toContain("codex-channel.cjs");
+    expect(result.launchAgent).toMatchObject({
+      enabled: true,
+      loaded: true,
+      label: "com.53ai.codex-channel",
+      serviceTarget: "gui/501/com.53ai.codex-channel"
+    });
+    expect(plist).toContain("<key>RunAtLoad</key>");
+    expect(plist).toContain("<key>KeepAlive</key>");
+    expect(plist).toContain(fakeNode);
+    expect(plist).toContain(result.channelEntryPath);
+    expect(plist).toContain("HUB53AI_CODEX_CHANNEL_CONFIG");
+    expect(plist).toContain(result.configPath);
+    expect(plist).toContain(result.startScriptPath);
+    expect(plist).toContain(result.launchAgent.stdoutPath);
+    expect(launchctlCalls).toEqual([
+      ["bootout", "gui/501", result.launchAgent.plistPath],
+      ["bootstrap", "gui/501", result.launchAgent.plistPath],
+      ["enable", "gui/501/com.53ai.codex-channel"],
+      ["kickstart", "-k", "gui/501/com.53ai.codex-channel"],
+      ["print", "gui/501/com.53ai.codex-channel"]
+    ]);
+    await access(join(result.destination, "dist", "codex-channel.cjs"));
+    await access(join(tempRoot, ".53ai", "codex-workspaces"));
+
+    launchctlCalls.length = 0;
+    await installIntoCodex({
+      packageRoot,
+      installRoot: join(tempRoot, ".53ai", "codex-channel"),
+      workspaceRoot: join(tempRoot, ".53ai", "codex-workspaces"),
+      codexBinPath: fakeCodex,
+      nodeBinPath: fakeNode,
+      hubWsUrl: "wss://hub.example.com/api/v1/openclaw/ws/connect",
+      hubBotId: "hub-bot",
+      hubSecret: "hub-secret",
+      launchAgent
+    });
+    expect(launchctlCalls.map((args) => args[0])).toEqual(["bootout", "bootstrap", "enable", "kickstart", "print"]);
+  });
+
   it("offers WorkBuddy through the normal install command", async () => {
     const tempRoot = await mkdtemp(join(tmpdir(), "workbuddy-auto-command-"));
     cleanupPaths.push(tempRoot);
@@ -1366,6 +1463,7 @@ async function createPackageRoot(tempRoot: string): Promise<string> {
   );
   await writeFile(join(packageRoot, "dist", "index.cjs"), "module.exports = {};\n");
   await writeFile(join(packageRoot, "dist", "codebuddy-channel.cjs"), "module.exports = {};\n");
+  await writeFile(join(packageRoot, "dist", "codex-channel.cjs"), "module.exports = {};\n");
   await writeFile(join(packageRoot, "dist", "workbuddy-supervisor.cjs"), "module.exports = {};\n");
   await writeFile(join(packageRoot, "hermes", "platforms", "53aihub", "plugin.yaml"), "name: 53aihub\nversion: 0.1.0\nkind: platform\n");
   await writeFile(join(packageRoot, "hermes", "platforms", "53aihub", "__init__.py"), "from .adapter import register\n");
