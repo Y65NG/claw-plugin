@@ -28,6 +28,10 @@ import {
   type Hub53AIRPCRequest
 } from "./53aihub-protocol";
 import {
+  buildWorkBuddyReplyAnswerEvent,
+  buildWorkBuddyRunCompletedEvent,
+  buildWorkBuddyRunFailedEvent,
+  finalizeWorkBuddyHistoryEvent,
   loadWorkBuddyHistory,
   sanitizeWorkBuddyChannelHistory,
   type WorkBuddyHistoryEvent,
@@ -37,7 +41,6 @@ import {
 } from "./workbuddy-history";
 import {
   loadWorkBuddyRuntime,
-  pokeWorkBuddySessionRefresh,
   type WorkBuddyRuntimeSnapshot
 } from "./workbuddy-runtime";
 import {
@@ -110,6 +113,7 @@ type ChannelSessionRecord = {
   updatedAt: string;
   lastEventSeq: number;
   messages: ChannelMessageRecord[];
+  events: WorkBuddyHistoryEvent[];
 };
 
 type ChannelRPCErrorCode = "FEATURE_NOT_AVAILABLE" | "PARAM_ERROR" | "INTERNAL_ERROR" | "NETWORK_ERROR";
@@ -204,7 +208,7 @@ export function createCodeBuddyChannelBridge(input: CodeBuddyChannelBridgeInput)
       text: inputReply.text,
       status: inputReply.status ?? "done"
     });
-    appendAssistantMessage(chatId, inputReply.text);
+    appendAssistantMessage(chatId, inputReply.text, reqId);
     scheduleSharedWorkBuddyChannelHistoryCleanup(chatId, reqId);
     await syncSharedWorkBuddySessionIndex(inputReply.text, "completed", { preserveTitleOnUpdate: true });
   }
@@ -346,12 +350,23 @@ export function createCodeBuddyChannelBridge(input: CodeBuddyChannelBridgeInput)
     status: Hub53AIOutgoingChunk["status"];
     error?: Hub53AIOutgoingChunk["data"]["error"];
   }) {
+    const createdAt = new Date().toISOString();
+    const metadata = buildReplyChunkMetadata({
+      sessionId: inputReply.chatId,
+      chatId: inputReply.chatId,
+      reqId: inputReply.reqId,
+      text: inputReply.text,
+      status: inputReply.status,
+      error: inputReply.error,
+      createdAt
+    });
     const frame = buildHub53AIOutgoingChunk(
       inputReply.reqId,
       inputReply.text,
       inputReply.status,
       inputReply.error,
-      inputReply.chatId
+      inputReply.chatId,
+      metadata
     );
     if (!sendRaw(JSON.stringify(frame), true)) {
       outbox.push(frame);
@@ -393,11 +408,15 @@ export function createCodeBuddyChannelBridge(input: CodeBuddyChannelBridgeInput)
     if (request.action === "sessions.messages") {
       const payload = toRecord(request.data);
       const session = await readRPCSessionMessages(payload);
+      const events = await readRPCSessionEvents(payload);
+      const ledgerEvents = extractLedgerEvents(events);
       const pagination = readRPCPagination(payload, 100);
       const page = session.slice(pagination.offset, pagination.offset + pagination.limit);
       return {
         messages: page,
-        events: [],
+        events,
+        ledger_events: ledgerEvents,
+        ledgerEvents,
         pagination: buildPagination(pagination.limit, pagination.offset, session.length, page.length)
       };
     }
@@ -407,12 +426,19 @@ export function createCodeBuddyChannelBridge(input: CodeBuddyChannelBridgeInput)
       const events = await readRPCSessionEvents(payload);
       const afterSeq = positiveInt(payload.after_seq ?? payload.afterSeq, 0);
       const filteredEvents = afterSeq > 0 ? events.filter((event) => event.seq > afterSeq) : events;
+      const filteredLedgerEvents = extractLedgerEvents(filteredEvents);
       const pagination = readRPCPagination(payload, 100);
       const page = filteredEvents.slice(pagination.offset, pagination.offset + pagination.limit);
       return {
         events: page,
+        ledger_events: filteredLedgerEvents,
+        ledgerEvents: filteredLedgerEvents,
         pagination: buildPagination(pagination.limit, pagination.offset, filteredEvents.length, page.length)
       };
+    }
+
+    if (request.action === "sessions.snapshot") {
+      return readRPCSessionSnapshot(toRecord(request.data));
     }
 
     if (request.action === "sessions.control") {
@@ -486,6 +512,13 @@ export function createCodeBuddyChannelBridge(input: CodeBuddyChannelBridgeInput)
         endpoint: sharedWorker?.endpoint || sharedWorker?.url,
         mainEndpoint: mainWorker?.endpoint || mainWorker?.url
       },
+      hostCapabilities: {
+        inboundChannelNotification: true,
+        sessionSnapshot: true,
+        sessionCacheInvalidation: false,
+        externalHistoryAppend: false,
+        refreshStrategy: "host-capability-gap"
+      },
       cronScheduler: {
         jobCount: runtime.cronTasks.length
       },
@@ -511,6 +544,13 @@ export function createCodeBuddyChannelBridge(input: CodeBuddyChannelBridgeInput)
         permissionMode,
         plugins: runtime.plugins,
         workers: runtime.workers
+      },
+      hostCapabilities: {
+        inboundChannelNotification: true,
+        sessionSnapshot: true,
+        sessionCacheInvalidation: false,
+        externalHistoryAppend: false,
+        refreshStrategy: "host-capability-gap"
       },
       hub53ai: {
         enabled: true,
@@ -597,7 +637,8 @@ export function createCodeBuddyChannelBridge(input: CodeBuddyChannelBridgeInput)
         createdAt: now,
         updatedAt: now,
         lastEventSeq: 0,
-        messages: []
+        messages: [],
+        events: []
       } satisfies ChannelSessionRecord);
 
     session.status = "running";
@@ -615,7 +656,7 @@ export function createCodeBuddyChannelBridge(input: CodeBuddyChannelBridgeInput)
     latestSessionByChat.set(message.chatId, sessionId);
   }
 
-  function appendAssistantMessage(chatId: string, text: string) {
+  function appendAssistantMessage(chatId: string, text: string, reqId?: string) {
     const sessionId = latestSessionByChat.get(chatId) ?? chatId;
     const session = sessions.get(sessionId);
     if (!session) {
@@ -632,6 +673,32 @@ export function createCodeBuddyChannelBridge(input: CodeBuddyChannelBridgeInput)
       content: text,
       createdAt: now
     });
+    appendChannelHistoryEvent(session, buildWorkBuddyReplyAnswerEvent({
+      sessionId,
+      eventId: `assistant-${session.lastEventSeq}:answer`,
+      text,
+      createdAt: now,
+      chatId,
+      reqId
+    }));
+    appendChannelHistoryEvent(session, buildWorkBuddyRunCompletedEvent({
+      sessionId,
+      eventId: `assistant-${session.lastEventSeq}:completed`,
+      createdAt: now,
+      chatId,
+      reqId
+    }));
+  }
+
+  function appendChannelHistoryEvent(
+    session: ChannelSessionRecord,
+    event: Omit<WorkBuddyHistoryEvent, "sessionId" | "seq">
+  ) {
+    const next = finalizeWorkBuddyHistoryEvent(session.id, session.lastEventSeq + 1, event);
+    session.lastEventSeq = next.seq;
+    session.events.push(next);
+    session.updatedAt = maxIso(session.updatedAt, next.createdAt);
+    return next;
   }
 
   function buildSessionTitle(message: Hub53AIIncomingMessage): string {
@@ -657,16 +724,6 @@ export function createCodeBuddyChannelBridge(input: CodeBuddyChannelBridgeInput)
         status,
         preserveTitleOnUpdate: options?.preserveTitleOnUpdate
       });
-      void pokeWorkBuddySessionRefresh({
-        workbuddyHome: input.config.workbuddyHome,
-        sessionId: input.config.workbuddySessionId
-      }).catch((error) => {
-        input.logger?.warn?.(
-          `[53aihub-channel] failed to poke WorkBuddy refresh: ${
-            error instanceof Error ? error.message : String(error)
-          }`
-        );
-      });
     } catch (error) {
       input.logger?.warn?.(
         `[53aihub-channel] failed to sync WorkBuddy session index: ${
@@ -690,10 +747,6 @@ export function createCodeBuddyChannelBridge(input: CodeBuddyChannelBridgeInput)
         input.logger?.info?.(
           `[53aihub-channel] sanitized WorkBuddy channel history: replacements=${result.replacements}`
         );
-        return pokeWorkBuddySessionRefresh({
-          workbuddyHome: input.config.workbuddyHome,
-          sessionId: input.config.workbuddySessionId
-        });
       }).catch((error) => {
         input.logger?.warn?.(
           `[53aihub-channel] failed to sanitize WorkBuddy channel history: ${
@@ -790,12 +843,6 @@ export function createCodeBuddyChannelBridge(input: CodeBuddyChannelBridgeInput)
         timeoutMs: 5_000
       });
       await syncSharedWorkBuddySessionIndex("53AIHub WorkBuddy", "running", { preserveTitleOnUpdate: true });
-      await pokeWorkBuddySessionRefresh({
-        workbuddyHome: input.config.workbuddyHome,
-        sessionId,
-        apiBaseUrls: runtime.apiBaseUrls,
-        timeoutMs: 500
-      }).catch(() => undefined);
       return result;
     } catch (error) {
       throw new ChannelRPCError("NETWORK_ERROR", error instanceof Error ? error.message : String(error));
@@ -978,8 +1025,36 @@ export function createCodeBuddyChannelBridge(input: CodeBuddyChannelBridgeInput)
     if (!sessionId) {
       throw new ChannelRPCError("PARAM_ERROR", "session_id or conversation_id is required");
     }
+    const session = sessions.get(sessionId);
+    if (session) {
+      return session.events;
+    }
     const history = await loadHistorySnapshot();
     return history.eventsBySessionId.get(sessionId) ?? [];
+  }
+
+  async function readRPCSessionSnapshot(payload: Record<string, unknown>) {
+    const sessionId = readRPCSessionId(payload);
+    const afterSeq = positiveInt(payload.after_seq ?? payload.afterSeq, 0);
+    const events = await readRPCSessionEvents(payload);
+    const ledgerEvents = extractLedgerEvents(events);
+    const filteredLedgerEvents = afterSeq > 0
+      ? ledgerEvents.filter((event) => positiveInt(event.seq, 0) > afterSeq)
+      : ledgerEvents;
+    const lastSeq = Math.max(
+      0,
+      ...events.map((event) => event.seq),
+      ...ledgerEvents.map((event) => positiveInt(event.seq, 0))
+    );
+    return {
+      session_id: sessionId,
+      conversation_id: sessionId,
+      last_seq: lastSeq,
+      active_turns: buildActiveTurns(ledgerEvents),
+      recent_events: ledgerEvents.slice(-100),
+      ledger_events: filteredLedgerEvents,
+      ledgerEvents: filteredLedgerEvents
+    };
   }
 
   function positiveInt(value: unknown, fallback: number): number {
@@ -1045,6 +1120,96 @@ export function resolveCodeBuddyChannelBrokerSocketPath(config: Hub53AIChannelCo
     .replace(/[^A-Za-z0-9_.-]+/g, "-")
     .slice(0, 80);
   return join(stateDir, `${identity}.sock`);
+}
+
+function buildReplyChunkMetadata(input: {
+  sessionId: string;
+  chatId: string;
+  reqId: string;
+  text: string;
+  status: Hub53AIOutgoingChunk["status"];
+  error?: Hub53AIOutgoingChunk["data"]["error"];
+  createdAt: string;
+}) {
+  if (input.status === "error") {
+    const event = finalizeWorkBuddyHistoryEvent(input.sessionId, 1, buildWorkBuddyRunFailedEvent({
+      sessionId: input.sessionId,
+      eventId: `${input.reqId}:failed-frame`,
+      text: input.text,
+      createdAt: input.createdAt,
+      chatId: input.chatId,
+      reqId: input.reqId,
+      error: input.error
+    }));
+    return {
+      eventKind: "run.failed",
+      mode: "replace",
+      replace: true,
+      payload: event.payload
+    };
+  }
+
+  if (input.status !== "done" && input.status !== "streaming") {
+    return undefined;
+  }
+
+  const event = finalizeWorkBuddyHistoryEvent(input.sessionId, 1, buildWorkBuddyReplyAnswerEvent({
+    sessionId: input.sessionId,
+    eventId: `${input.reqId}:answer-frame`,
+    text: input.text,
+    createdAt: input.createdAt,
+    chatId: input.chatId,
+    reqId: input.reqId
+  }));
+  return {
+    eventKind: "assistant.message",
+    mode: "replace",
+    replace: true,
+    payload: event.payload
+  };
+}
+
+function extractLedgerEvents(events: WorkBuddyHistoryEvent[]): Array<Record<string, unknown>> {
+  return events
+    .map((event) => toRecord(event.payload.openclaw_ledger))
+    .filter((ledger) => readOptionalString(ledger, "protocol_version") === "openclaw.ledger.v1");
+}
+
+function buildActiveTurns(ledgerEvents: Array<Record<string, unknown>>): Array<Record<string, unknown>> {
+  const latestByTurn = new Map<string, Record<string, unknown>>();
+  for (const event of ledgerEvents) {
+    const turnId = readOptionalString(event, "turn_id");
+    if (!turnId) {
+      continue;
+    }
+    latestByTurn.set(turnId, event);
+  }
+  return [...latestByTurn.values()]
+    .filter((event) => {
+      const eventType = readOptionalString(event, "event_type");
+      const terminalStatus = readOptionalString(event, "terminal_status");
+      return eventType !== "turn.completed" &&
+        eventType !== "turn.failed" &&
+        terminalStatus !== "completed" &&
+        terminalStatus !== "failed" &&
+        terminalStatus !== "interrupted";
+    })
+    .map((event) => ({
+      turn_id: readOptionalString(event, "turn_id"),
+      active_request_id: readOptionalString(event, "active_request_id"),
+      last_seq: readLedgerSeq(event),
+      status: "running"
+    }));
+}
+
+function readLedgerSeq(event: Record<string, unknown>): number {
+  const value = event.seq;
+  const parsed = typeof value === "number" ? value : typeof value === "string" ? Number(value) : NaN;
+  return Number.isFinite(parsed) && parsed >= 0 ? Math.floor(parsed) : 0;
+}
+
+function maxIso(left: string, right: string): string {
+  return left.localeCompare(right) >= 0 ? left : right;
 }
 
 export async function createCodeBuddyChannelBroker(input: {

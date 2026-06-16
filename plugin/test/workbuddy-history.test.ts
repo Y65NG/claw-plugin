@@ -114,7 +114,7 @@ describe("WorkBuddy history adapter", () => {
           callId: "call-1",
           arguments: JSON.stringify({
             toolName: "mcp__53aihub-channel__reply",
-            params: { chat_id: "chat-a", text: "reply" }
+            params: { chat_id: "chat-a", req_id: "req-a", text: "reply" }
           })
         }),
         JSON.stringify({
@@ -145,17 +145,119 @@ describe("WorkBuddy history adapter", () => {
         payload: expect.objectContaining({
           data: expect.objectContaining({
             name: "mcp__53aihub-channel__reply",
-            args: { chat_id: "chat-a", text: "reply" }
+            args: { chat_id: "chat-a", req_id: "req-a", text: "reply" }
+          })
+        })
+      }),
+      expect.objectContaining({
+        id: "tool-call-1:answer",
+        seq: 4,
+        kind: "assistant.message",
+        payload: expect.objectContaining({
+          content: "reply",
+          openclaw_timeline: expect.objectContaining({
+            protocol_version: "openclaw.timeline.v2",
+            operation: "replace",
+            final: true
+          }),
+          openclaw_ledger: expect.objectContaining({
+            protocol_version: "openclaw.ledger.v1",
+            seq: 4,
+            event_type: "part.replace",
+            part_type: "answer",
+            text: "reply",
+            payload: expect.objectContaining({
+              source_kind: "assistant.message",
+              chat_id: "chat-a",
+              req_id: "req-a"
+            })
           })
         })
       }),
       expect.objectContaining({
         id: "tool-result-1",
-        seq: 4,
+        seq: 5,
         kind: "tool.result",
         payload: expect.objectContaining({
           data: expect.objectContaining({
             result: expect.objectContaining({ content: "sent" })
+          })
+        })
+      }),
+      expect.objectContaining({
+        id: "tool-result-1:completed",
+        seq: 6,
+        kind: "run.completed",
+        payload: expect.objectContaining({
+          openclaw_ledger: expect.objectContaining({
+            protocol_version: "openclaw.ledger.v1",
+            seq: 6,
+            event_type: "turn.completed",
+            terminal_status: "completed",
+            payload: expect.objectContaining({
+              source_kind: "run.completed",
+              req_id: "req-a"
+            })
+          })
+        })
+      })
+    ]);
+  });
+
+  it("maps incomplete WorkBuddy assistant records to canonical run.failed ledger events", async () => {
+    const tempRoot = await mkdtemp(join(tmpdir(), "workbuddy-history-failed-"));
+    cleanupPaths.push(tempRoot);
+    const workbuddyHome = join(tempRoot, ".workbuddy");
+    const projectDir = join(workbuddyHome, "projects", "project");
+    await mkdir(projectDir, { recursive: true });
+    await writeFile(
+      join(projectDir, "session-failed.jsonl"),
+      [
+        JSON.stringify({
+          type: "message",
+          role: "user",
+          timestamp: "2026-06-12T08:15:41.000Z",
+          content: "need answer"
+        }),
+        JSON.stringify({
+          id: "assistant-429",
+          type: "message",
+          role: "assistant",
+          status: "incomplete",
+          timestamp: "2026-06-12T08:15:42.000Z",
+          content: "model request failed",
+          providerData: {
+            error: {
+              code: "rate_limit_exceeded",
+              message: "429 Too Many Requests"
+            }
+          }
+        })
+      ].join("\n") + "\n"
+    );
+
+    const snapshot = await loadWorkBuddyHistory({ workbuddyHome, sqliteCommand: join(tempRoot, "missing-sqlite") });
+
+    expect(snapshot.eventsBySessionId.get("session-failed")).toEqual([
+      expect.objectContaining({
+        id: "assistant-429:failed",
+        seq: 3,
+        kind: "run.failed",
+        payload: expect.objectContaining({
+          content: "model request failed",
+          error: expect.objectContaining({ code: "rate_limit_exceeded" }),
+          openclaw_ledger: expect.objectContaining({
+            protocol_version: "openclaw.ledger.v1",
+            seq: 3,
+            event_type: "turn.failed",
+            terminal_status: "failed",
+            text: "model request failed",
+            payload: expect.objectContaining({
+              source_kind: "run.failed",
+              error: expect.objectContaining({
+                message: "429 Too Many Requests"
+              })
+            })
           })
         })
       })

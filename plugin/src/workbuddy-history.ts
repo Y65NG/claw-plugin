@@ -19,9 +19,27 @@ export type WorkBuddyHistoryEvent = {
   id: string;
   sessionId: string;
   seq: number;
-  kind: "assistant.thinking" | "tool.call" | "tool.result" | "run.failed" | "run.interrupted";
+  kind:
+    | "assistant.message"
+    | "assistant.thinking"
+    | "tool.call"
+    | "tool.result"
+    | "run.completed"
+    | "run.failed"
+    | "run.interrupted";
   payload: Record<string, unknown>;
   createdAt: string;
+};
+
+export type WorkBuddyReplyEventInput = {
+  sessionId: string;
+  eventId: string;
+  text?: string;
+  createdAt: string;
+  chatId?: string;
+  reqId?: string;
+  callId?: string;
+  error?: Record<string, unknown>;
 };
 
 export type WorkBuddyHistorySession = {
@@ -72,6 +90,13 @@ type MutableSession = WorkBuddyHistorySession & {
   events: WorkBuddyHistoryEvent[];
 };
 
+type WorkBuddyReplyCall = {
+  text: string;
+  chatId?: string;
+  reqId?: string;
+  callId: string;
+};
+
 type SqliteSessionRecord = {
   id?: unknown;
   cwd?: unknown;
@@ -85,6 +110,8 @@ type SqliteSessionRecord = {
   expert_marketplace?: unknown;
   permission_mode?: unknown;
 };
+
+const HUB53AI_REPLY_TOOL_NAME = "mcp__53aihub-channel__reply";
 
 export async function loadWorkBuddyHistory(input: LoadWorkBuddyHistoryInput = {}): Promise<WorkBuddyHistorySnapshot> {
   const workbuddyHome = input.workbuddyHome || join(homedir(), ".workbuddy");
@@ -213,6 +240,7 @@ async function parseJsonlSession(filePath: string, projectsDir: string, sessions
   const lines = raw.split(/\r?\n/).filter((line) => line.trim());
   let minRecordTime: string | undefined;
   let maxRecordTime: string | undefined;
+  const replyCallsByCallId = new Map<string, WorkBuddyReplyCall>();
   lines.forEach((line, index) => {
     const record = parseJsonLine(line);
     if (!record) {
@@ -262,6 +290,19 @@ async function parseJsonlSession(filePath: string, projectsDir: string, sessions
       const event = buildToolCallEvent(record, sessionId, index, timestamp);
       if (event) {
         appendHistoryEvent(session, event);
+        const replyCall = extractHub53AIReplyCall(record, sessionId, index);
+        if (replyCall) {
+          replyCallsByCallId.set(replyCall.callId, replyCall);
+          appendHistoryEvent(session, buildWorkBuddyReplyAnswerEvent({
+            sessionId,
+            eventId: `${event.id}:answer`,
+            text: replyCall.text,
+            createdAt: timestamp,
+            chatId: replyCall.chatId,
+            reqId: replyCall.reqId,
+            callId: replyCall.callId
+          }));
+        }
       } else {
         session.updatedAt = maxIso(session.updatedAt, timestamp);
       }
@@ -272,6 +313,37 @@ async function parseJsonlSession(filePath: string, projectsDir: string, sessions
       const event = buildToolResultEvent(record, sessionId, index, timestamp);
       if (event) {
         appendHistoryEvent(session, event);
+        const callId = readToolCallId(record, sessionId, index);
+        const replyCall = replyCallsByCallId.get(callId);
+        if (replyCall) {
+          const status = readString(record, "status");
+          const output = record.output;
+          const outputText = extractText(output) || stringifyValue(output);
+          if (status && status !== "completed") {
+            appendHistoryEvent(session, buildWorkBuddyRunFailedEvent({
+              sessionId,
+              eventId: `${event.id}:failed`,
+              text: outputText || `WorkBuddy reply tool failed: ${status}`,
+              createdAt: timestamp,
+              chatId: replyCall.chatId,
+              reqId: replyCall.reqId,
+              callId: replyCall.callId,
+              error: {
+                code: status,
+                message: outputText || `WorkBuddy reply tool failed: ${status}`
+              }
+            }));
+          } else {
+            appendHistoryEvent(session, buildWorkBuddyRunCompletedEvent({
+              sessionId,
+              eventId: `${event.id}:completed`,
+              createdAt: timestamp,
+              chatId: replyCall.chatId,
+              reqId: replyCall.reqId,
+              callId: replyCall.callId
+            }));
+          }
+        }
       } else {
         session.updatedAt = maxIso(session.updatedAt, timestamp);
       }
@@ -304,16 +376,13 @@ async function parseJsonlSession(filePath: string, projectsDir: string, sessions
     if (role === "assistant" && readString(record, "status") === "incomplete") {
       const providerData = toRecord(record.providerData);
       const error = toRecord(providerData.error);
-      appendHistoryEvent(session, {
-        id: `${readString(record, "id") || `${sessionId}-${index + 1}`}:failed`,
-        kind: "run.failed",
+      appendHistoryEvent(session, buildWorkBuddyRunFailedEvent({
+        sessionId,
+        eventId: `${readString(record, "id") || `${sessionId}-${index + 1}`}:failed`,
+        text: content,
         createdAt: timestamp,
-        payload: {
-          content,
-          summary: content,
-          error: Object.keys(error).length ? error : undefined
-        }
-      });
+        error: Object.keys(error).length ? error : undefined
+      }));
     }
     session.createdAt = minIso(session.createdAt, timestamp);
     session.updatedAt = maxIso(session.updatedAt, timestamp);
@@ -436,15 +505,206 @@ function appendHistoryEvent(
   session: MutableSession,
   event: Omit<WorkBuddyHistoryEvent, "sessionId" | "seq">
 ): WorkBuddyHistoryEvent {
-  const next: WorkBuddyHistoryEvent = {
-    ...event,
-    sessionId: session.id,
-    seq: session.lastEventSeq + 1
-  };
+  const next = finalizeWorkBuddyHistoryEvent(session.id, session.lastEventSeq + 1, event);
   session.lastEventSeq = next.seq;
   session.events.push(next);
   session.updatedAt = maxIso(session.updatedAt, next.createdAt);
   return next;
+}
+
+export function finalizeWorkBuddyHistoryEvent(
+  sessionId: string,
+  seq: number,
+  event: Omit<WorkBuddyHistoryEvent, "sessionId" | "seq">
+): WorkBuddyHistoryEvent {
+  const next: WorkBuddyHistoryEvent = {
+    ...event,
+    sessionId,
+    seq
+  };
+  return {
+    ...next,
+    payload: finalizeCanonicalPayload(next)
+  };
+}
+
+export function buildWorkBuddyReplyAnswerEvent(
+  input: WorkBuddyReplyEventInput
+): Omit<WorkBuddyHistoryEvent, "sessionId" | "seq"> {
+  return {
+    id: input.eventId,
+    kind: "assistant.message",
+    createdAt: input.createdAt,
+    payload: buildCanonicalPayload({
+      ...input,
+      sourceKind: "assistant.message",
+      eventType: "part.replace",
+      operation: "replace",
+      partType: "answer",
+      segmentType: "answer",
+      segmentIndex: 1,
+      terminalStatus: undefined
+    })
+  };
+}
+
+export function buildWorkBuddyRunCompletedEvent(
+  input: WorkBuddyReplyEventInput
+): Omit<WorkBuddyHistoryEvent, "sessionId" | "seq"> {
+  return {
+    id: input.eventId,
+    kind: "run.completed",
+    createdAt: input.createdAt,
+    payload: buildCanonicalPayload({
+      ...input,
+      text: input.text || "",
+      sourceKind: "run.completed",
+      eventType: "turn.completed",
+      operation: "close",
+      partType: "status",
+      segmentType: "run",
+      segmentIndex: 2,
+      terminalStatus: "completed"
+    })
+  };
+}
+
+export function buildWorkBuddyRunFailedEvent(
+  input: WorkBuddyReplyEventInput
+): Omit<WorkBuddyHistoryEvent, "sessionId" | "seq"> {
+  const text = input.text || readString(input.error ?? {}, "message") || "WorkBuddy run failed";
+  return {
+    id: input.eventId,
+    kind: "run.failed",
+    createdAt: input.createdAt,
+    payload: buildCanonicalPayload({
+      ...input,
+      text,
+      sourceKind: "run.failed",
+      eventType: "turn.failed",
+      operation: "close",
+      partType: "status",
+      segmentType: "run",
+      segmentIndex: 2,
+      terminalStatus: "failed",
+      error: input.error
+    })
+  };
+}
+
+type CanonicalPayloadInput = WorkBuddyReplyEventInput & {
+  sourceKind: "assistant.message" | "run.completed" | "run.failed";
+  eventType: "part.replace" | "turn.completed" | "turn.failed";
+  operation: "replace" | "close";
+  partType: "answer" | "status";
+  segmentType: "answer" | "run";
+  segmentIndex: number;
+  terminalStatus?: "completed" | "failed";
+};
+
+function buildCanonicalPayload(input: CanonicalPayloadInput): Record<string, unknown> {
+  const requestId = input.reqId || input.callId || input.eventId;
+  const turnId = `${input.sessionId}:turn:${sanitizeIdentityPart(requestId)}`;
+  const partId = input.partType === "answer"
+    ? `${turnId}:answer:0`
+    : `${turnId}:status`;
+  const text = input.text || "";
+  const ledgerPayload: Record<string, unknown> = {
+    source_kind: input.sourceKind,
+    chat_id: input.chatId,
+    req_id: input.reqId,
+    call_id: input.callId
+  };
+  if (input.error && Object.keys(input.error).length) {
+    ledgerPayload.error = input.error;
+  }
+
+  return {
+    content: text,
+    summary: text,
+    source_kind: input.sourceKind,
+    chat_id: input.chatId,
+    req_id: input.reqId,
+    call_id: input.callId,
+    error: input.error && Object.keys(input.error).length ? input.error : undefined,
+    openclaw_timeline: {
+      protocol_version: "openclaw.timeline.v2",
+      turn_id: turnId,
+      segment_id: partId,
+      segment_type: input.segmentType,
+      segment_index: input.segmentIndex,
+      delta_index: 0,
+      operation: input.operation,
+      visibility: "final",
+      final: true
+    },
+    openclaw_ledger: {
+      protocol_version: "openclaw.ledger.v1",
+      seq: 0,
+      session_id: input.sessionId,
+      conversation_id: input.sessionId,
+      turn_id: turnId,
+      active_request_id: requestId,
+      part_id: partId,
+      part_type: input.partType,
+      event_type: input.eventType,
+      operation: input.operation,
+      visibility: "final",
+      text,
+      payload: ledgerPayload,
+      terminal_status: input.terminalStatus,
+      created_at: input.createdAt,
+      raw_event_ref: `${input.sessionId}:pending:${input.eventId}`
+    }
+  };
+}
+
+function finalizeCanonicalPayload(event: WorkBuddyHistoryEvent): Record<string, unknown> {
+  const ledger = toRecord(event.payload.openclaw_ledger);
+  if (readString(ledger, "protocol_version") !== "openclaw.ledger.v1") {
+    return event.payload;
+  }
+  return {
+    ...event.payload,
+    openclaw_ledger: {
+      ...ledger,
+      seq: event.seq,
+      session_id: event.sessionId,
+      conversation_id: readString(ledger, "conversation_id") || event.sessionId,
+      raw_event_ref: `${event.sessionId}:${event.seq}:${event.id}`
+    }
+  };
+}
+
+function extractHub53AIReplyCall(
+  record: Record<string, unknown>,
+  sessionId: string,
+  index: number
+): WorkBuddyReplyCall | undefined {
+  const args = parseJsonObject(record.arguments);
+  const requestedTool = readString(args, "toolName") || readString(record, "name");
+  if (requestedTool !== HUB53AI_REPLY_TOOL_NAME) {
+    return undefined;
+  }
+  const params = toRecord(args.params);
+  const text = readString(params, "text");
+  if (!text) {
+    return undefined;
+  }
+  return {
+    text,
+    chatId: readString(params, "chat_id") || readString(params, "chatId"),
+    reqId: readString(params, "req_id") || readString(params, "reqId"),
+    callId: readToolCallId(record, sessionId, index)
+  };
+}
+
+function readToolCallId(record: Record<string, unknown>, sessionId: string, index: number): string {
+  return readString(record, "callId") || readString(record, "toolCallId") || `${sessionId}-tool-${index + 1}`;
+}
+
+function sanitizeIdentityPart(value: string): string {
+  return value.replace(/[^a-zA-Z0-9._:-]+/g, "_").slice(0, 128) || "unknown";
 }
 
 function buildToolCallEvent(

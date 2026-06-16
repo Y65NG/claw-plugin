@@ -85,6 +85,28 @@ describe("CodeBuddy 53AIHub channel", () => {
           status: "done",
           data: {
             conversation_id: "chat-a",
+            mode: "replace",
+            replace: true,
+            event_kind: "assistant.message",
+            payload: expect.objectContaining({
+              content: "reply from codebuddy",
+              openclaw_timeline: expect.objectContaining({
+                protocol_version: "openclaw.timeline.v2",
+                operation: "replace",
+                final: true
+              }),
+              openclaw_ledger: expect.objectContaining({
+                protocol_version: "openclaw.ledger.v1",
+                event_type: "part.replace",
+                part_type: "answer",
+                text: "reply from codebuddy",
+                payload: expect.objectContaining({
+                  source_kind: "assistant.message",
+                  chat_id: "chat-a",
+                  req_id: "req-1"
+                })
+              })
+            }),
             choices: [
               {
                 delta: {
@@ -264,6 +286,22 @@ describe("CodeBuddy 53AIHub channel", () => {
       );
       connection.socket.send(
         JSON.stringify({
+          req_id: "rpc-events",
+          action: "sessions.events",
+          status: "request",
+          data: { session_id: "agenthub_u1", limit: 10, offset: 0 }
+        })
+      );
+      connection.socket.send(
+        JSON.stringify({
+          req_id: "rpc-snapshot",
+          action: "sessions.snapshot",
+          status: "request",
+          data: { session_id: "agenthub_u1", after_seq: 0 }
+        })
+      );
+      connection.socket.send(
+        JSON.stringify({
           req_id: "rpc-cron",
           action: "cron.tasks",
           status: "request",
@@ -303,7 +341,63 @@ describe("CodeBuddy 53AIHub channel", () => {
               { role: "user", content: "first message" },
               { role: "assistant", content: "assistant answer" }
             ],
+            ledger_events: [
+              expect.objectContaining({
+                event_type: "part.replace",
+                text: "assistant answer",
+                payload: expect.objectContaining({ source_kind: "assistant.message" })
+              }),
+              expect.objectContaining({
+                event_type: "turn.completed",
+                terminal_status: "completed",
+                payload: expect.objectContaining({ source_kind: "run.completed" })
+              })
+            ],
             pagination: { limit: 10, offset: 0, total: 2, hasMore: false }
+          }
+        });
+        expect(frameByReq(server.frames, "rpc-events")).toMatchObject({
+          action: "sessions.events",
+          status: "done",
+          data: {
+            events: [
+              expect.objectContaining({ kind: "assistant.message" }),
+              expect.objectContaining({ kind: "run.completed" })
+            ],
+            ledger_events: [
+              expect.objectContaining({
+                event_type: "part.replace",
+                text: "assistant answer",
+                payload: expect.objectContaining({ source_kind: "assistant.message" })
+              }),
+              expect.objectContaining({
+                event_type: "turn.completed",
+                terminal_status: "completed",
+                payload: expect.objectContaining({ source_kind: "run.completed" })
+              })
+            ]
+          }
+        });
+        expect(frameByReq(server.frames, "rpc-snapshot")).toMatchObject({
+          action: "sessions.snapshot",
+          status: "done",
+          data: {
+            session_id: "agenthub_u1",
+            conversation_id: "agenthub_u1",
+            last_seq: 4,
+            active_turns: [],
+            ledger_events: [
+              expect.objectContaining({
+                event_type: "part.replace",
+                text: "assistant answer",
+                payload: expect.objectContaining({ source_kind: "assistant.message" })
+              }),
+              expect.objectContaining({
+                event_type: "turn.completed",
+                terminal_status: "completed",
+                payload: expect.objectContaining({ source_kind: "run.completed" })
+              })
+            ]
           }
         });
         expect(frameByReq(server.frames, "rpc-cron")).toMatchObject({
