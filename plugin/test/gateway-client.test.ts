@@ -263,11 +263,14 @@ describe("gateway client", () => {
           start() {
             this.options.onHelloOk();
           }
-          async request(method, params) {
+          async request(method, params, options) {
             globalThis.__officialGatewayClientRequests = [
               ...(globalThis.__officialGatewayClientRequests || []),
-              { method, params }
+              { method, params, options }
             ];
+            if (method === "health") {
+              return { ok: true, status: "ok" };
+            }
             return { ok: true, key: "official-session", sessionId: "official-session", label: "Official session" };
           }
           stop() {}
@@ -282,8 +285,10 @@ describe("gateway client", () => {
     });
 
     const session = await client.createSession("Official session");
+    const health = await client.getHealth();
 
     expect(session.id).toBe("official-session");
+    expect(health).toMatchObject({ ok: true, status: "ok" });
     expect((globalThis as Record<string, unknown>).__officialGatewayClientOptions).toMatchObject({
       url: "ws://127.0.0.1:28789",
       token: "shared-token"
@@ -294,7 +299,13 @@ describe("gateway client", () => {
         params: {
           label: "Official session",
           agentId: "main"
-        }
+        },
+        options: undefined
+      },
+      {
+        method: "health",
+        params: {},
+        options: { timeoutMs: 2000 }
       }
     ]);
     await client.stop();
@@ -2139,7 +2150,7 @@ describe("gateway client", () => {
   });
 
   it("normalizes live used_exec tool payloads and preserves command input", async () => {
-    const received: Array<{ kind: string; name?: unknown; command?: unknown }> = [];
+    const received: Array<{ kind: string; name?: unknown; command?: unknown; output?: unknown }> = [];
     const httpServer = createServer();
     servers.add(httpServer);
     const wss = new WebSocketServer({ noServer: true });
@@ -2219,7 +2230,8 @@ describe("gateway client", () => {
         received.push({
           kind: event.kind,
           name: (event.payload as { data?: { name?: unknown } }).data?.name,
-          command: (event.payload as { data?: { args?: { command?: unknown } } }).data?.args?.command
+          command: (event.payload as { data?: { args?: { command?: unknown } } }).data?.args?.command,
+          output: (event.payload as { data?: { result?: { output?: unknown } } }).data?.result?.output
         }),
       onDisconnect: () => {}
     });
@@ -2229,12 +2241,14 @@ describe("gateway client", () => {
         {
           kind: "tool.call",
           name: "exec",
-          command: 'curl -s "wttr.in/Shanghai?2"'
+          command: 'curl -s "wttr.in/Shanghai?2"',
+          output: undefined
         },
         {
           kind: "tool.result",
           name: "exec",
-          command: 'curl -s "wttr.in/Shanghai?2"'
+          command: 'curl -s "wttr.in/Shanghai?2"',
+          output: "Shanghai weather"
         }
       ])
     );

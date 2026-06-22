@@ -46,6 +46,15 @@ export type GatewayRuntimeInfo = {
   cronScheduler?: GatewayCronScheduler;
   cronTasks?: GatewayCronTask[];
 };
+export type GatewayMessageAttachment = {
+  type?: string;
+  mimeType?: string;
+  fileName?: string;
+  content: string;
+};
+export type GatewaySendMessageOptions = {
+  attachments?: GatewayMessageAttachment[];
+};
 export type GatewayHealthSnapshot = {
   ok?: boolean;
   status: "ok" | "degraded" | "error" | "unknown";
@@ -84,7 +93,7 @@ type GatewayFrame =
       };
     };
 
-type GatewayClient = {
+export type GatewayClient = {
   getRuntimeInfo(): Promise<GatewayRuntimeInfo>;
   getHealth(): Promise<GatewayHealthSnapshot>;
   listSessions(limit?: number): Promise<GatewaySession[]>;
@@ -92,7 +101,7 @@ type GatewayClient = {
   createSession(title: string, initialPrompt?: string): Promise<GatewaySession>;
   getSession(sessionId: string): Promise<GatewaySession>;
   getSessionMessages(sessionId: string, limit?: number): Promise<SessionMessage[]>;
-  sendMessage(sessionId: string, content: string): Promise<void>;
+  sendMessage(sessionId: string, content: string, options?: GatewaySendMessageOptions): Promise<void>;
   controlSession(sessionId: string, action: ControlAction, title?: string): Promise<void>;
   listEvents(sessionId: string, afterSeq?: number): Promise<GatewayEvent[]>;
   subscribe(
@@ -358,7 +367,7 @@ export function createGatewayClient(config: Partial<GatewayConfig>): GatewayClie
       const rawMessages = await readChatHistoryPages(transport, sessionId, limit);
       return extractMessagesFromRaw(sessionId, rawMessages);
     },
-    async sendMessage(sessionId, content) {
+    async sendMessage(sessionId, content, options = {}) {
       if (resolved.preferResponsesApi) {
         try {
           await startResponsesApiRun({
@@ -380,6 +389,7 @@ export function createGatewayClient(config: Partial<GatewayConfig>): GatewayClie
       await transport.request("chat.send", {
         sessionKey: sessionId,
         message: content,
+        ...(options.attachments?.length ? { attachments: options.attachments } : {}),
         deliver: false,
         idempotencyKey: randomUUID()
       });
@@ -584,9 +594,9 @@ function createOfficialTransport(config: GatewayConfig, modulePath: string): Rpc
   };
 
   return {
-    async request(method, params) {
+    async request(method, params, options) {
       const client = await ensureClient();
-      return await client.request(method, params);
+      return await client.request(method, params, options);
     },
     onEvent(listener) {
       listeners.add(listener);
@@ -2499,6 +2509,59 @@ function readExecCommandFromRecords(...records: Record<string, unknown>[]): stri
   return "";
 }
 
+function firstToolResultValue(...values: unknown[]): unknown {
+  for (const value of values) {
+    if (value === undefined || value === null || value === "") {
+      continue;
+    }
+    return value;
+  }
+  return undefined;
+}
+
+function readTextFromToolResultValue(value: unknown): string {
+  if (typeof value === "string") {
+    return value.trim();
+  }
+  if (Array.isArray(value)) {
+    return value
+      .map((entry) => {
+        const record = toRecord(entry);
+        return stringProperty(record, ["text", "content", "output", "result"]) ?? "";
+      })
+      .filter(Boolean)
+      .join("\n")
+      .trim();
+  }
+  const record = toRecord(value);
+  return (
+    stringProperty(record, ["output", "content", "result", "aggregated"]) ??
+    stringProperty(toRecord(record.details), ["aggregated", "output", "content", "result"]) ??
+    ""
+  ).trim();
+}
+
+function normalizeToolResultValue(value: unknown): unknown {
+  if (value === undefined || value === null || value === "") {
+    return undefined;
+  }
+  const record = toRecord(value);
+  const text = readTextFromToolResultValue(value);
+  if (!text) {
+    return value;
+  }
+  if (typeof value === "string" || Array.isArray(value)) {
+    return { output: text };
+  }
+  if (record.output === undefined && record.content === undefined && record.result === undefined) {
+    return {
+      ...record,
+      output: text
+    };
+  }
+  return value;
+}
+
 function normalizeSessionToolPayload(
   payload: Record<string, unknown>,
   subscription?: SessionSubscription
@@ -2542,6 +2605,29 @@ function normalizeSessionToolPayload(
     readToolCallId(payload) ||
     readToolCallId(fn) ||
     readToolCallId(inherited);
+  const phase = String(payload.phase ?? data.phase ?? "");
+  const shouldNormalizeResult =
+    ["result", "done", "output"].includes(phase) ||
+    data.result !== undefined ||
+    data.output !== undefined ||
+    data.content !== undefined ||
+    payload.result !== undefined ||
+    payload.output !== undefined ||
+    payload.content !== undefined;
+  const normalizedResult = shouldNormalizeResult
+    ? normalizeToolResultValue(
+        firstToolResultValue(
+          data.result,
+          data.output,
+          data.content,
+          data.details,
+          payload.result,
+          payload.output,
+          payload.content,
+          payload.details
+        )
+      )
+    : undefined;
 
   return {
     ...payload,
@@ -2550,7 +2636,8 @@ function normalizeSessionToolPayload(
       name,
       ...(toolCallId ? { toolCallId } : {}),
       ...(Object.keys(normalizedArgs).length > 0 ? { args: normalizedArgs } : {}),
-      ...(command && isExecToolName(name) ? { command } : {})
+      ...(command && isExecToolName(name) ? { command } : {}),
+      ...(normalizedResult !== undefined ? { result: normalizedResult } : {})
     }
   };
 }
@@ -3457,5 +3544,3 @@ function fallbackSession(sessionId: string, hostKind = "openclaw"): GatewaySessi
 function toRecord(value: unknown): Record<string, any> {
   return value && typeof value === "object" ? (value as Record<string, any>) : {};
 }
-
-export type { GatewayClient };

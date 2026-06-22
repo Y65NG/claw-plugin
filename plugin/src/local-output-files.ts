@@ -28,6 +28,7 @@ export type LocalOutputFileEntry = {
 export type LocalOutputFile = {
   id: string;
   file_name: string;
+  path?: string;
   mime_type?: string;
   size?: number;
   base64: string;
@@ -257,6 +258,7 @@ async function entriesToOutputFiles(
       files.push({
         id: buildLocalOutputFileId(entry, bytes),
         file_name: entry.relativePath,
+        path: entry.path,
         mime_type: inferMimeType(entry.relativePath),
         size: entry.size,
         base64: bytes.toString("base64")

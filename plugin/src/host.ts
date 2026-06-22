@@ -29,6 +29,7 @@ export type PluginConfig = {
     createdFilesMaxFileBytes?: number;
     createdFilesMaxCount?: number;
     createdFilesExclude?: string[];
+    artifactUploadTimeoutMs?: number;
     diagnosticLogs?: boolean;
     ledgerDebug?: boolean;
     duplicateTrace?: boolean;
@@ -77,6 +78,7 @@ export type ResolvedPluginConfig = {
     createdFilesMaxFileBytes: number;
     createdFilesMaxCount: number;
     createdFilesExclude: string[];
+    artifactUploadTimeoutMs: number;
     diagnosticLogs: boolean;
     ledgerDebug: boolean;
     duplicateTrace: boolean;
@@ -176,6 +178,7 @@ export function resolvePluginConfig(config?: PluginConfig): ResolvedPluginConfig
       createdFilesExclude: Array.isArray(config?.hub53ai?.createdFilesExclude)
         ? config.hub53ai.createdFilesExclude.map((entry) => String(entry).trim()).filter(Boolean)
         : [],
+      artifactUploadTimeoutMs: config?.hub53ai?.artifactUploadTimeoutMs ?? 1_500,
       diagnosticLogs: config?.hub53ai?.diagnosticLogs ?? config?.hub53ai?.debug?.all ?? false,
       ledgerDebug: config?.hub53ai?.ledgerDebug ?? config?.hub53ai?.debug?.ledger ?? false,
       duplicateTrace: config?.hub53ai?.duplicateTrace ?? config?.hub53ai?.debug?.duplicates ?? false,
@@ -556,7 +559,7 @@ function readHostGatewayConfig(configPath: string): {
   }
 }
 
-function resolveHostConfigPath(configPath: string): string {
+export function resolveHostConfigPath(configPath: string): string {
   const candidates = [
     configPath,
     join(homedir(), ".qclaw", "openclaw.json"),

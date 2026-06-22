@@ -127,6 +127,7 @@ export function createConsoleServer(input: CreateConsoleServerInput) {
             await appendEvent(event);
             broadcastSessionEvent(event.sessionId, event);
           },
+          listSessionMessages: (sessionId) => store.getSession(sessionId)?.messages ?? [],
           listSessionEvents: (sessionId) => store.getSession(sessionId)?.events ?? [],
           listKnownSessions: () => store.listSessions(),
           onEnsureSessionStream: ensureSessionStream,

@@ -23,6 +23,41 @@ afterEach(async () => {
   await Promise.all(cleanupPaths.splice(0).map((path) => rm(path, { recursive: true, force: true })));
 });
 
+function ledgerTimelineEvent(
+  sessionId: string,
+  seq: number,
+  turnId: string,
+  eventType: "turn.started" | "part.replace" | "turn.completed",
+  text: string
+): GatewayEvent {
+  return {
+    id: `event-${seq}`,
+    sessionId,
+    seq,
+    kind: eventType === "part.replace" ? "assistant.message" : eventType === "turn.started" ? "run.started" : "run.completed",
+    payload: {
+      content: text,
+      openclaw_ledger: {
+        protocol_version: "openclaw.ledger.v1",
+        seq,
+        session_id: sessionId,
+        conversation_id: sessionId,
+        turn_id: `${sessionId}:${turnId}`,
+        active_request_id: turnId,
+        part_id: `${sessionId}:${turnId}:${eventType}`,
+        part_type: eventType === "part.replace" ? "answer" : "status",
+        event_type: eventType,
+        operation: eventType === "part.replace" ? "replace" : "noop",
+        visibility: "final",
+        text,
+        created_at: "2026-06-18T08:00:00.000Z",
+        raw_event_ref: `${sessionId}:${seq}:event-${seq}`
+      }
+    },
+    createdAt: "2026-06-18T08:00:00.000Z"
+  };
+}
+
 describe("53AIHub client", () => {
   it("slices older pages from the fetched latest message window", () => {
     const messages = ["m3", "m4", "m5", "m6"];
@@ -179,6 +214,149 @@ describe("53AIHub client", () => {
           "53AI Hub-杨芳贤：每日CRM与企微资讯简报查看53ai.com官网的更新"
         ]);
       });
+    } finally {
+      await bridge.stop();
+    }
+  });
+
+  it("sends selected skills and uploaded files together to the gateway", async () => {
+    const stateDir = await mkdtemp(join(tmpdir(), "claw-53aihub-"));
+    cleanupPaths.push(stateDir);
+    const skillRoot = join(stateDir, "skills");
+    await mkdir(join(skillRoot, "openclaw_pdf_probe"), { recursive: true });
+    await writeFile(
+      join(stateDir, "openclaw.json"),
+      JSON.stringify({ skills: { load: { extraDirs: [skillRoot] }, entries: { openclaw_pdf_probe: { enabled: true } } } }),
+      "utf8"
+    );
+    await writeFile(
+      join(skillRoot, "openclaw_pdf_probe", "SKILL.md"),
+      "When this skill is selected, inspect the attached document before answering.",
+      "utf8"
+    );
+    const server = await createFakeHubServer();
+    cleanupServers.push(server.close);
+    const fileServer = createServer((req, res) => {
+      if (req.url === "/probe.txt") {
+        res.writeHead(200, { "Content-Type": "text/plain" });
+        res.end("probe file content");
+        return;
+      }
+      res.writeHead(404);
+      res.end("not found");
+    });
+    await new Promise<void>((resolve) => fileServer.listen(0, "127.0.0.1", resolve));
+    cleanupServers.push(
+      () =>
+        new Promise<void>((resolve) => {
+          fileServer.close(() => resolve());
+        })
+    );
+    const filePort = (fileServer.address() as any).port;
+    const gateway = new FakeGateway();
+    const userMessages: SessionMessage[] = [];
+    const bridge = createHub53AIBridge({
+      stateDir,
+      config: {
+        enabled: true,
+        botId: "bot-123",
+        secret: "sk-secret",
+        wsUrl: server.url,
+        accessPolicy: "open",
+        allowFrom: [],
+        sendThinkingMessage: false,
+        reconnectBaseMs: 20,
+        maxReconnectAttempts: 2
+      },
+      gateway,
+      callbacks: {
+        onSessionUpsert: async (session) => {
+          gateway.upsertSession(session);
+        },
+        onUserMessage: async (message) => {
+          userMessages.push(message);
+        },
+        onSessionStatus: async () => undefined,
+        onEnsureSessionStream: async () => undefined,
+        getLastEventSeq: () => 0,
+        onStatusChange: () => undefined
+      }
+    });
+
+    await bridge.start();
+    try {
+      const connection = await server.connected;
+      connection.socket.send(
+        JSON.stringify({
+          req_id: "req-skill-file",
+          action: "chat",
+          data: {
+            user: "user-123",
+            conversation_id: "chat-skill-file",
+            metadata: {
+              openclaw_client_message_id: "client-skill-file",
+              openclaw_skill: {
+                skill_id: "skill-1",
+                skill_name: "openclaw_pdf_probe",
+                display_name: "PDF Probe"
+              },
+              openclaw_input_files: [
+                {
+                  id: "file-1",
+                  file_name: "probe.txt",
+                  mime_type: "text/plain",
+                  signed_download_url: `http://127.0.0.1:${filePort}/probe.txt`
+                }
+              ]
+            },
+            messages: [{ role: "user", content: "测试技能效果" }]
+          }
+        })
+      );
+
+      await waitFor(() => {
+        expect(gateway.sentMessages).toHaveLength(1);
+      });
+
+      const sentMessage = gateway.sentMessages[0];
+      const expectedLocalPath = join(stateDir, "input-files", "req-skill-file", "probe.txt");
+      expect(sentMessage.content).toContain("测试技能效果");
+      expect(sentMessage.content).not.toContain("Files:\n");
+      expect(sentMessage.content).not.toContain("Attached files:\n");
+      expect(sentMessage.content).not.toContain(`http://127.0.0.1:${filePort}/probe.txt`);
+      expect(sentMessage.content).toContain("<53aihub-openclaw-runtime-context>");
+      expect(sentMessage.content).toContain("Local input files:");
+      expect(sentMessage.content).toContain(`@${expectedLocalPath}`);
+      expect(sentMessage.content).toContain("Selected skill: /openclaw_pdf_probe");
+      expect(sentMessage.content).not.toContain("53AIHub selected skill instructions for /openclaw_pdf_probe");
+      expect(sentMessage.content).not.toContain("inspect the attached document");
+      expect(sentMessage.attachments).toEqual([
+        expect.objectContaining({
+          type: "file",
+          fileName: "probe.txt",
+          mimeType: "text/plain",
+          content: Buffer.from("probe file content").toString("base64")
+        })
+      ]);
+      expect(userMessages).toHaveLength(1);
+      expect(userMessages[0]).toMatchObject({
+        content: "测试技能效果",
+        metadata: {
+          openclaw_client_message_id: "client-skill-file",
+          openclaw_skill: {
+            skill_name: "openclaw_pdf_probe"
+          },
+          openclaw_input_files: [
+            expect.objectContaining({
+              file_name: "probe.txt",
+              local_path: expectedLocalPath
+            })
+          ]
+        }
+      });
+      expect(userMessages[0]?.content).not.toContain("<53aihub-openclaw-runtime-context>");
+      expect(userMessages[0]?.content).not.toContain("Selected skill:");
+      expect(userMessages[0]?.content).not.toContain("Attached files:");
     } finally {
       await bridge.stop();
     }
@@ -2954,6 +3132,84 @@ describe("53AIHub client", () => {
     }
   });
 
+  it("terminates a stale Hub websocket when heartbeats are not acknowledged and reconnects", async () => {
+    const stateDir = await mkdtemp(join(tmpdir(), "claw-53aihub-heartbeat-"));
+    cleanupPaths.push(stateDir);
+    const httpServer = createServer();
+    const wsServer = new WebSocketServer({ server: httpServer });
+    let connectionCount = 0;
+    wsServer.on("connection", (socket) => {
+      connectionCount += 1;
+      socket.on("message", () => {
+        // Intentionally do not answer app-level ping frames; the bridge should
+        // notice the unacknowledged heartbeat and create a fresh connection.
+      });
+    });
+    await new Promise<void>((resolve, reject) => {
+      httpServer.once("error", reject);
+      httpServer.listen(0, "127.0.0.1", () => {
+        httpServer.off("error", reject);
+        resolve();
+      });
+    });
+    cleanupServers.push(async () => {
+      for (const client of wsServer.clients) {
+        client.close();
+      }
+      await new Promise<void>((resolve) => wsServer.close(() => resolve()));
+      await new Promise<void>((resolve) => httpServer.close(() => resolve()));
+    });
+    const address = httpServer.address();
+    if (!address || typeof address === "string") {
+      throw new Error("failed to bind heartbeat test hub server");
+    }
+
+    const gateway = new FakeGateway();
+    const statusErrors: string[] = [];
+    const bridge = createHub53AIBridge({
+      stateDir,
+      config: {
+        enabled: true,
+        botId: "bot-123",
+        secret: "sk-secret",
+        wsUrl: `ws://127.0.0.1:${address.port}`,
+        accessPolicy: "open",
+        allowFrom: [],
+        sendThinkingMessage: false,
+        reconnectBaseMs: 20,
+        maxReconnectAttempts: 2,
+        heartbeatIntervalMs: 1_000,
+        heartbeatTimeoutMs: 2_000,
+      },
+      gateway,
+      callbacks: {
+        onSessionUpsert: async (session) => {
+          gateway.upsertSession(session);
+        },
+        onUserMessage: async () => undefined,
+        onSessionStatus: async () => undefined,
+        onEnsureSessionStream: async () => undefined,
+        getLastEventSeq: () => 0,
+        onStatusChange: () => {
+          const status = bridge.getStatus();
+          if (status.lastError) {
+            statusErrors.push(status.lastError);
+          }
+        },
+      },
+    });
+
+    await bridge.start();
+    try {
+      await waitFor(() => {
+        expect(connectionCount).toBeGreaterThanOrEqual(2);
+      }, 5_000);
+      expect(statusErrors.some((lastError) => lastError.includes("heartbeat timed out"))).toBe(true);
+    } finally {
+      await bridge.stop();
+    }
+  }, 8_000);
+
   it("ignores stale terminal events replayed before the current OpenClaw send", async () => {
     const stateDir = await mkdtemp(join(tmpdir(), "claw-53aihub-"));
     cleanupPaths.push(stateDir);
@@ -5169,16 +5425,6 @@ describe("53AIHub client", () => {
             recent_events: [
               {
                 protocol_version: "openclaw.ledger.v1",
-                seq: 1,
-                run_id: "run-ledger",
-                active_request_id: "client-ledger-snapshot",
-                part_type: "status",
-                event_type: "turn.started",
-                operation: "noop",
-                terminal_status: "running"
-              },
-              {
-                protocol_version: "openclaw.ledger.v1",
                 seq: 2,
                 run_id: "run-ledger",
                 active_request_id: "client-ledger-snapshot",
@@ -5613,6 +5859,303 @@ describe("53AIHub client", () => {
           "part.replace",
           "turn.completed"
         ]);
+      });
+    } finally {
+      await bridge.stop();
+    }
+  });
+
+  it("limits snapshot ledger payloads for large cached histories", async () => {
+    const stateDir = await mkdtemp(join(tmpdir(), "claw-53aihub-rpc-snapshot-window-"));
+    cleanupPaths.push(stateDir);
+
+    const server = await createFakeHubServer();
+    cleanupServers.push(server.close);
+
+    const gateway = new FakeGateway();
+    const historyEvents: GatewayEvent[] = [];
+    for (let index = 0; index < 100; index += 1) {
+      const turnSeq = index * 3 + 1;
+      const runId = `run-window-${index + 1}`;
+      historyEvents.push(
+        {
+          id: `window-run-started-${index + 1}`,
+          sessionId: "session-1",
+          seq: turnSeq,
+          kind: "run.started",
+          payload: { runId },
+          createdAt: new Date(Date.UTC(2026, 5, 12, 0, 0, index)).toISOString()
+        },
+        {
+          id: `window-answer-${index + 1}`,
+          sessionId: "session-1",
+          seq: turnSeq + 1,
+          kind: "assistant.message",
+          payload: { runId, content: `Answer ${index + 1}` },
+          createdAt: new Date(Date.UTC(2026, 5, 12, 0, 0, index, 100)).toISOString()
+        },
+        {
+          id: `window-run-completed-${index + 1}`,
+          sessionId: "session-1",
+          seq: turnSeq + 2,
+          kind: "run.completed",
+          payload: { runId },
+          createdAt: new Date(Date.UTC(2026, 5, 12, 0, 0, index, 200)).toISOString()
+        }
+      );
+    }
+    gateway.eventsBySession.set("session-1", historyEvents);
+
+    const bridge = createHub53AIBridge({
+      stateDir,
+      config: {
+        enabled: true,
+        botId: "bot-123",
+        secret: "sk-secret",
+        wsUrl: server.url,
+        accessPolicy: "open",
+        allowFrom: [],
+        sendThinkingMessage: false,
+        reconnectBaseMs: 20,
+        maxReconnectAttempts: 2
+      },
+      gateway,
+      callbacks: {
+        onSessionUpsert: async (session) => {
+          gateway.upsertSession(session);
+        },
+        onUserMessage: async () => undefined,
+        onSessionStatus: async () => undefined,
+        onEnsureSessionStream: async () => undefined,
+        listSessionEvents: () => [],
+        getLastEventSeq: () => 0,
+        onStatusChange: () => undefined
+      }
+    });
+
+    await bridge.start();
+    try {
+      const connection = await server.connected;
+      connection.socket.send(
+        JSON.stringify({
+          req_id: "rpc-snapshot-window",
+          action: "sessions.snapshot",
+          status: "request",
+          data: { session_id: "session-1" }
+        })
+      );
+
+      await waitFor(() => {
+        const frame = frameByReq(server.frames, "rpc-snapshot-window");
+        expect(frame).toMatchObject({ action: "sessions.snapshot", status: "done" });
+        expect(frame?.data?.last_seq).toBeGreaterThanOrEqual(300);
+        expect(frame?.data?.recent_events.length).toBeLessThanOrEqual(240);
+        expect(frame?.data?.ledger_events.length).toBeLessThanOrEqual(240);
+        expect(frame?.data?.recent_events[0].seq).toBeGreaterThan(1);
+      });
+    } finally {
+      await bridge.stop();
+    }
+  });
+
+  it("does not attach the full canonical ledger to older message pages without message seq anchors", async () => {
+    const stateDir = await mkdtemp(join(tmpdir(), "claw-53aihub-rpc-message-page-ledger-"));
+    cleanupPaths.push(stateDir);
+
+    const server = await createFakeHubServer();
+    cleanupServers.push(server.close);
+
+    const gateway = new FakeGateway();
+    gateway.upsertSession({
+      id: "session-1",
+      title: "Paged history",
+      status: "idle",
+      hostKind: "qclaw",
+      runnerCommand: "gateway",
+      createdAt: "2026-06-18T08:00:00.000Z",
+      updatedAt: "2026-06-18T08:10:00.000Z",
+      lastEventSeq: 6
+    });
+    gateway.messagesBySession.set("session-1", [
+      { id: "m1", sessionId: "session-1", role: "user", content: "first", createdAt: "2026-06-18T08:00:00.000Z" },
+      { id: "m2", sessionId: "session-1", role: "assistant", content: "first answer", createdAt: "2026-06-18T08:00:01.000Z" },
+      { id: "m3", sessionId: "session-1", role: "user", content: "second", createdAt: "2026-06-18T08:01:00.000Z" }
+    ]);
+    gateway.eventsBySession.set("session-1", [
+      ledgerTimelineEvent("session-1", 1, "turn-1", "turn.started", "first"),
+      ledgerTimelineEvent("session-1", 2, "turn-1", "part.replace", "first answer"),
+      ledgerTimelineEvent("session-1", 3, "turn-1", "turn.completed", ""),
+      ledgerTimelineEvent("session-1", 4, "turn-2", "turn.started", "second"),
+      ledgerTimelineEvent("session-1", 5, "turn-2", "part.replace", "second answer"),
+      ledgerTimelineEvent("session-1", 6, "turn-2", "turn.completed", "")
+    ]);
+
+    const bridge = createHub53AIBridge({
+      stateDir,
+      config: {
+        enabled: true,
+        botId: "bot-123",
+        secret: "sk-secret",
+        wsUrl: server.url,
+        accessPolicy: "open",
+        allowFrom: [],
+        sendThinkingMessage: false,
+        reconnectBaseMs: 20,
+        maxReconnectAttempts: 2
+      },
+      gateway,
+      callbacks: {
+        onSessionUpsert: async (session) => {
+          gateway.upsertSession(session);
+        },
+        onUserMessage: async () => undefined,
+        onSessionStatus: async () => undefined,
+        onEnsureSessionStream: async () => undefined,
+        listSessionEvents: () => [],
+        getLastEventSeq: () => 0,
+        onStatusChange: () => undefined
+      }
+    });
+
+    await bridge.start();
+    try {
+      const connection = await server.connected;
+      connection.socket.send(
+        JSON.stringify({
+          req_id: "rpc-message-page-ledger",
+          action: "sessions.messages",
+          status: "request",
+          data: { session_id: "session-1", limit: 1, offset: 1 }
+        })
+      );
+
+      await waitFor(() => {
+        const frame = frameByReq(server.frames, "rpc-message-page-ledger");
+        expect(frame).toMatchObject({ action: "sessions.messages", status: "done" });
+        expect(frame?.data?.messages).toEqual([
+          expect.objectContaining({ id: "m2", content: "first answer" })
+        ]);
+        expect(frame?.data?.events).toEqual([]);
+        expect(frame?.data?.ledger_events).toEqual([]);
+      });
+    } finally {
+      await bridge.stop();
+    }
+  });
+
+  it("merges local 53AIHub user file metadata into sessions.messages history", async () => {
+    const stateDir = await mkdtemp(join(tmpdir(), "claw-53aihub-rpc-message-file-metadata-"));
+    cleanupPaths.push(stateDir);
+
+    const server = await createFakeHubServer();
+    cleanupServers.push(server.close);
+    const gateway = new FakeGateway();
+    gateway.messagesBySession.set("session-1", [
+      {
+        id: "gw-user-1",
+        sessionId: "session-1",
+        role: "user",
+        content: [
+          "读取附件",
+          "<53aihub-openclaw-runtime-context>",
+          "Local input files:",
+          "@/Users/y65ng/.qclaw/input-files/request/probe.md",
+          "Selected skill: /openclaw_pdf_probe",
+          "</53aihub-openclaw-runtime-context>"
+        ].join("\n"),
+        createdAt: "2026-06-18T08:00:00.000Z"
+      },
+      {
+        id: "gw-assistant-1",
+        sessionId: "session-1",
+        role: "assistant",
+        content: "已读取",
+        createdAt: "2026-06-18T08:00:01.000Z"
+      }
+    ]);
+
+    const localMessages: SessionMessage[] = [
+      {
+        id: "hub53ai-user-req-1",
+        sessionId: "session-1",
+        role: "user",
+        content: "读取附件",
+        createdAt: "2026-06-18T08:00:00.200Z",
+        metadata: {
+          openclaw_client_message_id: "client-1",
+          openclaw_skill: {
+            skill_name: "openclaw_pdf_probe",
+            display_name: "PDF Probe"
+          },
+          openclaw_input_files: [
+            {
+              file_name: "probe.md",
+              mime_type: "text/markdown",
+              preview_url: "http://localhost:9001/api/preview/probe.md"
+            }
+          ]
+        }
+      }
+    ];
+
+    const bridge = createHub53AIBridge({
+      stateDir,
+      config: {
+        enabled: true,
+        botId: "bot-123",
+        secret: "sk-secret",
+        wsUrl: server.url,
+        accessPolicy: "open",
+        allowFrom: [],
+        sendThinkingMessage: false,
+        reconnectBaseMs: 20,
+        maxReconnectAttempts: 2
+      },
+      gateway,
+      callbacks: {
+        onSessionUpsert: async (session) => {
+          gateway.upsertSession(session);
+        },
+        onUserMessage: async () => undefined,
+        onSessionStatus: async () => undefined,
+        onEnsureSessionStream: async () => undefined,
+        listSessionMessages: () => localMessages,
+        listSessionEvents: () => [],
+        getLastEventSeq: () => 0,
+        onStatusChange: () => undefined
+      }
+    });
+
+    await bridge.start();
+    try {
+      const connection = await server.connected;
+      connection.socket.send(
+        JSON.stringify({
+          req_id: "rpc-message-file-metadata",
+          action: "sessions.messages",
+          status: "request",
+          data: { session_id: "session-1", limit: 2, offset: 0 }
+        })
+      );
+
+      await waitFor(() => {
+        const frame = frameByReq(server.frames, "rpc-message-file-metadata");
+        expect(frame).toMatchObject({ action: "sessions.messages", status: "done" });
+        expect(frame?.data?.messages?.[0]).toMatchObject({
+          id: "gw-user-1",
+          content: "读取附件",
+          metadata: {
+            openclaw_client_message_id: "client-1",
+            openclaw_skill: { skill_name: "openclaw_pdf_probe" },
+            openclaw_input_files: [
+              expect.objectContaining({
+                file_name: "probe.md",
+                preview_url: "http://localhost:9001/api/preview/probe.md"
+              })
+            ]
+          }
+        });
+        expect(frame?.data?.messages?.[0]?.content).not.toContain("<53aihub-openclaw-runtime-context>");
       });
     } finally {
       await bridge.stop();
@@ -7871,7 +8414,7 @@ class FakeGateway {
   private sessions = new Map<string, GatewaySession>();
   private listeners = new Map<string, Set<(event: GatewayEvent) => void>>();
   private disconnectHandlers = new Map<string, Set<(error?: Error) => void>>();
-  sentMessages: Array<{ sessionId: string; content: string }> = [];
+  sentMessages: Array<{ sessionId: string; content: string; attachments?: any[] }> = [];
   eventsToEmit?: GatewayEvent[];
   disconnectOnNextSend = false;
   disconnectCompletionDelayMs = 0;
@@ -7956,8 +8499,12 @@ class FakeGateway {
     return this.messagesBySession.get(sessionId) ?? [];
   }
 
-  async sendMessage(sessionId: string, content: string): Promise<void> {
-    this.sentMessages.push({ sessionId, content });
+  async sendMessage(sessionId: string, content: string, options: { attachments?: any[] } = {}): Promise<void> {
+    this.sentMessages.push({
+      sessionId,
+      content,
+      ...(options.attachments?.length ? { attachments: options.attachments } : {})
+    });
     setTimeout(async () => {
       await this.beforeEmit?.(sessionId);
       if (this.disconnectOnNextSend) {
