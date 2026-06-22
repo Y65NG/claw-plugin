@@ -3,8 +3,20 @@ import { mkdir, mkdtemp, readFile, rm, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 
-import { afterEach, describe, expect, it } from "vitest";
+import { afterEach, describe, expect, it, vi } from "vitest";
 import WebSocket, { WebSocketServer } from "ws";
+
+const skillInstallerMock = vi.hoisted(() => ({
+  ensureHubSkillInstalled: vi.fn()
+}));
+
+vi.mock("../src/skill-installer", async (importOriginal) => {
+  const actual = await importOriginal<typeof import("../src/skill-installer")>();
+  return {
+    ...actual,
+    ensureHubSkillInstalled: skillInstallerMock.ensureHubSkillInstalled
+  };
+});
 
 import {
   createHub53AIBridge,
@@ -19,6 +31,7 @@ const cleanupPaths: string[] = [];
 const cleanupServers: Array<() => Promise<void>> = [];
 
 afterEach(async () => {
+  skillInstallerMock.ensureHubSkillInstalled.mockReset();
   await Promise.all(cleanupServers.splice(0).map((cleanup) => cleanup()));
   await Promise.all(cleanupPaths.splice(0).map((path) => rm(path, { recursive: true, force: true })));
 });
@@ -4133,6 +4146,205 @@ describe("53AIHub client", () => {
       expect(frameByReq(server.frames, "rpc-server-response")).toBeUndefined();
       expect(gateway.sentMessages).toEqual([]);
       expect(gateway.controls).toEqual([{ sessionId: "session-1", action: "stop" }]);
+    } finally {
+      await bridge.stop();
+    }
+  });
+
+  it("adds successfully ensured 53AI skills to runtime skills responses", async () => {
+    const stateDir = await mkdtemp(join(tmpdir(), "claw-53aihub-runtime-skill-overlay-"));
+    cleanupPaths.push(stateDir);
+    const server = await createFakeHubServer();
+    cleanupServers.push(server.close);
+    const gateway = new FakeGateway();
+    gateway.runtimeInfo = { enabledSkills: ["browser"] };
+    skillInstallerMock.ensureHubSkillInstalled.mockResolvedValueOnce({
+      ok: true,
+      status: "installed",
+      skill_id: "skill-1",
+      skill_name: "openclaw_pdf_probe",
+      display_name: "PDF Probe",
+      install_path: "/Users/y65ng/.qclaw/skills/openclaw_pdf_probe"
+    });
+
+    const bridge = createHub53AIBridge({
+      stateDir,
+      config: {
+        enabled: true,
+        botId: "bot-123",
+        secret: "sk-secret",
+        wsUrl: server.url,
+        accessPolicy: "open",
+        allowFrom: [],
+        sendThinkingMessage: false,
+        reconnectBaseMs: 20,
+        maxReconnectAttempts: 2
+      },
+      gateway,
+      callbacks: {
+        onSessionUpsert: async (session) => {
+          gateway.upsertSession(session);
+        },
+        onUserMessage: async () => undefined,
+        onSessionStatus: async () => undefined,
+        onEnsureSessionStream: async () => undefined,
+        getLastEventSeq: () => 0,
+        onStatusChange: () => undefined
+      }
+    });
+
+    await bridge.start();
+    try {
+      const connection = await server.connected;
+      connection.socket.send(
+        JSON.stringify({
+          req_id: "rpc-ensure-skill",
+          action: "runtime.skills.ensure",
+          status: "request",
+          data: {
+            skill_id: "skill-1",
+            skill_name: "openclaw_pdf_probe",
+            display_name: "PDF Probe"
+          }
+        })
+      );
+
+      await waitFor(() => {
+        expect(frameByReq(server.frames, "rpc-ensure-skill")).toMatchObject({
+          action: "runtime.skills.ensure",
+          status: "done",
+          data: { ok: true, status: "installed" }
+        });
+      });
+
+      connection.socket.send(
+        JSON.stringify({
+          req_id: "rpc-runtime-skills-after-ensure",
+          action: "runtime.get",
+          status: "request",
+          data: { include: "skills" }
+        })
+      );
+
+      await waitFor(() => {
+        expect(frameByReq(server.frames, "rpc-runtime-skills-after-ensure")).toMatchObject({
+          action: "runtime.get",
+          status: "done",
+          data: {
+            enabledSkills: [
+              "browser",
+              expect.objectContaining({
+                skill_id: "skill-1",
+                skill_name: "openclaw_pdf_probe",
+                display_name: "PDF Probe",
+                status: "enabled",
+                source: "53aihub"
+              })
+            ]
+          }
+        });
+      });
+    } finally {
+      await bridge.stop();
+    }
+  });
+
+  it("does not add failed or duplicate ensured 53AI skills to runtime skills responses", async () => {
+    const stateDir = await mkdtemp(join(tmpdir(), "claw-53aihub-runtime-skill-overlay-dedupe-"));
+    cleanupPaths.push(stateDir);
+    const server = await createFakeHubServer();
+    cleanupServers.push(server.close);
+    const gateway = new FakeGateway();
+    gateway.runtimeInfo = { enabledSkills: ["browser", "openclaw_pdf_probe"] };
+    skillInstallerMock.ensureHubSkillInstalled
+      .mockResolvedValueOnce({
+        ok: false,
+        status: "failed",
+        skill_name: "failed_skill",
+        error: "missing package"
+      })
+      .mockResolvedValueOnce({
+        ok: true,
+        status: "up_to_date",
+        skill_name: "openclaw_pdf_probe",
+        display_name: "PDF Probe"
+      });
+
+    const bridge = createHub53AIBridge({
+      stateDir,
+      config: {
+        enabled: true,
+        botId: "bot-123",
+        secret: "sk-secret",
+        wsUrl: server.url,
+        accessPolicy: "open",
+        allowFrom: [],
+        sendThinkingMessage: false,
+        reconnectBaseMs: 20,
+        maxReconnectAttempts: 2
+      },
+      gateway,
+      callbacks: {
+        onSessionUpsert: async (session) => {
+          gateway.upsertSession(session);
+        },
+        onUserMessage: async () => undefined,
+        onSessionStatus: async () => undefined,
+        onEnsureSessionStream: async () => undefined,
+        getLastEventSeq: () => 0,
+        onStatusChange: () => undefined
+      }
+    });
+
+    await bridge.start();
+    try {
+      const connection = await server.connected;
+      connection.socket.send(
+        JSON.stringify({
+          req_id: "rpc-ensure-failed-skill",
+          action: "runtime.skills.ensure",
+          status: "request",
+          data: { skill_name: "failed_skill" }
+        })
+      );
+      connection.socket.send(
+        JSON.stringify({
+          req_id: "rpc-ensure-duplicate-skill",
+          action: "runtime.skills.ensure",
+          status: "request",
+          data: { skill_name: "openclaw_pdf_probe", display_name: "PDF Probe" }
+        })
+      );
+
+      await waitFor(() => {
+        expect(frameByReq(server.frames, "rpc-ensure-failed-skill")).toMatchObject({
+          status: "done",
+          data: { ok: false, status: "failed" }
+        });
+        expect(frameByReq(server.frames, "rpc-ensure-duplicate-skill")).toMatchObject({
+          status: "done",
+          data: { ok: true, status: "up_to_date" }
+        });
+      });
+
+      connection.socket.send(
+        JSON.stringify({
+          req_id: "rpc-runtime-skills-after-failed-and-duplicate",
+          action: "runtime.get",
+          status: "request",
+          data: { include: "skills" }
+        })
+      );
+
+      await waitFor(() => {
+        const frame = frameByReq(server.frames, "rpc-runtime-skills-after-failed-and-duplicate");
+        expect(frame).toMatchObject({
+          action: "runtime.get",
+          status: "done",
+          data: { enabledSkills: ["browser", "openclaw_pdf_probe"] }
+        });
+        expect(JSON.stringify(frame?.data)).not.toContain("failed_skill");
+      });
     } finally {
       await bridge.stop();
     }

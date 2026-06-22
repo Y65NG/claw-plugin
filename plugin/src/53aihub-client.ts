@@ -4,7 +4,7 @@ import { basename, dirname, extname, join } from "node:path";
 
 import WebSocket from "ws";
 
-import { ensureHubSkillInstalled, type EnsureHubSkillRequest } from "./skill-installer";
+import { ensureHubSkillInstalled, type EnsureHubSkillRequest, type EnsureHubSkillResult } from "./skill-installer";
 import type {
   GatewayClient,
   GatewayEvent,
@@ -400,6 +400,8 @@ type RPCPagination = {
   offset: number;
 };
 
+type RuntimeSkillDisplayItem = string | Record<string, unknown>;
+
 class HubRPCError extends Error {
   constructor(
     readonly code: string,
@@ -434,6 +436,7 @@ export function createHub53AIBridge(input: HubBridgeInput) {
   const syntheticEventsBySession = new Map<string, TimelineEvent[]>();
   const canonicalEventsBySession = new Map<string, TimelineEvent[]>();
   const ledgerSeqBySession = new Map<string, number>();
+  const ensuredRuntimeSkillsByKey = new Map<string, RuntimeSkillDisplayItem>();
   let persistStateQueue: Promise<void> = Promise.resolve();
   let persistStateTimer: NodeJS.Timeout | null = null;
 
@@ -792,8 +795,9 @@ export function createHub53AIBridge(input: HubBridgeInput) {
     }
 
     if (request.action === "runtime.skills.ensure") {
-      return ensureHubSkillInstalled({
-        request: toRecord(request.data) as EnsureHubSkillRequest,
+      const ensureRequest = toRecord(request.data) as EnsureHubSkillRequest;
+      const result = await ensureHubSkillInstalled({
+        request: ensureRequest,
         configPath: input.configPath,
         stateDir: input.stateDir,
         hub: {
@@ -803,6 +807,8 @@ export function createHub53AIBridge(input: HubBridgeInput) {
         },
         logger: input.logger
       });
+      rememberEnsuredRuntimeSkill(ensureRequest, result);
+      return result;
     }
 
     if (request.action === "cron.tasks") {
@@ -1884,16 +1890,27 @@ export function createHub53AIBridge(input: HubBridgeInput) {
       return input.rpcContext?.getConfigSnapshot ? await input.rpcContext.getConfigSnapshot() : buildFallbackConfig();
     }
     if (include === "skills") {
-      return buildSkillsPayload(await input.gateway.getRuntimeInfo());
+      return buildSkillsPayload(await input.gateway.getRuntimeInfo(), ensuredRuntimeSkillsByKey);
     }
 
     const runtimeInfo = await input.gateway.getRuntimeInfo();
     return {
       status: input.rpcContext?.getStatusSnapshot ? await input.rpcContext.getStatusSnapshot() : await buildFallbackStatus(),
       config: input.rpcContext?.getConfigSnapshot ? await input.rpcContext.getConfigSnapshot() : buildFallbackConfig(),
-      skills: buildSkillsPayload(runtimeInfo),
+      skills: buildSkillsPayload(runtimeInfo, ensuredRuntimeSkillsByKey),
       cronTasks: runtimeInfo.cronTasks ?? []
     };
+  }
+
+  function rememberEnsuredRuntimeSkill(request: EnsureHubSkillRequest, result: EnsureHubSkillResult): void {
+    if (!result.ok || (result.status !== "installed" && result.status !== "up_to_date")) {
+      return;
+    }
+    const skill = buildEnsuredRuntimeSkill(request, result);
+    const key = runtimeSkillIdentity(skill);
+    if (key) {
+      ensuredRuntimeSkillsByKey.set(key, skill);
+    }
   }
 
   async function resolveCurrentSessionRPC(payload: unknown): Promise<GatewaySession | null> {
@@ -6592,12 +6609,74 @@ export function sliceLatestWindowPage<T>(items: T[], limit: number, offset: numb
   return items.slice(start, end);
 }
 
-function buildSkillsPayload(runtimeInfo: GatewayRuntimeInfo) {
+function buildSkillsPayload(
+  runtimeInfo: GatewayRuntimeInfo,
+  ensuredRuntimeSkills?: Map<string, RuntimeSkillDisplayItem>
+) {
+  const enabledSkills = mergeRuntimeSkills(
+    runtimeInfo.enabledSkills,
+    ensuredRuntimeSkills ? Array.from(ensuredRuntimeSkills.values()) : []
+  );
   return {
     ...(runtimeInfo.modelPrimary ? { modelPrimary: runtimeInfo.modelPrimary } : {}),
-    skills: runtimeInfo.enabledSkills,
-    enabledSkills: runtimeInfo.enabledSkills
+    skills: enabledSkills,
+    enabledSkills
   };
+}
+
+function buildEnsuredRuntimeSkill(
+  request: EnsureHubSkillRequest,
+  result: EnsureHubSkillResult
+): Record<string, unknown> {
+  const skillName = stringOr(result.skill_name, request.skill_name);
+  const skillID = stringOr(result.skill_id, request.skill_id);
+  const displayName = stringOr(result.display_name, request.display_name, skillName, skillID);
+  return {
+    id: skillID || skillName || displayName,
+    ...(skillID ? { skill_id: skillID } : {}),
+    ...(skillName ? { skill_name: skillName } : {}),
+    name: displayName || skillName || skillID,
+    title: displayName || skillName || skillID,
+    ...(displayName ? { display_name: displayName } : {}),
+    enabled: true,
+    status: "enabled",
+    source: "53aihub",
+    ensure_status: result.status,
+    ...(result.version ? { version: result.version } : {}),
+    ...(result.install_path ? { install_path: result.install_path } : {})
+  };
+}
+
+function mergeRuntimeSkills(
+  gatewaySkills: unknown[],
+  ensuredSkills: RuntimeSkillDisplayItem[]
+): RuntimeSkillDisplayItem[] {
+  const seen = new Set<string>();
+  const output: RuntimeSkillDisplayItem[] = [];
+  for (const skill of [...gatewaySkills, ...ensuredSkills]) {
+    const key = runtimeSkillIdentity(skill);
+    if (!key || seen.has(key)) {
+      continue;
+    }
+    seen.add(key);
+    output.push(skill as RuntimeSkillDisplayItem);
+  }
+  return output;
+}
+
+function runtimeSkillIdentity(skill: unknown): string {
+  if (typeof skill === "string") {
+    return skill.trim().toLowerCase();
+  }
+  const record = toRecord(skill);
+  return stringOr(
+    record.skill_name,
+    record.name,
+    record.title,
+    record.display_name,
+    record.skill_id,
+    record.id
+  ).toLowerCase();
 }
 
 function redactHubConfig(config: Hub53AIConfig): Omit<Hub53AIConfig, "secret"> & { secret: string } {
