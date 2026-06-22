@@ -367,6 +367,7 @@ const MAX_SYNTHETIC_EVENTS_PER_SESSION = 200;
 const MAX_CANONICAL_EVENTS_PER_SESSION = 500;
 const MAX_CANONICAL_EVENTS_PER_MESSAGE_PAGE = 160;
 const MAX_CANONICAL_EVENTS_PER_SNAPSHOT = 240;
+const MAX_SESSION_MESSAGE_TURN_BOUNDARY_OVERSCAN = 8;
 const CANONICAL_MESSAGE_PAGE_SEQ_WINDOW_BEFORE = 80;
 const CANONICAL_MESSAGE_PAGE_SEQ_WINDOW_AFTER = 160;
 const PERSIST_STATE_DEBOUNCE_MS = 300;
@@ -724,16 +725,18 @@ export function createHub53AIBridge(input: HubBridgeInput) {
       const payload = toRecord(request.data);
       const sessionId = readRPCSessionId(payload);
       const pagination = readRPCPagination(payload, 100);
-      const fetchLimit = pagination.offset + pagination.limit;
+      const requestedFetchLimit = pagination.offset + pagination.limit;
+      const fetchLimit = requestedFetchLimit + MAX_SESSION_MESSAGE_TURN_BOUNDARY_OVERSCAN;
       const messages = await input.gateway.getSessionMessages(sessionId, fetchLimit);
       const localMessages = input.callbacks.listSessionMessages
         ? await Promise.resolve(input.callbacks.listSessionMessages(sessionId)).catch(() => [])
         : [];
+      const rawPageMessages = sliceLatestWindowPage(messages, pagination.limit, pagination.offset);
       const pageMessages = mergeHubUserMessageMetadata(
-        sliceLatestWindowPage(messages, pagination.limit, pagination.offset),
+        sliceLatestWindowPageWithTurnBoundary(messages, pagination.limit, pagination.offset),
         Array.isArray(localMessages) ? localMessages : []
       );
-      const total = messages.length >= fetchLimit ? fetchLimit + 1 : messages.length;
+      const total = messages.length >= fetchLimit ? requestedFetchLimit + 1 : messages.length;
       const ledgerEvents = listCanonicalLedgerEventsForMessagePage(sessionId, pageMessages, 0, pagination);
       const events = listCanonicalTimelineEventsForLedgerEvents(sessionId, ledgerEvents);
       return {
@@ -741,7 +744,7 @@ export function createHub53AIBridge(input: HubBridgeInput) {
         events,
         ledger_events: ledgerEvents,
         ledgerEvents,
-        pagination: buildPagination(pagination.limit, pagination.offset, total, pageMessages.length)
+        pagination: buildPagination(pagination.limit, pagination.offset, total, rawPageMessages.length)
       };
     }
 
@@ -6603,10 +6606,69 @@ function buildPagination(limit: number, offset: number, total: number, pageSize:
   };
 }
 
-export function sliceLatestWindowPage<T>(items: T[], limit: number, offset: number): T[] {
+function getLatestWindowPageBounds<T>(items: T[], limit: number, offset: number): { start: number; end: number } {
   const end = Math.max(0, items.length - offset);
   const start = Math.max(0, end - limit);
+  return { start, end };
+}
+
+export function sliceLatestWindowPage<T>(items: T[], limit: number, offset: number): T[] {
+  const { start, end } = getLatestWindowPageBounds(items, limit, offset);
   return items.slice(start, end);
+}
+
+function sliceLatestWindowPageWithTurnBoundary(items: SessionMessage[], limit: number, offset: number): SessionMessage[] {
+  const { start, end } = getLatestWindowPageBounds(items, limit, offset);
+  if (start >= end) {
+    return [];
+  }
+
+  let expandedStart = start;
+  let expandedEnd = end;
+  for (let index = start; index < end; index += 1) {
+    const message = items[index];
+    if (!message) continue;
+    if (message.role === "assistant") {
+      const userIndex = findPreviousTurnUserIndex(items, index);
+      if (userIndex >= 0 && userIndex < expandedStart) {
+        expandedStart = userIndex;
+      }
+      continue;
+    }
+    if (message.role === "user") {
+      const assistantIndex = findNextTurnAssistantIndex(items, index);
+      if (assistantIndex >= end && assistantIndex + 1 > expandedEnd) {
+        expandedEnd = assistantIndex + 1;
+      }
+    }
+  }
+
+  return items.slice(expandedStart, expandedEnd);
+}
+
+function findPreviousTurnUserIndex(items: SessionMessage[], assistantIndex: number): number {
+  const minIndex = Math.max(0, assistantIndex - MAX_SESSION_MESSAGE_TURN_BOUNDARY_OVERSCAN);
+  for (let index = assistantIndex - 1; index >= minIndex; index -= 1) {
+    const role = items[index]?.role;
+    if (role === "user") {
+      return index;
+    }
+  }
+  return -1;
+}
+
+function findNextTurnAssistantIndex(items: SessionMessage[], userIndex: number): number {
+  const maxIndex = Math.min(items.length - 1, userIndex + MAX_SESSION_MESSAGE_TURN_BOUNDARY_OVERSCAN);
+  for (let index = userIndex + 1; index <= maxIndex; index += 1) {
+    const role = items[index]?.role;
+    if (role === "user") {
+      return -1;
+    }
+    if (role === "assistant") {
+      return index;
+    }
+  }
+  return -1;
 }
 
 function buildSkillsPayload(

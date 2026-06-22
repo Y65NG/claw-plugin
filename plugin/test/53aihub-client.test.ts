@@ -4082,8 +4082,11 @@ describe("53AIHub client", () => {
           action: "sessions.messages",
           status: "done",
           data: {
-            messages: [{ id: "message-1", content: "hello" }],
-            pagination: { limit: 1, offset: 1, total: 3, hasMore: true, nextOffset: 2 }
+            messages: [
+              { id: "message-1", content: "hello" },
+              { id: "message-2", content: "hi" }
+            ],
+            pagination: { limit: 1, offset: 1, total: 2, hasMore: false }
           }
         });
         expect(frameByReq(server.frames, "rpc-events")).toMatchObject({
@@ -6245,6 +6248,7 @@ describe("53AIHub client", () => {
         const frame = frameByReq(server.frames, "rpc-message-page-ledger");
         expect(frame).toMatchObject({ action: "sessions.messages", status: "done" });
         expect(frame?.data?.messages).toEqual([
+          expect.objectContaining({ id: "m1", content: "first" }),
           expect.objectContaining({ id: "m2", content: "first answer" })
         ]);
         expect(frame?.data?.events).toEqual([]);
@@ -6368,6 +6372,96 @@ describe("53AIHub client", () => {
           }
         });
         expect(frame?.data?.messages?.[0]?.content).not.toContain("<53aihub-openclaw-runtime-context>");
+      });
+    } finally {
+      await bridge.stop();
+    }
+  });
+
+  it("expands sessions.messages pages to complete user and assistant turn boundaries", async () => {
+    const stateDir = await mkdtemp(join(tmpdir(), "claw-53aihub-rpc-message-turn-window-"));
+    cleanupPaths.push(stateDir);
+
+    const server = await createFakeHubServer();
+    cleanupServers.push(server.close);
+    const gateway = new FakeGateway();
+    gateway.messagesBySession.set("session-1", [
+      { id: "u1", sessionId: "session-1", role: "user", content: "first question", createdAt: "2026-06-18T08:00:00.000Z" },
+      { id: "a1", sessionId: "session-1", role: "assistant", content: "first answer", createdAt: "2026-06-18T08:00:01.000Z" },
+      { id: "u2", sessionId: "session-1", role: "user", content: "second question", createdAt: "2026-06-18T08:01:00.000Z" },
+      { id: "a2", sessionId: "session-1", role: "assistant", content: "second answer", createdAt: "2026-06-18T08:01:01.000Z" }
+    ]);
+
+    const bridge = createHub53AIBridge({
+      stateDir,
+      config: {
+        enabled: true,
+        botId: "bot-123",
+        secret: "sk-secret",
+        wsUrl: server.url,
+        accessPolicy: "open",
+        allowFrom: [],
+        sendThinkingMessage: false,
+        reconnectBaseMs: 20,
+        maxReconnectAttempts: 2
+      },
+      gateway,
+      callbacks: {
+        onSessionUpsert: async (session) => {
+          gateway.upsertSession(session);
+        },
+        onUserMessage: async () => undefined,
+        onSessionStatus: async () => undefined,
+        onEnsureSessionStream: async () => undefined,
+        listSessionEvents: () => [],
+        getLastEventSeq: () => 0,
+        onStatusChange: () => undefined
+      }
+    });
+
+    await bridge.start();
+    try {
+      const connection = await server.connected;
+      connection.socket.send(
+        JSON.stringify({
+          req_id: "rpc-assistant-boundary",
+          action: "sessions.messages",
+          status: "request",
+          data: { session_id: "session-1", limit: 1, offset: 2 }
+        })
+      );
+      connection.socket.send(
+        JSON.stringify({
+          req_id: "rpc-user-boundary",
+          action: "sessions.messages",
+          status: "request",
+          data: { session_id: "session-1", limit: 1, offset: 1 }
+        })
+      );
+
+      await waitFor(() => {
+        expect(frameByReq(server.frames, "rpc-assistant-boundary")).toMatchObject({
+          action: "sessions.messages",
+          status: "done",
+          data: {
+            messages: [
+              { id: "u1", content: "first question" },
+              { id: "a1", content: "first answer" }
+            ],
+            pagination: { limit: 1, offset: 2, total: 4, hasMore: true, nextOffset: 3 }
+          }
+        });
+        expect(frameByReq(server.frames, "rpc-user-boundary")).toMatchObject({
+          action: "sessions.messages",
+          status: "done",
+          data: {
+            messages: [
+              { id: "u2", content: "second question" },
+              { id: "a2", content: "second answer" }
+            ],
+            pagination: { limit: 1, offset: 1, total: 4, hasMore: true, nextOffset: 2 }
+          }
+        });
       });
     } finally {
       await bridge.stop();
