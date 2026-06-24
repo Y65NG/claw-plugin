@@ -72,4 +72,81 @@ describe("FileSessionStore", () => {
 
     expect(store.listSessions()).toEqual([]);
   });
+
+  it("preserves local 53AIHub user file metadata when hydrating gateway history", async () => {
+    const stateDir = await mkdtemp(join(tmpdir(), "claw-session-store-metadata-"));
+    cleanupPaths.push(stateDir);
+
+    const store = new FileSessionStore(join(stateDir, "state.json"), 20);
+    await store.init();
+
+    await store.upsertSession({
+      id: "agent:main:dashboard:metadata",
+      title: "53AI Hub-Y65NG：读取附件",
+      status: "running",
+      hostKind: "openclaw",
+      runnerCommand: "openclaw-gateway",
+      createdAt: "2026-06-18T08:00:00.000Z",
+      updatedAt: "2026-06-18T08:00:00.000Z",
+      lastEventSeq: 0
+    });
+    await store.appendMessage({
+      id: "hub53ai-user-req-1",
+      sessionId: "agent:main:dashboard:metadata",
+      role: "user",
+      content: "读取附件",
+      createdAt: "2026-06-18T08:00:00.100Z",
+      metadata: {
+        openclaw_client_message_id: "client-1",
+        openclaw_input_files: [
+          {
+            file_name: "probe.md",
+            preview_url: "http://localhost:9001/api/preview/probe.md"
+          }
+        ]
+      }
+    });
+
+    await store.replaceSessionDetail("agent:main:dashboard:metadata", {
+      messages: [
+        {
+          id: "gw-user-1",
+          sessionId: "agent:main:dashboard:metadata",
+          role: "user",
+          content: [
+            "读取附件",
+            "<53aihub-openclaw-runtime-context>",
+            "Local input files:",
+            "@/Users/y65ng/.qclaw/input-files/request/probe.md",
+            "</53aihub-openclaw-runtime-context>"
+          ].join("\n"),
+          createdAt: "2026-06-18T08:00:00.000Z"
+        },
+        {
+          id: "gw-assistant-1",
+          sessionId: "agent:main:dashboard:metadata",
+          role: "assistant",
+          content: "已读取",
+          createdAt: "2026-06-18T08:00:01.000Z"
+        }
+      ],
+      events: []
+    });
+
+    const messages = store.getSession("agent:main:dashboard:metadata")?.messages ?? [];
+    expect(messages[0]).toMatchObject({
+      id: "gw-user-1",
+      content: "读取附件",
+      metadata: {
+        openclaw_client_message_id: "client-1",
+        openclaw_input_files: [
+          expect.objectContaining({
+            file_name: "probe.md",
+            preview_url: "http://localhost:9001/api/preview/probe.md"
+          })
+        ]
+      }
+    });
+    expect(messages[0]?.content).not.toContain("<53aihub-openclaw-runtime-context>");
+  });
 });

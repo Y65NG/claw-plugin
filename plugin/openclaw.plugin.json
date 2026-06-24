@@ -123,8 +123,8 @@
           },
           "detectCreatedFiles": {
             "type": "boolean",
-            "default": true,
-            "description": "When true, scan local workspace directories before and after each 53AIHub run and return newly created files as output_files."
+            "default": false,
+            "description": "When true, enable the legacy fallback that scans local workspace directories when the per-conversation output manifest has no matching files."
           },
           "fileWorkspaceDirs": {
             "type": "array",
