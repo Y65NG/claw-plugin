@@ -13,11 +13,16 @@ import type {
   GatewaySession
 } from "./gateway-client";
 import {
+  collectConversationManifestLocalOutputFiles,
+  collectManifestLocalOutputFiles,
   collectReferencedLocalOutputFiles,
   collectCreatedLocalOutputFiles,
   collectRecentReferencedLocalOutputFiles,
   extractReferencedLocalOutputPaths,
+  resolveLocalOutputManifestPath,
+  resolveLocalOutputWorkspaceDirs,
   snapshotLocalOutputFiles,
+  type LocalOutputManifestFile,
   type LocalOutputFileSnapshot
 } from "./local-output-files";
 import type { SessionMessage, SessionStatus, TimelineEvent } from "./models";
@@ -124,8 +129,10 @@ export type Hub53AIOutputFile = {
   preview_url?: string;
   download_url?: string;
   signed_download_url?: string;
+  preview_key?: string;
   mime_type?: string;
   size?: number;
+  sha256?: string;
   base64?: string;
   content?: string;
   message_id?: string;
@@ -278,6 +285,17 @@ type OpenClawTypedToolCall = {
   meta?: string;
   sourceEventId?: string;
   sourceSeq?: number;
+};
+
+type ManifestOutputBackfillGroup = {
+  turnId: string;
+  activeRequestId: string;
+  files: LocalOutputManifestFile[];
+};
+
+type VerifiedHistoryManifestScope = {
+  turnId: string;
+  activeRequestId: string;
 };
 
 export type Hub53AIMediaAttachment = Hub53AIOutputFile & {
@@ -737,6 +755,7 @@ export function createHub53AIBridge(input: HubBridgeInput) {
         Array.isArray(localMessages) ? localMessages : []
       );
       const total = messages.length >= fetchLimit ? requestedFetchLimit + 1 : messages.length;
+      await ensureCanonicalLedgerBackfill(sessionId);
       const ledgerEvents = listCanonicalLedgerEventsForMessagePage(sessionId, pageMessages, 0, pagination);
       const events = listCanonicalTimelineEventsForLedgerEvents(sessionId, ledgerEvents);
       return {
@@ -885,7 +904,11 @@ export function createHub53AIBridge(input: HubBridgeInput) {
   }
 
   async function ensureCanonicalLedgerBackfillFromEvents(sessionId: string, events: TimelineEvent[]) {
-    if (!sessionId || !events.length) {
+    if (!sessionId) {
+      return;
+    }
+    if (!events.length) {
+      await ensureCanonicalManifestOutputBackfill(sessionId);
       return;
     }
 
@@ -894,7 +917,9 @@ export function createHub53AIBridge(input: HubBridgeInput) {
     const turnGroups = collectCompletedHistoryLedgerBackfillGroups(sessionId, events).filter(
       (group) => !group.runId || !liveCompletedRunIds.has(group.runId)
     );
-    const expectedBackfillRefs = buildExpectedHistoryBackfillRefs(sessionId, turnGroups);
+    const manifestFiles = await collectConversationManifestFilesForBackfill(sessionId);
+    const verifiedManifestScopes = buildVerifiedHistoryManifestScopes(sessionId, turnGroups, manifestFiles);
+    const expectedBackfillRefs = buildExpectedHistoryBackfillRefs(sessionId, turnGroups, verifiedManifestScopes);
     const rewrittenExisting = pruneCanonicalHistoryBackfillEvents(sessionId, expectedBackfillRefs, liveCompletedRunIds);
     const existingCanonicalEvents = listCanonicalSessionEvents(sessionId);
     const existingEventIds = new Set(existingCanonicalEvents.map((event) => event.id).filter(Boolean));
@@ -914,7 +939,7 @@ export function createHub53AIBridge(input: HubBridgeInput) {
         continue;
       }
       const identity = group.runId || `history:${group.firstSeq || group.events[0]?.id || "turn"}`;
-      const eventScope = createHistoryLedgerBackfillScope(sessionId, identity);
+      const eventScope = createHistoryLedgerBackfillScope(sessionId, identity, verifiedManifestScopes.get(group));
       if (group.runId) {
         eventScope.currentRunId = group.runId;
       }
@@ -962,6 +987,143 @@ export function createHub53AIBridge(input: HubBridgeInput) {
         skippedCompletedLiveRuns: liveCompletedRunIds.size
       }, input.config);
     }
+    await ensureCanonicalManifestOutputBackfill(sessionId);
+  }
+
+  async function ensureCanonicalManifestOutputBackfill(sessionId: string): Promise<number> {
+    if (!sessionId) {
+      return 0;
+    }
+    const manifestPath = resolveLocalOutputManifestPath({
+      stateDir: input.stateDir,
+      conversationId: sessionId
+    });
+    const manifestFiles = await collectConversationManifestFilesForBackfill(sessionId);
+    if (manifestFiles.length === 0) {
+      return 0;
+    }
+
+    const existingKeys = new Set<string>();
+    for (const event of extractOpenClawLedgerEvents(listCanonicalSessionEvents(sessionId))) {
+      if (event.part_type !== "output_file") {
+        continue;
+      }
+      for (const file of extractOutputFilesFromPayload(event.payload)) {
+        for (const key of buildManifestOutputFileBackfillKeys(event.active_request_id, file)) {
+          existingKeys.add(key);
+        }
+      }
+    }
+
+    const groups = new Map<string, ManifestOutputBackfillGroup>();
+    let skippedExisting = 0;
+    for (const file of manifestFiles) {
+      const keys = buildManifestOutputFileBackfillKeys(file.active_request_id, file);
+      if (keys.some((key) => existingKeys.has(key))) {
+        skippedExisting += 1;
+        continue;
+      }
+      const groupKey = `${file.turn_id}\0${file.active_request_id}`;
+      const group = groups.get(groupKey) ?? {
+        turnId: file.turn_id,
+        activeRequestId: file.active_request_id,
+        files: []
+      };
+      group.files.push(file);
+      groups.set(groupKey, group);
+      for (const key of keys) {
+        existingKeys.add(key);
+      }
+    }
+
+    let appended = 0;
+    for (const group of groups.values()) {
+      const eventScope = createManifestOutputBackfillScope(sessionId, group.turnId, group.activeRequestId);
+      const outputTimeline = buildOpenClawOutputFilesTimelineMeta(eventScope, group.files);
+      const hubFiles = await uploadOutputFilesToHub(
+        "manifest-output-backfill",
+        sessionId,
+        group.files,
+        eventScope,
+        outputTimeline
+      );
+      const ledgerSourceEvent = await buildOutputFilesLedgerSourceEvent(
+        sessionId,
+        hubFiles,
+        eventScope,
+        outputTimeline
+      );
+      const outputLedger = buildOpenClawLedgerEvent(ledgerSourceEvent, eventScope, outputTimeline);
+      appendCanonicalSessionEvent(
+        sessionId,
+        buildCanonicalOutputFilesTimelineEvent(ledgerSourceEvent, outputTimeline, outputLedger)
+      );
+      appended += group.files.length;
+    }
+
+    if (appended || skippedExisting) {
+      traceOpenClawLedger(input.logger, "manifest-output-backfill", {
+        sessionId,
+        manifestPath,
+        manifestFiles: manifestFiles.length,
+        appended,
+        skippedExisting
+      }, input.config);
+    }
+    return appended;
+  }
+
+  async function collectConversationManifestFilesForBackfill(sessionId: string): Promise<LocalOutputManifestFile[]> {
+    const manifestPath = resolveLocalOutputManifestPath({
+      stateDir: input.stateDir,
+      conversationId: sessionId
+    });
+    return collectConversationManifestLocalOutputFiles({
+      config: input.config,
+      configPath: input.configPath,
+      stateDir: input.stateDir,
+      manifestPath,
+      conversationId: sessionId,
+      logger: input.logger
+    });
+  }
+
+  function buildManifestOutputFileBackfillKeys(activeRequestId: string, file: Hub53AIOutputFile): string[] {
+    const active = activeRequestId || "";
+    const name = file.file_name || "";
+    const size = typeof file.size === "number" && Number.isFinite(file.size) ? String(file.size) : "";
+    const sha256 = typeof file.sha256 === "string" ? file.sha256.trim().toLowerCase() : "";
+    return [
+      active && name && sha256 ? `${active}\0${name}\0sha256:${sha256}` : "",
+      active && name && size ? `${active}\0${name}\0size:${size}` : ""
+    ].filter(Boolean);
+  }
+
+  function createManifestOutputBackfillScope(sessionId: string, turnId: string, activeRequestId: string): GatewayEventScope {
+    return {
+      eventBoundaryMs: 0,
+      turnId,
+      activeRequestId,
+      currentTurnId: turnId,
+      nextSegmentIndex: 0,
+      nextAnswerSegmentIndex: 0,
+      answerBoundaryAfterVisibleResponse: false,
+      activityAppliedEventKeys: new Set<string>(),
+      answerContentAppliedEventKeys: new Set<string>(),
+      answerSegmentTextById: new Map<string, string>(),
+      answerSegmentVisibilityById: new Map<string, OpenClawTimelineV2Visibility>(),
+      answerSegmentTrustedById: new Map<string, boolean>(),
+      nextDeltaIndexBySegment: new Map<string, number>(),
+      segmentIndexById: new Map<string, number>(),
+      timelineMetaByEventKey: new Map<string, OpenClawTimelineV2Meta>(),
+      typedToolCallEnrichedKeys: new Set<string>(),
+      currentActivitySeen: false,
+      visibleResponseSeen: false,
+      lastSeqSeen: computeMaxOpenClawLedgerSeqForSession(sessionId),
+      emittedOutputFileKeys: new Set<string>(),
+      referencedLocalOutputPaths: new Set<string>(),
+      writeOutputFilesByToolCallId: new Map<string, Hub53AIOutputFile[]>()
+    };
   }
 
   type HistoryBackfillExpectedRef = {
@@ -972,7 +1134,8 @@ export function createHub53AIBridge(input: HubBridgeInput) {
 
   function buildExpectedHistoryBackfillRefs(
     sessionId: string,
-    groups: HistoryLedgerBackfillGroup[]
+    groups: HistoryLedgerBackfillGroup[],
+    verifiedManifestScopes: Map<HistoryLedgerBackfillGroup, VerifiedHistoryManifestScope> = new Map()
   ): Map<string, HistoryBackfillExpectedRef> {
     const refs = new Map<string, HistoryBackfillExpectedRef>();
     for (const group of groups) {
@@ -980,9 +1143,10 @@ export function createHub53AIBridge(input: HubBridgeInput) {
         continue;
       }
       const identity = group.runId || `history:${group.firstSeq || group.events[0]?.id || "turn"}`;
-      const activeRequestId = `history:${identity}`;
+      const verifiedScope = verifiedManifestScopes.get(group);
+      const activeRequestId = verifiedScope?.activeRequestId || `history:${identity}`;
       const expected: HistoryBackfillExpectedRef = {
-        turnId: buildOpenClawTimelineTurnId(sessionId, activeRequestId),
+        turnId: verifiedScope?.turnId || buildOpenClawTimelineTurnId(sessionId, activeRequestId),
         activeRequestId,
         ...(group.runId ? { runId: group.runId } : {})
       };
@@ -993,6 +1157,186 @@ export function createHub53AIBridge(input: HubBridgeInput) {
       }
     }
     return refs;
+  }
+
+  function buildVerifiedHistoryManifestScopes(
+    sessionId: string,
+    groups: HistoryLedgerBackfillGroup[],
+    manifestFiles: LocalOutputManifestFile[]
+  ): Map<HistoryLedgerBackfillGroup, VerifiedHistoryManifestScope> {
+    const manifestGroups = buildManifestOutputBackfillGroups(manifestFiles);
+    if (!groups.length || !manifestGroups.length) {
+      return new Map();
+    }
+
+    const candidateByGroup = new Map<HistoryLedgerBackfillGroup, VerifiedHistoryManifestScope>();
+    const groupsByActiveRequestId = new Map<string, HistoryLedgerBackfillGroup[]>();
+    for (const group of groups) {
+      if (!group.terminalSeen || !group.runId) {
+        continue;
+      }
+      const window = readHistoryBackfillRunWindowMs(group);
+      if (!window) {
+        continue;
+      }
+      const matchingManifestGroups = manifestGroups.filter((manifestGroup) =>
+        isManifestActiveRequestInHistoryRunWindow(manifestGroup.activeRequestId, window)
+      );
+      if (matchingManifestGroups.length !== 1) {
+        if (matchingManifestGroups.length > 1) {
+          traceOpenClawLedger(input.logger, "history-manifest-scope-skip", {
+            sessionId,
+            reason: "ambiguous_manifest_active_request_window",
+            runId: group.runId,
+            activeRequestIds: matchingManifestGroups.map((candidate) => candidate.activeRequestId)
+          }, input.config);
+        }
+        continue;
+      }
+      const manifestGroup = matchingManifestGroups[0];
+      candidateByGroup.set(group, {
+        turnId: manifestGroup.turnId,
+        activeRequestId: manifestGroup.activeRequestId
+      });
+      const claimants = groupsByActiveRequestId.get(manifestGroup.activeRequestId) ?? [];
+      claimants.push(group);
+      groupsByActiveRequestId.set(manifestGroup.activeRequestId, claimants);
+    }
+
+    const verified = new Map<HistoryLedgerBackfillGroup, VerifiedHistoryManifestScope>();
+    for (const [group, scope] of candidateByGroup) {
+      const claimants = groupsByActiveRequestId.get(scope.activeRequestId) ?? [];
+      if (claimants.length !== 1) {
+        traceOpenClawLedger(input.logger, "history-manifest-scope-skip", {
+          sessionId,
+          reason: "manifest_active_request_claimed_by_multiple_history_runs",
+          activeRequestId: scope.activeRequestId,
+          runIds: claimants.map((candidate) => candidate.runId).filter(Boolean)
+        }, input.config);
+        continue;
+      }
+      verified.set(group, scope);
+    }
+
+    if (verified.size > 0) {
+      traceOpenClawLedger(input.logger, "history-manifest-scope", {
+        sessionId,
+        matched: [...verified.entries()].map(([group, scope]) => ({
+          runId: group.runId,
+          turnId: scope.turnId,
+          activeRequestId: scope.activeRequestId
+        }))
+      }, input.config);
+    }
+    return verified;
+  }
+
+  function buildManifestOutputBackfillGroups(manifestFiles: LocalOutputManifestFile[]): ManifestOutputBackfillGroup[] {
+    const groups = new Map<string, ManifestOutputBackfillGroup>();
+    for (const file of manifestFiles) {
+      const groupKey = `${file.turn_id}\0${file.active_request_id}`;
+      const group = groups.get(groupKey) ?? {
+        turnId: file.turn_id,
+        activeRequestId: file.active_request_id,
+        files: []
+      };
+      group.files.push(file);
+      groups.set(groupKey, group);
+    }
+    return [...groups.values()];
+  }
+
+  type HistoryBackfillRunWindowMs = {
+    startedAtMs: number;
+    endedAtMs: number;
+  };
+
+  function readHistoryBackfillRunWindowMs(group: HistoryLedgerBackfillGroup): HistoryBackfillRunWindowMs | null {
+    const starts: number[] = [];
+    const ends: number[] = [];
+    for (const event of group.events) {
+      const payload = toRecord(event.payload);
+      const data = toRecord(payload.data);
+      const session = toRecord(payload.session);
+      const startedAt = firstTimestampMs(
+        payload.startedAt,
+        payload.started_at,
+        data.startedAt,
+        data.started_at,
+        session.startedAt,
+        session.started_at,
+        event.kind === "run.started" ? event.createdAt : undefined
+      );
+      if (startedAt) {
+        starts.push(startedAt);
+      }
+      const endedAt = firstTimestampMs(
+        payload.endedAt,
+        payload.ended_at,
+        data.endedAt,
+        data.ended_at,
+        session.endedAt,
+        session.ended_at,
+        isTerminalRunEvent(event) ? event.createdAt : undefined
+      );
+      if (endedAt) {
+        ends.push(endedAt);
+      }
+    }
+    if (!starts.length && !ends.length) {
+      return null;
+    }
+    const startedAtMs = starts.length ? Math.min(...starts) : Math.min(...ends);
+    const endedAtMs = ends.length ? Math.max(...ends) : Math.max(...starts);
+    if (!Number.isFinite(startedAtMs) || !Number.isFinite(endedAtMs) || endedAtMs <= 0) {
+      return null;
+    }
+    return {
+      startedAtMs: Math.min(startedAtMs, endedAtMs),
+      endedAtMs: Math.max(startedAtMs, endedAtMs)
+    };
+  }
+
+  function isManifestActiveRequestInHistoryRunWindow(
+    activeRequestId: string,
+    window: HistoryBackfillRunWindowMs
+  ): boolean {
+    const activeRequestMs = parseManifestActiveRequestTimestampMs(activeRequestId);
+    if (!activeRequestMs) {
+      return false;
+    }
+    const slackMs = 5_000;
+    return activeRequestMs >= window.startedAtMs - slackMs && activeRequestMs <= window.endedAtMs + slackMs;
+  }
+
+  function parseManifestActiveRequestTimestampMs(activeRequestId: string): number {
+    const parsed = Number(activeRequestId);
+    return Number.isFinite(parsed) && parsed > 0 ? parsed : 0;
+  }
+
+  function firstTimestampMs(...values: unknown[]): number {
+    for (const value of values) {
+      const parsed = timestampMs(value);
+      if (parsed > 0) {
+        return parsed;
+      }
+    }
+    return 0;
+  }
+
+  function timestampMs(value: unknown): number {
+    if (typeof value === "number" && Number.isFinite(value)) {
+      return value > 0 && value < 10_000_000_000 ? value * 1000 : value;
+    }
+    if (typeof value === "string" && value.trim()) {
+      const numeric = Number(value);
+      if (Number.isFinite(numeric)) {
+        return numeric > 0 && numeric < 10_000_000_000 ? numeric * 1000 : numeric;
+      }
+      const parsed = Date.parse(value);
+      return Number.isFinite(parsed) ? parsed : 0;
+    }
+    return 0;
   }
 
   function pruneCanonicalHistoryBackfillEvents(
@@ -1236,9 +1580,13 @@ export function createHub53AIBridge(input: HubBridgeInput) {
     return 0;
   }
 
-  function createHistoryLedgerBackfillScope(sessionId: string, identity: string): GatewayEventScope {
-    const activeRequestId = `history:${identity}`;
-    const turnId = buildOpenClawTimelineTurnId(sessionId, activeRequestId);
+  function createHistoryLedgerBackfillScope(
+    sessionId: string,
+    identity: string,
+    verifiedManifestScope?: VerifiedHistoryManifestScope
+  ): GatewayEventScope {
+    const activeRequestId = verifiedManifestScope?.activeRequestId || `history:${identity}`;
+    const turnId = verifiedManifestScope?.turnId || buildOpenClawTimelineTurnId(sessionId, activeRequestId);
     return {
       eventBoundaryMs: 0,
       turnId,
@@ -1271,23 +1619,123 @@ export function createHub53AIBridge(input: HubBridgeInput) {
     eventScope: GatewayEventScope,
     terminalEvent: TimelineEvent
   ): Promise<boolean> {
-    if (!group.terminalSeen || terminalEvent.kind !== "run.completed") {
+    if (eventScope.activeRequestId.startsWith("history:")) {
+      traceOpenClawLedger(input.logger, "history-typed-final-skip", {
+        sessionId,
+        reason: "unverified_history_turn_scope",
+        activeRequestId: eventScope.activeRequestId,
+        turnId: eventScope.currentTurnId || eventScope.turnId,
+        terminalEvent: summarizeTimelineEventForTrace(terminalEvent)
+      }, input.config);
       return false;
     }
-    return applyTypedTranscriptFinalReplace({
+
+    const typedFinal = await resolveTypedTranscriptFinal(sessionId, terminalEvent, eventScope);
+    if (!typedFinal) {
+      const removed = pruneWeakTypedFinalReplaceForHistoryScope(sessionId, eventScope, group.runId);
+      traceOpenClawLedger(input.logger, "history-typed-final-skip", {
+        sessionId,
+        reason: "typed_final_not_found",
+        removedStaleTypedFinalEvents: removed,
+        activeRequestId: eventScope.activeRequestId,
+        turnId: eventScope.currentTurnId || eventScope.turnId,
+        terminalEvent: summarizeTimelineEventForTrace(terminalEvent)
+      }, input.config);
+      return false;
+    }
+
+    if (!isStrongTypedFinalMatchStrategy(typedFinal.matchStrategy)) {
+      const removed = pruneWeakTypedFinalReplaceForHistoryScope(sessionId, eventScope, group.runId);
+      traceOpenClawLedger(input.logger, "history-typed-final-skip", {
+        sessionId,
+        reason: "weak_typed_final_match_strategy",
+        activeRequestId: eventScope.activeRequestId,
+        turnId: eventScope.currentTurnId || eventScope.turnId,
+        runId: group.runId,
+        matchStrategy: typedFinal.matchStrategy,
+        removedStaleTypedFinalEvents: removed,
+        terminalEvent: summarizeTimelineEventForTrace(terminalEvent)
+      }, input.config);
+      return false;
+    }
+
+    const currentAnswer = readCurrentOpenClawAnswerText(eventScope, eventScope.activeRequestId);
+    const event = buildTypedTranscriptFinalEvent(
       sessionId,
       terminalEvent,
       eventScope,
-      reqId: eventScope.activeRequestId,
-      sendToHub: false
+      eventScope.activeRequestId,
+      typedFinal,
+      currentAnswer
+    );
+    applyOpenClawEventScopeActivity(event, eventScope);
+    event.payload = augmentPayloadWithEventMeta(event, eventScope);
+    appendCanonicalSessionEvent(sessionId, event);
+
+    traceOpenClawLedger(input.logger, "history-typed-final", {
+      sessionId,
+      result: "canonicalized_verified_manifest_scope",
+      activeRequestId: eventScope.activeRequestId,
+      turnId: eventScope.currentTurnId || eventScope.turnId,
+      runId: group.runId,
+      matchStrategy: typedFinal.matchStrategy,
+      textLength: typedFinal.text.length,
+      textHash: hashTraceText(typedFinal.text),
+      event: summarizeTimelineEventForTrace(event)
+    }, input.config);
+    return true;
+  }
+
+  function isStrongTypedFinalMatchStrategy(strategy?: string): boolean {
+    return strategy === "run_id" || strategy === "response_id";
+  }
+
+  function pruneWeakTypedFinalReplaceForHistoryScope(
+    sessionId: string,
+    eventScope: GatewayEventScope,
+    runId?: string
+  ): number {
+    const events = canonicalEventsBySession.get(sessionId) ?? [];
+    let removed = 0;
+    const nextEvents = events.filter((event) => {
+      const ledger = normalizeOpenClawLedgerEvent(readOpenClawLedgerFromEvent(event));
+      if (!ledger || ledger.part_type !== "answer" || ledger.active_request_id !== eventScope.activeRequestId) {
+        return true;
+      }
+      const payload = toRecord(event.payload);
+      const ledgerPayload = toRecord(ledger.payload);
+      const sourceKind = readStringMetadata(payload, "source_kind") || readStringMetadata(ledgerPayload, "source_kind");
+      const isTypedFinal = sourceKind === "typed_transcript.final_replace" ||
+        readBooleanMetadata(payload, "typed_final") === true ||
+        readBooleanMetadata(ledgerPayload, "typed_final") === true;
+      if (!isTypedFinal) {
+        return true;
+      }
+      const candidateRunId = ledger.run_id || getGatewayEventRunIdentity(event) || stringOr(payload.runId, payload.run_id);
+      if (runId && candidateRunId && candidateRunId !== runId) {
+        return true;
+      }
+      const matchStrategy = readStringMetadata(payload, "typed_final_match_strategy") ||
+        readStringMetadata(ledgerPayload, "typed_final_match_strategy");
+      if (isStrongTypedFinalMatchStrategy(matchStrategy)) {
+        return true;
+      }
+      removed += 1;
+      return false;
     });
+    if (removed > 0) {
+      canonicalEventsBySession.set(sessionId, nextEvents);
+      setPersistedSessionEvents("canonicalEventsBySession", sessionId, nextEvents, MAX_CANONICAL_EVENTS_PER_SESSION);
+      persistStateSoon("weak typed final prune");
+    }
+    return removed;
   }
 
   function listCanonicalSessionEvents(sessionId: string): TimelineEvent[] {
-    return dedupeTimelineEvents([
+    return filterCanonicalSessionEventsForExposure(sessionId, dedupeTimelineEvents([
       ...(canonicalEventsBySession.get(sessionId) ?? []),
       ...(syntheticEventsBySession.get(sessionId) ?? [])
-    ])
+    ]))
       .map(normalizeTimelineEventSegmentType)
       .map(normalizeTimelineEventMessageSeq);
   }
@@ -1324,16 +1772,15 @@ export function createHub53AIBridge(input: HubBridgeInput) {
     }
 
     const messageSeqSet = new Set(messageSeqs);
-    const matchedLedgerSeqs = events
-      .filter((event) => {
+    const matchedLedgerEvents = events.filter((event) => {
         const payload = toRecord(event.payload);
         const rawSeq = firstPositiveNumber(payload.rawSeq, payload.messageSeq, payload.message_seq);
         if (rawSeq > 0 && messageSeqSet.has(rawSeq)) {
           return true;
         }
         return messageSeqSet.has(event.seq);
-      })
-      .map((event) => event.seq);
+      });
+    const matchedLedgerSeqs = matchedLedgerEvents.map((event) => event.seq);
 
     if (matchedLedgerSeqs.length === 0) {
       return pagination && pagination.offset > 0 ? [] : events.slice(-MAX_CANONICAL_EVENTS_PER_MESSAGE_PAGE);
@@ -1341,7 +1788,13 @@ export function createHub53AIBridge(input: HubBridgeInput) {
 
     const minSeq = Math.min(...matchedLedgerSeqs) - CANONICAL_MESSAGE_PAGE_SEQ_WINDOW_BEFORE;
     const maxSeq = Math.max(...matchedLedgerSeqs) + CANONICAL_MESSAGE_PAGE_SEQ_WINDOW_AFTER;
-    const scoped = events.filter((event) => event.seq >= minSeq && event.seq <= maxSeq);
+    const matchedTurnIds = new Set(matchedLedgerEvents.map((event) => event.turn_id).filter(Boolean));
+    const matchedActiveRequestIds = new Set(matchedLedgerEvents.map((event) => event.active_request_id).filter(Boolean));
+    const scoped = events.filter((event) =>
+      (event.seq >= minSeq && event.seq <= maxSeq) ||
+      matchedTurnIds.has(event.turn_id) ||
+      matchedActiveRequestIds.has(event.active_request_id)
+    );
     return scoped.length > MAX_CANONICAL_EVENTS_PER_MESSAGE_PAGE
       ? scoped.slice(-MAX_CANONICAL_EVENTS_PER_MESSAGE_PAGE)
       : scoped;
@@ -2018,6 +2471,15 @@ export function createHub53AIBridge(input: HubBridgeInput) {
   }
 
   async function processIncomingMessage(message: Hub53AIIncomingMessage) {
+    if (isHub53AIBusinessHeartbeatMessage(message)) {
+      traceOpenClawLedger(input.logger, "business-heartbeat-ignored", {
+        reqId: message.reqId,
+        chatIdHash: hashTraceText(message.chatId),
+        textHash: hashTraceText(message.text)
+      }, input.config);
+      return;
+    }
+
     const accessResult = checkAccessPolicy(message);
     if (!accessResult.allowed) {
       await sendReply({
@@ -2038,8 +2500,31 @@ export function createHub53AIBridge(input: HubBridgeInput) {
       const session = await resolveSession(message);
       const preparedMessage = await prepareIncomingFiles(message);
       const messageAttachments = await buildGatewayMessageAttachments(preparedMessage);
+      const requestIdentity = message.clientMessageId || message.reqId;
+      const turnId = buildOpenClawTimelineTurnId(session.id, requestIdentity);
+      const outputManifestPath = resolveLocalOutputManifestPath({
+        stateDir: input.stateDir,
+        conversationId: session.id
+      });
+      if (outputManifestPath) {
+        await mkdir(dirname(outputManifestPath), { recursive: true });
+      }
       const prompt = buildPrompt(preparedMessage, {
-        includeRuntimeContext: true
+        includeRuntimeContext: true,
+        outputManifest:
+          outputManifestPath
+            ? {
+                path: outputManifestPath,
+                conversationId: session.id,
+                turnId,
+                activeRequestId: requestIdentity,
+                workspaceDirs: resolveLocalOutputWorkspaceDirs({
+                  config: input.config,
+                  configPath: input.configPath,
+                  stateDir: input.stateDir
+                })
+              }
+            : undefined
       });
       const displayContent = buildDisplayUserContent(preparedMessage);
       const userMessageMetadata = buildDisplayUserMessageMetadata(preparedMessage);
@@ -2055,10 +2540,9 @@ export function createHub53AIBridge(input: HubBridgeInput) {
       });
       await input.callbacks.onSessionStatus(session.id, "running");
 
-      const requestIdentity = message.clientMessageId || message.reqId;
       const eventScope: GatewayEventScope = {
         eventBoundaryMs: Date.now(),
-        turnId: buildOpenClawTimelineTurnId(session.id, requestIdentity),
+        turnId,
         activeRequestId: requestIdentity,
         nextSegmentIndex: 0,
         nextAnswerSegmentIndex: 0,
@@ -2076,14 +2560,18 @@ export function createHub53AIBridge(input: HubBridgeInput) {
         visibleResponseSeen: false,
         lastSeqSeen: 0,
         emittedOutputFileKeys: new Set<string>(),
+        outputManifestPath,
         referencedLocalOutputPaths: new Set<string>(),
         writeOutputFilesByToolCallId: new Map<string, Hub53AIOutputFile[]>(),
-        localOutputSnapshot: await snapshotLocalOutputFiles({
-          config: input.config,
-          configPath: input.configPath,
-          stateDir: input.stateDir,
-          logger: input.logger
-        }),
+        localOutputSnapshot:
+          input.config.detectCreatedFiles === true
+            ? await snapshotLocalOutputFiles({
+                config: input.config,
+                configPath: input.configPath,
+                stateDir: input.stateDir,
+                logger: input.logger
+              })
+            : undefined,
         hubUserId: preparedMessage.userId
       };
       trackActiveSessionRequest(sessionId, message.reqId, { message: preparedMessage, eventScope });
@@ -2400,6 +2888,16 @@ export function createHub53AIBridge(input: HubBridgeInput) {
     if (!sessionId) {
       return;
     }
+    const ledger = normalizeOpenClawLedgerEvent(readOpenClawLedgerFromEvent(event));
+    if (ledger && shouldRejectCanonicalHistoryAnswerEvent(ledger, event)) {
+      traceOpenClawLedger(input.logger, "history-answer-canonical-skip", {
+        sessionId,
+        reason: "synthetic_history_typed_transcript_answer",
+        event: summarizeTimelineEventForTrace(event),
+        ledger: summarizeOpenClawLedgerEvent(ledger)
+      }, input.config);
+      return;
+    }
     const events = canonicalEventsBySession.get(sessionId) ?? [];
     const key = event.id || `${event.sessionId}:${event.seq}:${event.kind}`;
     const next = events.filter((candidate) => (candidate.id || `${candidate.sessionId}:${candidate.seq}:${candidate.kind}`) !== key);
@@ -2408,6 +2906,36 @@ export function createHub53AIBridge(input: HubBridgeInput) {
     setPersistedSessionEvents("canonicalEventsBySession", sessionId, nextEvents, MAX_CANONICAL_EVENTS_PER_SESSION);
     rememberOpenClawLedgerSeq(sessionId, event);
     persistStateSoon("canonical ledger event");
+  }
+
+  function shouldRejectCanonicalHistoryAnswerEvent(ledger: OpenClawLedgerEvent, event: TimelineEvent): boolean {
+    if (!isOpenClawHistoryLedgerEvent(ledger) || ledger.part_type !== "answer") {
+      return false;
+    }
+    const payload = toRecord(event.payload);
+    const sourceKind = readStringMetadata(payload, "source_kind");
+    return sourceKind === "typed_transcript.live_replace" ||
+      sourceKind === "typed_transcript.final_replace" ||
+      readBooleanMetadata(payload, "typed_live") === true ||
+      readBooleanMetadata(payload, "typed_final") === true;
+  }
+
+  function shouldExposeCanonicalSessionEvent(event: TimelineEvent): boolean {
+    const ledger = normalizeOpenClawLedgerEvent(readOpenClawLedgerFromEvent(event));
+    return !(ledger && shouldRejectCanonicalHistoryAnswerEvent(ledger, event));
+  }
+
+  function filterCanonicalSessionEventsForExposure(sessionId: string, events: TimelineEvent[]): TimelineEvent[] {
+    const nextEvents = events.filter(shouldExposeCanonicalSessionEvent);
+    if (nextEvents.length !== events.length) {
+      traceOpenClawLedger(input.logger, "history-answer-exposure-skip", {
+        sessionId,
+        before: events.length,
+        after: nextEvents.length,
+        removed: events.length - nextEvents.length
+      }, input.config);
+    }
+    return nextEvents;
   }
 
   const terminalResolvers = new Map<
@@ -2472,6 +3000,7 @@ export function createHub53AIBridge(input: HubBridgeInput) {
     lastSeqSeen: number;
     terminalSeen?: boolean;
     emittedOutputFileKeys: Set<string>;
+    outputManifestPath?: string;
     localOutputSnapshot?: LocalOutputFileSnapshot;
     hubUserId?: string;
     referencedLocalOutputPaths: Set<string>;
@@ -5645,33 +6174,51 @@ export function createHub53AIBridge(input: HubBridgeInput) {
     if (eventScope.localOutputFilesSent) {
       return;
     }
-    const files = await collectCreatedLocalOutputFiles(eventScope.localOutputSnapshot, {
+    const localOutputRuntime = {
       config: input.config,
       configPath: input.configPath,
       stateDir: input.stateDir,
       logger: input.logger
+    };
+    const manifestFiles = await collectManifestLocalOutputFiles({
+      ...localOutputRuntime,
+      manifestPath: eventScope.outputManifestPath,
+      conversationId: sessionId,
+      turnId: eventScope.turnId,
+      activeRequestId: eventScope.activeRequestId
     });
+    if (manifestFiles.length > 0) {
+      input.logger?.info?.(
+        `[53aihub] local output manifest: files=${manifestFiles.length}, path=${eventScope.outputManifestPath ?? "none"}, files=${
+          manifestFiles.map((file) => file.file_name).join(",") || "none"
+        }`
+      );
+      const sent = await sendOutputFiles(reqId, sessionId, manifestFiles, eventScope);
+      if (sent) {
+        eventScope.localOutputFilesSent = true;
+      }
+      return;
+    }
+
+    if (input.config.detectCreatedFiles !== true) {
+      input.logger?.info?.(
+        `[53aihub] local output manifest empty and legacy created-file scan disabled: path=${eventScope.outputManifestPath ?? "none"}`
+      );
+      return;
+    }
+
+    const files = await collectCreatedLocalOutputFiles(eventScope.localOutputSnapshot, localOutputRuntime);
     const referencedFiles = await collectReferencedLocalOutputFiles(
       eventScope.referencedLocalOutputPaths,
       eventScope.localOutputSnapshot,
-      {
-        config: input.config,
-        configPath: input.configPath,
-        stateDir: input.stateDir,
-        logger: input.logger
-      }
+      localOutputRuntime
     );
     const recentReferencedPaths = [...eventScope.referencedLocalOutputPaths].filter(
       (path) => !eventScope.localOutputSnapshot?.files.has(path)
     );
     const recentReferencedFiles = await collectRecentReferencedLocalOutputFiles(
       recentReferencedPaths,
-      {
-        config: input.config,
-        configPath: input.configPath,
-        stateDir: input.stateDir,
-        logger: input.logger
-      },
+      localOutputRuntime,
       eventScope.eventBoundaryMs
     );
     const outputFiles = [...files, ...referencedFiles, ...recentReferencedFiles];
@@ -5714,20 +6261,13 @@ export function createHub53AIBridge(input: HubBridgeInput) {
 
     const outputTimeline = timeline ?? buildOpenClawOutputFilesTimelineMeta(eventScope, freshFiles);
     const hubFiles = await uploadOutputFilesToHub(reqId, sessionId, freshFiles, eventScope, outputTimeline);
-    const ledgerSourceEvent = sourceEvent ?? {
-      id: `synthetic:output_files:${outputTimeline.segment_id}`,
+    const ledgerSourceEvent = await buildOutputFilesLedgerSourceEvent(
       sessionId,
-      seq: eventScope.lastSeqSeen,
-      kind: "process.step",
-      payload: {
-        process_step: {
-          step_code: "output_files",
-          status: "completed",
-          data: { files: hubFiles }
-        }
-      },
-      createdAt: new Date().toISOString()
-    };
+      hubFiles,
+      eventScope,
+      outputTimeline,
+      sourceEvent
+    );
     const outputLedger = buildOpenClawLedgerEvent(ledgerSourceEvent, eventScope, outputTimeline);
     if (eventScope.activeRequestId && eventScope.activeRequestId !== "events") {
       appendCanonicalSessionEvent(sessionId, buildCanonicalOutputFilesTimelineEvent(ledgerSourceEvent, outputTimeline, outputLedger));
@@ -5815,10 +6355,12 @@ export function createHub53AIBridge(input: HubBridgeInput) {
         file_name: stringOr(data.file_name, file.file_name),
         mime_type: stringOr(data.mime_type, file.mime_type),
         size: numberOr(data.size, file.size),
+        sha256: stringOr(data.sha256, file.sha256),
         url: stringOr(data.preview_url, data.url),
         preview_url: stringOr(data.preview_url, data.url),
         download_url: stringOr(data.download_url, file.download_url),
         signed_download_url: stringOr(data.signed_download_url, file.signed_download_url),
+        preview_key: stringOr(data.preview_key, file.preview_key),
         message_id: file.message_id,
         source_kind: stringOr(data.source_kind, file.source_kind, "openclaw_artifact")
       };
@@ -5888,10 +6430,36 @@ export function createHub53AIBridge(input: HubBridgeInput) {
       return false;
     }
     const outputTimeline = buildOpenClawOutputFilesTimelineMeta(eventScope, freshFiles);
-    const ledgerSourceEvent = buildSyntheticOutputFilesTimelineEvent(sessionId, freshFiles, eventScope, outputTimeline, sourceEvent);
+    const ledgerSourceEvent = buildSyntheticOutputFilesTimelineEvent(
+      sessionId,
+      freshFiles,
+      eventScope,
+      outputTimeline,
+      reserveLocalSyntheticEventSeq(eventScope, sourceEvent),
+      sourceEvent
+    );
     const outputLedger = buildOpenClawLedgerEvent(ledgerSourceEvent, eventScope, outputTimeline);
     appendCanonicalSessionEvent(sessionId, buildCanonicalOutputFilesTimelineEvent(ledgerSourceEvent, outputTimeline, outputLedger));
     return true;
+  }
+
+  async function buildOutputFilesLedgerSourceEvent(
+    sessionId: string,
+    files: Hub53AIOutputFile[],
+    eventScope: GatewayEventScope,
+    outputTimeline: OpenClawTimelineV2Meta,
+    sourceEvent?: GatewayEvent
+  ): Promise<TimelineEvent> {
+    const seq = await getNextSyntheticEventSeq(sessionId, eventScope);
+    eventScope.lastSeqSeen = Math.max(eventScope.lastSeqSeen, seq);
+    return buildSyntheticOutputFilesTimelineEvent(sessionId, files, eventScope, outputTimeline, seq, sourceEvent);
+  }
+
+  function reserveLocalSyntheticEventSeq(eventScope: GatewayEventScope, sourceEvent?: GatewayEvent): number {
+    const sourceSeq = typeof sourceEvent?.seq === "number" && Number.isFinite(sourceEvent.seq) ? sourceEvent.seq : 0;
+    const seq = Math.max(eventScope.lastSeqSeen, sourceSeq) + 1;
+    eventScope.lastSeqSeen = Math.max(eventScope.lastSeqSeen, seq);
+    return seq;
   }
 
   function buildSyntheticOutputFilesTimelineEvent(
@@ -5899,12 +6467,13 @@ export function createHub53AIBridge(input: HubBridgeInput) {
     files: Hub53AIOutputFile[],
     eventScope: GatewayEventScope,
     outputTimeline: OpenClawTimelineV2Meta,
+    seq: number,
     sourceEvent?: GatewayEvent
   ): TimelineEvent {
     return {
-      id: `synthetic:output_files:${outputTimeline.segment_id}`,
+      id: `synthetic:output_files:${outputTimeline.segment_id}:${seq}`,
       sessionId,
-      seq: typeof sourceEvent?.seq === "number" && Number.isFinite(sourceEvent.seq) ? sourceEvent.seq : eventScope.lastSeqSeen,
+      seq,
       kind: "process.step",
       payload: {
         process_step: {
@@ -6039,8 +6608,21 @@ export function createHub53AIBridge(input: HubBridgeInput) {
           return rewriteTimelineEventOpenClawLedgerSeq(event, nextSeq);
         });
 
-      const canonical = normalizeList(canonicalEventsBySession.get(sessionId) ?? []);
-      const synthetic = normalizeList(syntheticEventsBySession.get(sessionId) ?? []);
+      const canonicalSource = canonicalEventsBySession.get(sessionId) ?? [];
+      const syntheticSource = syntheticEventsBySession.get(sessionId) ?? [];
+      const canonicalExposed = canonicalSource.filter(shouldExposeCanonicalSessionEvent);
+      const syntheticExposed = syntheticSource.filter(shouldExposeCanonicalSessionEvent);
+      if (canonicalExposed.length !== canonicalSource.length || syntheticExposed.length !== syntheticSource.length) {
+        changed = true;
+        traceOpenClawLedger(input.logger, "history-answer-state-prune", {
+          sessionId,
+          canonicalRemoved: canonicalSource.length - canonicalExposed.length,
+          syntheticRemoved: syntheticSource.length - syntheticExposed.length
+        }, input.config);
+      }
+
+      const canonical = normalizeList(canonicalExposed);
+      const synthetic = normalizeList(syntheticExposed);
       canonicalEventsBySession.set(sessionId, canonical);
       syntheticEventsBySession.set(sessionId, synthetic);
       setPersistedSessionEvents("canonicalEventsBySession", sessionId, canonical, MAX_CANONICAL_EVENTS_PER_SESSION);
@@ -6984,7 +7566,7 @@ function inferMimeTypeFromFileName(fileName: string): string {
 
 function buildPrompt(
   message: Hub53AIIncomingMessage,
-  options: { includeRuntimeContext?: boolean } = {}
+  options: { includeRuntimeContext?: boolean; outputManifest?: OutputManifestPromptContext } = {}
 ): string {
   const parts = [message.text.trim()].filter(Boolean);
   if (message.imageUrls?.length) {
@@ -6992,7 +7574,7 @@ function buildPrompt(
   }
 
   if (options.includeRuntimeContext !== false) {
-    const runtimeContext = buildRuntimePromptContext(message);
+    const runtimeContext = buildRuntimePromptContext(message, options.outputManifest);
     if (runtimeContext) {
       parts.push(runtimeContext);
     }
@@ -7016,7 +7598,18 @@ function buildDisplayUserMessageMetadata(message: Hub53AIIncomingMessage): Recor
   };
 }
 
-function buildRuntimePromptContext(message: Hub53AIIncomingMessage): string {
+type OutputManifestPromptContext = {
+  path: string;
+  conversationId: string;
+  turnId: string;
+  activeRequestId: string;
+  workspaceDirs: string[];
+};
+
+function buildRuntimePromptContext(
+  message: Hub53AIIncomingMessage,
+  outputManifest?: OutputManifestPromptContext
+): string {
   const lines: string[] = [];
   const localFileRefs = dedupeStrings(
     (message.files ?? [])
@@ -7039,6 +7632,25 @@ function buildRuntimePromptContext(message: Hub53AIIncomingMessage): string {
   if (message.skill?.skill_name) {
     lines.push(`Selected skill: /${message.skill.skill_name}`);
     lines.push("Use the installed local skill with this name for this turn. Do not quote the skill instructions back to the user.");
+  }
+
+  if (outputManifest) {
+    lines.push("Output artifact manifest:");
+    lines.push(`Manifest path: ${outputManifest.path}`);
+    lines.push(`conversation_id: ${JSON.stringify(outputManifest.conversationId)}`);
+    lines.push(`turn_id: ${JSON.stringify(outputManifest.turnId)}`);
+    lines.push(`active_request_id: ${JSON.stringify(outputManifest.activeRequestId)}`);
+    if (outputManifest.workspaceDirs.length) {
+      lines.push("Allowed output workspace roots:", ...outputManifest.workspaceDirs.map((workspaceDir) => `@${workspaceDir}`));
+    }
+    lines.push(
+      "When you create or modify a user-visible output file for this turn, append exactly one JSON object per line to the manifest path."
+    );
+    lines.push(
+      "Each JSON object must include conversation_id, turn_id, active_request_id, part_id, path, logical_path, mime_type, size, sha256, created_at, and source_kind."
+    );
+    lines.push("Identifier fields must be JSON strings, even when an id looks numeric.");
+    lines.push("Do not rewrite prior manifest lines.");
   }
 
   if (!lines.length) {
@@ -7209,7 +7821,7 @@ function collectOutputFileCandidates(value: unknown, depth = 0): unknown[] {
 }
 
 function looksLikeOutputFile(record: Record<string, unknown>): boolean {
-  const url = readFirstString(record, ["url", "href", "download_url", "downloadUrl", "file_url", "fileUrl", "signed_url"]);
+  const url = readFirstString(record, ["url", "href", "preview_url", "previewUrl", "download_url", "downloadUrl", "file_url", "fileUrl", "signed_url"]);
   const base64 = readFirstString(record, ["base64"]);
   const content = readFirstString(record, ["content", "data"]);
   const explicitFileName = readFirstString(record, ["file_name", "fileName", "filename", "path", "title"]);
@@ -7227,7 +7839,11 @@ function normalizeOutputFile(value: unknown): Hub53AIOutputFile | null {
     return null;
   }
   const record = value as Record<string, unknown>;
-  const url = readFirstString(record, ["url", "href", "download_url", "downloadUrl", "file_url", "fileUrl", "signed_url"]);
+  const previewUrl = readFirstString(record, ["preview_url", "previewUrl"]);
+  const downloadUrl = readFirstString(record, ["download_url", "downloadUrl"]);
+  const signedDownloadUrl = readFirstString(record, ["signed_download_url", "signedDownloadUrl"]);
+  const rawUrl = readFirstString(record, ["url", "href", "file_url", "fileUrl", "signed_url"]);
+  const url = previewUrl || rawUrl || signedDownloadUrl || downloadUrl;
   const base64 = readFirstString(record, ["base64"]);
   const content = readFirstString(record, ["content", "data"]);
   if (!url && !base64 && !content) {
@@ -7238,17 +7854,22 @@ function normalizeOutputFile(value: unknown): Hub53AIOutputFile | null {
     readFirstString(record, ["file_name", "fileName", "filename", "name", "path", "title"]) ||
     inferFileNameFromUrl(url) ||
     "file";
-  const id = readFirstString(record, ["id", "file_id", "fileId", "upload_file_id", "uploadFileId"]) || url || fileName;
+  const id = readFirstString(record, ["id", "artifact_id", "artifactId", "file_id", "fileId", "upload_file_id", "uploadFileId"]) || url || fileName;
   const mimeType = readFirstString(record, ["mime_type", "mimeType", "mime", "content_type", "contentType"]);
   const size = readFirstNumber(record, ["size", "file_size", "fileSize", "bytes"]);
   return {
     id,
     file_name: fileName,
     ...(url ? { url } : {}),
-    ...(readFirstString(record, ["download_url", "downloadUrl"]) ? { download_url: readFirstString(record, ["download_url", "downloadUrl"]) } : {}),
-    ...(readFirstString(record, ["signed_download_url", "signedDownloadUrl"]) ? { signed_download_url: readFirstString(record, ["signed_download_url", "signedDownloadUrl"]) } : {}),
+    ...(previewUrl ? { preview_url: previewUrl } : {}),
+    ...(downloadUrl ? { download_url: downloadUrl } : {}),
+    ...(signedDownloadUrl ? { signed_download_url: signedDownloadUrl } : {}),
+    ...(readFirstString(record, ["preview_key", "previewKey"]) ? { preview_key: readFirstString(record, ["preview_key", "previewKey"]) } : {}),
+    ...(readFirstString(record, ["artifact_id", "artifactId"]) ? { artifact_id: readFirstString(record, ["artifact_id", "artifactId"]) } : {}),
+    ...(readFirstString(record, ["upload_file_id", "uploadFileId"]) ? { upload_file_id: readFirstString(record, ["upload_file_id", "uploadFileId"]) } : {}),
     ...(mimeType ? { mime_type: mimeType } : {}),
     ...(typeof size === "number" ? { size } : {}),
+    ...(readFirstString(record, ["sha256", "sha_256", "content_sha256"]) ? { sha256: readFirstString(record, ["sha256", "sha_256", "content_sha256"]) } : {}),
     ...(base64 ? { base64 } : {}),
     ...(content && !base64 ? { content } : {}),
     ...(readFirstString(record, ["message_id", "messageId"]) ? { message_id: readFirstString(record, ["message_id", "messageId"]) } : {}),
@@ -7257,7 +7878,7 @@ function normalizeOutputFile(value: unknown): Hub53AIOutputFile | null {
 }
 
 function getOutputFileKeys(file: Hub53AIOutputFile): string[] {
-  const address = file.signed_download_url || file.download_url || file.url || "";
+  const address = file.preview_url || file.url || file.signed_download_url || file.download_url || "";
   const contentFingerprint = getOutputFileContentFingerprint(file);
   return [
     file.id ? `id:${file.id}` : "",
@@ -7268,7 +7889,7 @@ function getOutputFileKeys(file: Hub53AIOutputFile): string[] {
 }
 
 function getOutputFilePartIdentityKey(file: Hub53AIOutputFile): string {
-  const address = file.signed_download_url || file.download_url || file.url || "";
+  const address = file.preview_url || file.url || file.signed_download_url || file.download_url || "";
   const id = typeof file.id === "string" ? file.id.trim() : "";
   if (file.file_name) {
     return `name:${file.file_name}`;
@@ -7288,12 +7909,17 @@ function getOutputFilePartIdentityKey(file: Hub53AIOutputFile): string {
 function getOutputFileEmissionKey(file: Hub53AIOutputFile): string {
   const fields = [
     ["id", file.id || ""],
+    ["artifact", file.artifact_id || ""],
+    ["upload", file.upload_file_id || ""],
     ["name", file.file_name || ""],
     ["url", file.url || ""],
+    ["preview", file.preview_url || ""],
+    ["preview_key", file.preview_key || ""],
     ["download", file.download_url || ""],
     ["signed", file.signed_download_url || ""],
     ["mime", file.mime_type || ""],
     ["size", typeof file.size === "number" ? String(file.size) : ""],
+    ["sha256", file.sha256 || ""],
     ["content", getOutputFileContentFingerprint(file)],
     ["message", file.message_id || ""],
     ["source", file.source_kind || ""]
@@ -7398,6 +8024,18 @@ function parseHeartbeat(rawPayload: string): "ping" | "pong" | null {
     return null;
   }
   return null;
+}
+
+function isHub53AIBusinessHeartbeatMessage(message: Hub53AIIncomingMessage): boolean {
+  const chatId = String(message.chatId || "").trim();
+  if (chatId.endsWith(":heartbeat")) {
+    return true;
+  }
+  if ((message.imageUrls?.length || 0) > 0 || (message.fileUrls?.length || 0) > 0 || (message.files?.length || 0) > 0) {
+    return false;
+  }
+  const normalized = message.text.trim().replace(/\s+/g, " ").toUpperCase();
+  return normalized === "HEARTBEAT_OK";
 }
 
 function extractTextFromContent(content: unknown): string {

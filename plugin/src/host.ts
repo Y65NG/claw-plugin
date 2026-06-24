@@ -169,7 +169,7 @@ export function resolvePluginConfig(config?: PluginConfig): ResolvedPluginConfig
       sendThinkingMessage: config?.hub53ai?.sendThinkingMessage ?? true,
       reconnectBaseMs: config?.hub53ai?.reconnectBaseMs ?? 2_000,
       maxReconnectAttempts: config?.hub53ai?.maxReconnectAttempts ?? 10,
-      detectCreatedFiles: config?.hub53ai?.detectCreatedFiles ?? true,
+      detectCreatedFiles: config?.hub53ai?.detectCreatedFiles ?? false,
       fileWorkspaceDirs: Array.isArray(config?.hub53ai?.fileWorkspaceDirs)
         ? config.hub53ai.fileWorkspaceDirs.map((entry) => String(entry).trim()).filter(Boolean)
         : [],

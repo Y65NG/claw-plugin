@@ -2,7 +2,7 @@ import { createHash } from "node:crypto";
 import { lstat, readdir, readFile } from "node:fs/promises";
 import { existsSync } from "node:fs";
 import { homedir } from "node:os";
-import { dirname, relative, resolve, sep } from "node:path";
+import { dirname, isAbsolute, join, relative, resolve, sep } from "node:path";
 
 export type LocalOutputFileConfig = {
   detectCreatedFiles?: boolean;
@@ -32,6 +32,31 @@ export type LocalOutputFile = {
   mime_type?: string;
   size?: number;
   base64: string;
+  sha256?: string;
+  source_kind?: string;
+};
+
+export type LocalOutputManifestFile = LocalOutputFile & {
+  conversation_id: string;
+  turn_id: string;
+  active_request_id: string;
+  part_id: string;
+  logical_path: string;
+  created_at: string;
+};
+
+export type LocalOutputManifestRecord = {
+  conversation_id: string;
+  turn_id: string;
+  active_request_id: string;
+  part_id: string;
+  path: string;
+  logical_path: string;
+  mime_type: string;
+  size: number;
+  sha256: string;
+  created_at: string;
+  source_kind: string;
 };
 
 type ExcludeRules = {
@@ -46,6 +71,13 @@ type LocalOutputFileRuntime = {
   logger?: {
     warn?(message: string): void;
   };
+};
+
+type LocalOutputManifestRuntime = LocalOutputFileRuntime & {
+  manifestPath?: string;
+  conversationId: string;
+  turnId?: string;
+  activeRequestId?: string;
 };
 
 const DEFAULT_MAX_FILE_BYTES = 10 * 1024 * 1024;
@@ -65,6 +97,17 @@ export function resolveLocalOutputWorkspaceDirs(input: LocalOutputFileRuntime): 
   const configured = input.config?.fileWorkspaceDirs?.map(expandHome).map((entry) => resolve(entry)) ?? [];
   const inferred = inferWorkspaceDirs(input);
   return dedupeStrings([...configured, ...inferred]).filter(Boolean);
+}
+
+export function resolveLocalOutputManifestPath(input: {
+  stateDir?: string;
+  conversationId?: string;
+}): string | undefined {
+  const conversationId = input.conversationId?.trim();
+  if (!input.stateDir || !conversationId) {
+    return undefined;
+  }
+  return join(resolve(expandHome(input.stateDir)), "output-manifests", `${buildSafeManifestFileStem(conversationId)}.jsonl`);
 }
 
 export async function snapshotLocalOutputFiles(input: LocalOutputFileRuntime): Promise<LocalOutputFileSnapshot | undefined> {
@@ -247,6 +290,151 @@ export async function collectReferencedLocalOutputFiles(
   return entriesToOutputFiles(latestEntries, input);
 }
 
+export async function collectManifestLocalOutputFiles(
+  input: LocalOutputManifestRuntime
+): Promise<LocalOutputFile[]> {
+  return collectManifestLocalOutputFilesInternal(input, (record) => manifestRecordMatchesScope(record, input));
+}
+
+export async function collectConversationManifestLocalOutputFiles(
+  input: Omit<LocalOutputManifestRuntime, "turnId" | "activeRequestId">
+): Promise<LocalOutputManifestFile[]> {
+  return collectManifestLocalOutputFilesInternal(input, (record) => record.conversation_id === input.conversationId);
+}
+
+async function collectManifestLocalOutputFilesInternal(
+  input: LocalOutputManifestRuntime,
+  matchesRecord: (record: LocalOutputManifestRecord) => boolean
+): Promise<LocalOutputManifestFile[]> {
+  const manifestPath = input.manifestPath ?? resolveLocalOutputManifestPath({
+    stateDir: input.stateDir,
+    conversationId: input.conversationId
+  });
+  if (!manifestPath || !existsSync(manifestPath)) {
+    return [];
+  }
+
+  let rawManifest: string;
+  try {
+    rawManifest = await readFile(manifestPath, "utf8");
+  } catch (error) {
+    input.logger?.warn?.(
+      `[53aihub] failed to read local output manifest ${manifestPath}: ${
+        error instanceof Error ? error.message : String(error)
+      }`
+    );
+    return [];
+  }
+
+  const workspaceDirs = resolveLocalOutputWorkspaceDirs(input);
+  if (workspaceDirs.length === 0) {
+    return [];
+  }
+
+  const maxFileBytes = input.config?.createdFilesMaxFileBytes ?? DEFAULT_MAX_FILE_BYTES;
+  const maxFileCount = Math.max(0, input.config?.createdFilesMaxCount ?? DEFAULT_MAX_FILE_COUNT);
+  const excludeRules = buildExcludeRules(input.config);
+  const files: LocalOutputManifestFile[] = [];
+  const seenManifestKeys = new Set<string>();
+
+  const lines = rawManifest.split(/\r?\n/);
+  for (let index = 0; index < lines.length; index += 1) {
+    if (files.length >= maxFileCount) {
+      break;
+    }
+    const line = lines[index]?.trim();
+    if (!line) {
+      continue;
+    }
+
+    const record = parseManifestRecordLine(line, manifestPath, index + 1, input.logger);
+    if (!record || !matchesRecord(record)) {
+      continue;
+    }
+
+    const expandedPath = expandHome(record.path);
+    if (!isAbsolute(expandedPath)) {
+      warnManifestRecordRejected(input, manifestPath, index + 1, record.logical_path, "path is not absolute");
+      continue;
+    }
+
+    const path = resolve(expandedPath);
+    const workspaceDir = findContainingWorkspace(path, workspaceDirs);
+    if (!workspaceDir) {
+      warnManifestRecordRejected(input, manifestPath, index + 1, record.logical_path, "path is outside allowed workspaces");
+      continue;
+    }
+
+    const relativePath = normalizeRelativePath(relative(workspaceDir, path));
+    if (!relativePath || shouldExclude(relativePath, excludeRules)) {
+      continue;
+    }
+
+    const logicalPath = sanitizeLogicalPath(record.logical_path) || relativePath;
+    try {
+      const stat = await lstat(path);
+      if (!stat.isFile() || stat.size <= 0 || stat.size > maxFileBytes) {
+        continue;
+      }
+
+      const bytes = await readFile(path);
+      const sha256 = createHash("sha256").update(bytes).digest("hex");
+      if (record.sha256.toLowerCase() !== sha256) {
+        warnManifestRecordRejected(input, manifestPath, index + 1, logicalPath, "sha256 does not match file");
+        continue;
+      }
+      if (Number.isFinite(record.size) && record.size !== stat.size) {
+        input.logger?.warn?.(
+          `[53aihub] local output manifest ${manifestPath}:${index + 1} size metadata for ${logicalPath} ` +
+            `does not match file; accepting sha256-verified content`
+        );
+      }
+
+      const manifestKey = `${record.active_request_id}\0${logicalPath}\0${sha256}`;
+      if (seenManifestKeys.has(manifestKey)) {
+        continue;
+      }
+      seenManifestKeys.add(manifestKey);
+
+      files.push({
+        id: buildLocalOutputFileId(
+          {
+            path,
+            workspaceDir,
+            relativePath: logicalPath,
+            size: stat.size,
+            mtimeMs: stat.mtimeMs
+          },
+          bytes
+        ),
+        file_name: logicalPath,
+        path,
+        mime_type: record.mime_type || inferMimeType(logicalPath),
+        size: stat.size,
+        base64: bytes.toString("base64"),
+        sha256,
+        conversation_id: record.conversation_id,
+        turn_id: record.turn_id,
+        active_request_id: record.active_request_id,
+        part_id: record.part_id,
+        logical_path: logicalPath,
+        created_at: record.created_at,
+        source_kind: record.source_kind || "manifest"
+      });
+    } catch (error) {
+      warnManifestRecordRejected(
+        input,
+        manifestPath,
+        index + 1,
+        logicalPath,
+        error instanceof Error ? error.message : String(error)
+      );
+    }
+  }
+
+  return files;
+}
+
 async function entriesToOutputFiles(
   entries: LocalOutputFileEntry[],
   input: LocalOutputFileRuntime
@@ -377,6 +565,132 @@ function buildExcludeRules(config?: LocalOutputFileConfig): ExcludeRules {
   };
 }
 
+function parseManifestRecordLine(
+  line: string,
+  manifestPath: string,
+  lineNumber: number,
+  logger: LocalOutputFileRuntime["logger"]
+): LocalOutputManifestRecord | undefined {
+  let parsed: unknown;
+  try {
+    parsed = JSON.parse(line);
+  } catch (error) {
+    logger?.warn?.(
+      `[53aihub] skipping malformed local output manifest line ${lineNumber} in ${manifestPath}: ${
+        error instanceof Error ? error.message : String(error)
+      }`
+    );
+    return undefined;
+  }
+
+  if (!parsed || typeof parsed !== "object" || Array.isArray(parsed)) {
+    logger?.warn?.(`[53aihub] skipping invalid local output manifest line ${lineNumber} in ${manifestPath}`);
+    return undefined;
+  }
+
+  const record = parsed as Record<string, unknown>;
+  const manifestRecord = {
+    conversation_id: scalarStringField(record, "conversation_id"),
+    turn_id: scalarStringField(record, "turn_id"),
+    active_request_id: scalarStringField(record, "active_request_id"),
+    part_id: scalarStringField(record, "part_id"),
+    path: stringField(record, "path"),
+    logical_path: stringField(record, "logical_path"),
+    mime_type: stringField(record, "mime_type"),
+    size: numberField(record, "size"),
+    sha256: stringField(record, "sha256").toLowerCase(),
+    created_at: stringField(record, "created_at"),
+    source_kind: stringField(record, "source_kind")
+  };
+
+  const requiredStrings: Array<keyof LocalOutputManifestRecord> = [
+    "conversation_id",
+    "turn_id",
+    "active_request_id",
+    "part_id",
+    "path",
+    "logical_path",
+    "mime_type",
+    "sha256",
+    "created_at",
+    "source_kind"
+  ];
+  const missing = requiredStrings.filter((key) => !manifestRecord[key]);
+  if (missing.length || !Number.isFinite(manifestRecord.size) || manifestRecord.size <= 0) {
+    logger?.warn?.(
+      `[53aihub] skipping invalid local output manifest line ${lineNumber} in ${manifestPath}: missing or invalid ${[
+        ...missing,
+        ...(!Number.isFinite(manifestRecord.size) || manifestRecord.size <= 0 ? ["size"] : [])
+      ].join(",")}`
+    );
+    return undefined;
+  }
+  if (!/^[a-f0-9]{64}$/i.test(manifestRecord.sha256)) {
+    logger?.warn?.(
+      `[53aihub] skipping invalid local output manifest line ${lineNumber} in ${manifestPath}: invalid sha256`
+    );
+    return undefined;
+  }
+
+  return manifestRecord;
+}
+
+function manifestRecordMatchesScope(record: LocalOutputManifestRecord, input: LocalOutputManifestRuntime): boolean {
+  if (record.conversation_id !== input.conversationId) {
+    return false;
+  }
+  const activeRequestMatches = Boolean(input.activeRequestId && record.active_request_id === input.activeRequestId);
+  const turnMatches = Boolean(input.turnId && record.turn_id === input.turnId);
+  return activeRequestMatches || turnMatches;
+}
+
+function stringField(record: Record<string, unknown>, key: string): string {
+  const value = record[key];
+  return typeof value === "string" ? value.trim() : "";
+}
+
+function scalarStringField(record: Record<string, unknown>, key: string): string {
+  const value = record[key];
+  if (typeof value === "string") {
+    return value.trim();
+  }
+  if (typeof value === "number" && Number.isFinite(value)) {
+    return String(value);
+  }
+  return "";
+}
+
+function numberField(record: Record<string, unknown>, key: string): number {
+  const value = record[key];
+  if (typeof value === "number" && Number.isFinite(value)) {
+    return value;
+  }
+  if (typeof value === "string" && value.trim()) {
+    const parsed = Number(value);
+    return Number.isFinite(parsed) ? parsed : Number.NaN;
+  }
+  return Number.NaN;
+}
+
+function sanitizeLogicalPath(value: string): string {
+  return normalizeRelativePath(value)
+    .split("/")
+    .filter((part) => part && part !== "." && part !== "..")
+    .join("/");
+}
+
+function warnManifestRecordRejected(
+  input: LocalOutputManifestRuntime,
+  manifestPath: string,
+  lineNumber: number,
+  logicalPath: string,
+  reason: string
+) {
+  input.logger?.warn?.(
+    `[53aihub] rejected local output manifest record ${logicalPath || "unknown"} at ${manifestPath}:${lineNumber}: ${reason}`
+  );
+}
+
 function globToRegExp(pattern: string): RegExp {
   const normalized = normalizeRelativePath(pattern);
   const escaped = normalized
@@ -454,6 +768,16 @@ function buildLocalOutputFileId(entry: LocalOutputFileEntry, bytes: Buffer): str
     .update(bytes)
     .digest("hex")
     .slice(0, 24)}`;
+}
+
+function buildSafeManifestFileStem(conversationId: string): string {
+  const safe = conversationId
+    .trim()
+    .replace(/[^a-zA-Z0-9._-]+/g, "_")
+    .replace(/^_+|_+$/g, "")
+    .slice(0, 80) || "conversation";
+  const hash = createHash("sha256").update(conversationId).digest("hex").slice(0, 12);
+  return `${safe}-${hash}`;
 }
 
 function inferMimeType(fileName: string): string {

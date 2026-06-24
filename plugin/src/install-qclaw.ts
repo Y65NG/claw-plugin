@@ -692,7 +692,7 @@ async function installIntoHost(
     previousHub.sendThinkingMessage =
       inferredHub53AI.sendThinkingMessage ?? previousHub.sendThinkingMessage ?? true;
     previousHub.detectCreatedFiles =
-      typeof previousHub.detectCreatedFiles === "boolean" ? previousHub.detectCreatedFiles : true;
+      typeof previousHub.detectCreatedFiles === "boolean" ? previousHub.detectCreatedFiles : false;
     previousHub.fileWorkspaceDirs = Array.isArray(previousHub.fileWorkspaceDirs) ? previousHub.fileWorkspaceDirs : [];
     previousHub.createdFilesMaxFileBytes =
       typeof previousHub.createdFilesMaxFileBytes === "number" ? previousHub.createdFilesMaxFileBytes : 10 * 1024 * 1024;
