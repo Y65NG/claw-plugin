@@ -73,6 +73,19 @@ function ledgerTimelineEvent(
   };
 }
 
+function fakeGatewaySession(id: string): GatewaySession {
+  return {
+    id,
+    title: id,
+    status: "idle",
+    hostKind: "qclaw",
+    runnerCommand: "gateway",
+    createdAt: "2026-05-20T10:00:00.000Z",
+    updatedAt: "2026-05-20T10:00:00.000Z",
+    lastEventSeq: 0
+  };
+}
+
 describe("53AIHub client", () => {
   it("slices older pages from the fetched latest message window", () => {
     const messages = ["m3", "m4", "m5", "m6"];
@@ -437,6 +450,98 @@ describe("53AIHub client", () => {
       expect(userMessages[0]?.content).not.toContain("<53aihub-openclaw-runtime-context>");
       expect(userMessages[0]?.content).not.toContain("Selected skill:");
       expect(userMessages[0]?.content).not.toContain("Attached files:");
+    } finally {
+      await bridge.stop();
+    }
+  });
+
+  it("falls back to runtime prompt context when native attachment send is rejected", async () => {
+    const stateDir = await mkdtemp(join(tmpdir(), "claw-53aihub-"));
+    cleanupPaths.push(stateDir);
+    const server = await createFakeHubServer();
+    cleanupServers.push(server.close);
+    const fileServer = createServer((req, res) => {
+      if (req.url === "/probe.txt") {
+        res.writeHead(200, { "Content-Type": "text/plain" });
+        res.end("probe file content");
+        return;
+      }
+      res.writeHead(404);
+      res.end("not found");
+    });
+    await new Promise<void>((resolve) => fileServer.listen(0, "127.0.0.1", resolve));
+    cleanupServers.push(
+      () =>
+        new Promise<void>((resolve) => {
+          fileServer.close(() => resolve());
+        })
+    );
+    const filePort = (fileServer.address() as any).port;
+    const gateway = new FakeGateway();
+    gateway.failNextAttachmentSendMessage = "attachments unsupported by current gateway";
+    const bridge = createHub53AIBridge({
+      stateDir,
+      config: {
+        enabled: true,
+        botId: "bot-123",
+        secret: "sk-secret",
+        wsUrl: server.url,
+        accessPolicy: "open",
+        allowFrom: [],
+        sendThinkingMessage: false,
+        reconnectBaseMs: 20,
+        maxReconnectAttempts: 2
+      },
+      gateway,
+      callbacks: {
+        onSessionUpsert: async (session) => {
+          gateway.upsertSession(session);
+        },
+        onUserMessage: async () => undefined,
+        onSessionStatus: async () => undefined,
+        onEnsureSessionStream: async () => undefined,
+        getLastEventSeq: () => 0,
+        onStatusChange: () => undefined
+      }
+    });
+
+    await bridge.start();
+    try {
+      const connection = await server.connected;
+      connection.socket.send(
+        JSON.stringify({
+          req_id: "req-attachment-fallback",
+          action: "chat",
+          data: {
+            user: "user-123",
+            conversation_id: "chat-attachment-fallback",
+            metadata: {
+              openclaw_client_message_id: "client-attachment-fallback",
+              openclaw_input_files: [
+                {
+                  id: "file-1",
+                  file_name: "probe.txt",
+                  mime_type: "text/plain",
+                  signed_download_url: `http://127.0.0.1:${filePort}/probe.txt`
+                }
+              ]
+            },
+            messages: [{ role: "user", content: "读取附件" }]
+          }
+        })
+      );
+
+      await waitFor(() => {
+        expect(gateway.sentMessages).toHaveLength(1);
+      });
+
+      const sentMessage = gateway.sentMessages[0];
+      const expectedLocalPath = join(stateDir, "input-files", "req-attachment-fallback", "probe.txt");
+      expect(sentMessage.attachments).toBeUndefined();
+      expect(sentMessage.content).toContain("读取附件");
+      expect(sentMessage.content).toContain("<53aihub-openclaw-runtime-context>");
+      expect(sentMessage.content).toContain("Local input files:");
+      expect(sentMessage.content).toContain(`@${expectedLocalPath}`);
     } finally {
       await bridge.stop();
     }
@@ -2347,6 +2452,277 @@ describe("53AIHub client", () => {
         });
         expect(files[0].url).toBeUndefined();
         expect(files[0].id).toMatch(/^local-/);
+      });
+    } finally {
+      await bridge.stop();
+    }
+  });
+
+  it("emits the final local file revision after an earlier write output was sent", async () => {
+    const stateDir = await mkdtemp(join(tmpdir(), "claw-53aihub-"));
+    cleanupPaths.push(stateDir);
+    const workspaceDir = join(stateDir, "workspace");
+    const reportPath = join(workspaceDir, "revision.txt");
+    await mkdir(workspaceDir, { recursive: true });
+
+    const server = await createFakeHubServer();
+    cleanupServers.push(server.close);
+    const gateway = new FakeGateway();
+    gateway.beforeEmit = async () => {
+      await writeFile(reportPath, "final revision");
+    };
+    gateway.eventsToEmit = [
+      {
+        id: "evt-started",
+        sessionId: "session-1",
+        seq: 1,
+        kind: "run.started",
+        payload: { runId: "run-edit-file" },
+        createdAt: new Date().toISOString()
+      },
+      {
+        id: "evt-write-call",
+        sessionId: "session-1",
+        seq: 2,
+        kind: "tool.call",
+        payload: {
+          runId: "run-edit-file",
+          data: {
+            name: "write",
+            toolCallId: "tool-write-revision",
+            args: {
+              path: reportPath,
+              content: "draft revision"
+            }
+          }
+        },
+        createdAt: new Date().toISOString()
+      },
+      {
+        id: "evt-write-result",
+        sessionId: "session-1",
+        seq: 3,
+        kind: "tool.result",
+        payload: {
+          runId: "run-edit-file",
+          data: {
+            name: "write",
+            toolCallId: "tool-write-revision",
+            isError: false
+          }
+        },
+        createdAt: new Date().toISOString()
+      },
+      {
+        id: "evt-completed",
+        sessionId: "session-1",
+        seq: 4,
+        kind: "run.completed",
+        payload: { runId: "run-edit-file", status: "completed" },
+        createdAt: new Date().toISOString()
+      }
+    ];
+
+    const bridge = createHub53AIBridge({
+      stateDir,
+      configPath: join(stateDir, "openclaw.json"),
+      config: {
+        enabled: true,
+        botId: "bot-123",
+        secret: "sk-secret",
+        wsUrl: server.url,
+        accessPolicy: "open",
+        allowFrom: [],
+        sendThinkingMessage: false,
+        reconnectBaseMs: 20,
+        maxReconnectAttempts: 2,
+        detectCreatedFiles: true,
+        fileWorkspaceDirs: [workspaceDir],
+        createdFilesMaxFileBytes: 1024,
+        createdFilesMaxCount: 5
+      },
+      gateway,
+      callbacks: {
+        onSessionUpsert: async (session) => {
+          gateway.upsertSession(session);
+        },
+        onUserMessage: async () => undefined,
+        onSessionStatus: async () => undefined,
+        onEnsureSessionStream: async () => undefined,
+        getLastEventSeq: () => 0,
+        onStatusChange: () => undefined
+      }
+    });
+
+    await bridge.start();
+    try {
+      const connection = await server.connected;
+      connection.socket.send(
+        JSON.stringify({
+          req_id: "req-final-file-revision",
+          action: "chat",
+          data: {
+            user: "user-a",
+            conversation_id: "chat-final-file-revision",
+            messages: [{ role: "user", content: "创建并修正本地文件" }]
+          }
+        })
+      );
+
+      await waitFor(() => {
+        const outputSteps = server.frames.filter(
+          (frame) =>
+            frame.req_id === "req-final-file-revision" &&
+            frame.action === "chat" &&
+            frame.data?.object === "process.step" &&
+            frame.data.process_step?.step_code === "output_files"
+        );
+        expect(outputSteps.length).toBeGreaterThanOrEqual(2);
+        expect(outputSteps[0]!.data.process_step.data.files[0]).toMatchObject({
+          file_name: "revision.txt",
+          content: "draft revision"
+        });
+        expect(outputSteps.at(-1)!.data.process_step.data.files[0]).toMatchObject({
+          file_name: "revision.txt",
+          base64: Buffer.from("final revision").toString("base64")
+        });
+      });
+    } finally {
+      await bridge.stop();
+    }
+  });
+
+  it("does not re-emit an unchanged local file revision after write output", async () => {
+    const stateDir = await mkdtemp(join(tmpdir(), "claw-53aihub-"));
+    cleanupPaths.push(stateDir);
+    const workspaceDir = join(stateDir, "workspace");
+    const reportPath = join(workspaceDir, "unchanged.txt");
+    await mkdir(workspaceDir, { recursive: true });
+
+    const server = await createFakeHubServer();
+    cleanupServers.push(server.close);
+    const gateway = new FakeGateway();
+    gateway.beforeEmit = async () => {
+      await writeFile(reportPath, "same revision");
+    };
+    gateway.eventsToEmit = [
+      {
+        id: "evt-started",
+        sessionId: "session-1",
+        seq: 1,
+        kind: "run.started",
+        payload: { runId: "run-same-file" },
+        createdAt: new Date().toISOString()
+      },
+      {
+        id: "evt-write-call",
+        sessionId: "session-1",
+        seq: 2,
+        kind: "tool.call",
+        payload: {
+          runId: "run-same-file",
+          data: {
+            name: "write",
+            toolCallId: "tool-write-same",
+            args: {
+              path: reportPath,
+              content: "same revision"
+            }
+          }
+        },
+        createdAt: new Date().toISOString()
+      },
+      {
+        id: "evt-write-result",
+        sessionId: "session-1",
+        seq: 3,
+        kind: "tool.result",
+        payload: {
+          runId: "run-same-file",
+          data: {
+            name: "write",
+            toolCallId: "tool-write-same",
+            isError: false
+          }
+        },
+        createdAt: new Date().toISOString()
+      },
+      {
+        id: "evt-completed",
+        sessionId: "session-1",
+        seq: 4,
+        kind: "run.completed",
+        payload: { runId: "run-same-file", status: "completed" },
+        createdAt: new Date().toISOString()
+      }
+    ];
+
+    const bridge = createHub53AIBridge({
+      stateDir,
+      configPath: join(stateDir, "openclaw.json"),
+      config: {
+        enabled: true,
+        botId: "bot-123",
+        secret: "sk-secret",
+        wsUrl: server.url,
+        accessPolicy: "open",
+        allowFrom: [],
+        sendThinkingMessage: false,
+        reconnectBaseMs: 20,
+        maxReconnectAttempts: 2,
+        detectCreatedFiles: true,
+        fileWorkspaceDirs: [workspaceDir],
+        createdFilesMaxFileBytes: 1024,
+        createdFilesMaxCount: 5
+      },
+      gateway,
+      callbacks: {
+        onSessionUpsert: async (session) => {
+          gateway.upsertSession(session);
+        },
+        onUserMessage: async () => undefined,
+        onSessionStatus: async () => undefined,
+        onEnsureSessionStream: async () => undefined,
+        getLastEventSeq: () => 0,
+        onStatusChange: () => undefined
+      }
+    });
+
+    await bridge.start();
+    try {
+      const connection = await server.connected;
+      connection.socket.send(
+        JSON.stringify({
+          req_id: "req-unchanged-file-revision",
+          action: "chat",
+          data: {
+            user: "user-a",
+            conversation_id: "chat-unchanged-file-revision",
+            messages: [{ role: "user", content: "创建本地文件" }]
+          }
+        })
+      );
+
+      await waitFor(() => {
+        const doneFrame = server.frames.find(
+          (frame) =>
+            frame.req_id === "req-unchanged-file-revision" &&
+            frame.action === "chat" &&
+            frame.status === "done"
+        );
+        expect(doneFrame).toBeTruthy();
+      });
+      const outputSteps = server.frames.filter(
+        (frame) =>
+          frame.req_id === "req-unchanged-file-revision" &&
+          frame.action === "chat" &&
+          frame.data?.object === "process.step" &&
+          frame.data.process_step?.step_code === "output_files"
+      );
+      expect(outputSteps).toHaveLength(1);
+      expect(outputSteps[0]!.data.process_step.data.files[0]).toMatchObject({
+        file_name: "unchanged.txt",
+        content: "same revision"
       });
     } finally {
       await bridge.stop();
@@ -8056,6 +8432,7 @@ describe("53AIHub client", () => {
     cleanupServers.push(server.close);
 
     const gateway = new FakeGateway();
+    gateway.upsertSession(fakeGatewaySession("session-1"));
     const bridge = createHub53AIBridge({
       stateDir,
       config: {
@@ -8237,6 +8614,7 @@ describe("53AIHub client", () => {
     cleanupServers.push(server.close);
 
     const gateway = new FakeGateway();
+    gateway.upsertSession(fakeGatewaySession("session-1"));
     const bridge = createHub53AIBridge({
       stateDir,
       config: {
@@ -8461,6 +8839,7 @@ describe("53AIHub client", () => {
     cleanupServers.push(server.close);
 
     const gateway = new FakeGateway();
+    gateway.upsertSession(fakeGatewaySession("session-1"));
     const bridge = createHub53AIBridge({
       stateDir,
       config: {
@@ -8599,6 +8978,7 @@ describe("53AIHub client", () => {
     cleanupServers.push(server.close);
 
     const gateway = new FakeGateway();
+    gateway.upsertSession(fakeGatewaySession("session-1"));
     const bridge = createHub53AIBridge({
       stateDir,
       config: {
@@ -9483,6 +9863,7 @@ describe("53AIHub client", () => {
     cleanupServers.push(server.close);
 
     const gateway = new FakeGateway();
+    gateway.upsertSession(fakeGatewaySession("session-1"));
     const bridge = createHub53AIBridge({
       stateDir,
       config: {
@@ -9800,6 +10181,142 @@ describe("53AIHub client", () => {
       await bridge.stop();
     }
   });
+
+  it("returns NOT_FOUND for explicit session history RPCs when the gateway list proves the session is missing", async () => {
+    const stateDir = await mkdtemp(join(tmpdir(), "claw-53aihub-rpc-missing-"));
+    cleanupPaths.push(stateDir);
+
+    const server = await createFakeHubServer();
+    cleanupServers.push(server.close);
+
+    const gateway = new FakeGateway();
+    gateway.sessionPage = {
+      sessions: [],
+      pagination: {
+        limit: 50,
+        offset: 0,
+        total: 0,
+        hasMore: false
+      }
+    };
+
+    const bridge = createHub53AIBridge({
+      stateDir,
+      config: {
+        enabled: true,
+        botId: "bot-123",
+        secret: "sk-secret",
+        wsUrl: server.url,
+        accessPolicy: "open",
+        allowFrom: [],
+        sendThinkingMessage: false,
+        reconnectBaseMs: 20,
+        maxReconnectAttempts: 2
+      },
+      gateway,
+      callbacks: {
+        onSessionUpsert: async (session) => {
+          gateway.upsertSession(session);
+        },
+        onUserMessage: async () => undefined,
+        onSessionStatus: async () => undefined,
+        onEnsureSessionStream: async () => undefined,
+        getLastEventSeq: () => 0,
+        onStatusChange: () => undefined
+      }
+    });
+
+    await bridge.start();
+    try {
+      const connection = await server.connected;
+      for (const action of ["sessions.messages", "sessions.events", "sessions.snapshot"] as const) {
+        connection.socket.send(
+          JSON.stringify({
+            req_id: `rpc-missing-${action}`,
+            action,
+            status: "request",
+            data: { session_id: "deleted-session" }
+          })
+        );
+      }
+
+      await waitFor(() => {
+        for (const action of ["sessions.messages", "sessions.events", "sessions.snapshot"] as const) {
+          expect(frameByReq(server.frames, `rpc-missing-${action}`)).toMatchObject({
+            action,
+            status: "error",
+            data: {
+              code: "NOT_FOUND"
+            }
+          });
+        }
+      });
+    } finally {
+      await bridge.stop();
+    }
+  });
+
+  it("does not convert gateway session-list failures into NOT_FOUND history RPCs", async () => {
+    const stateDir = await mkdtemp(join(tmpdir(), "claw-53aihub-rpc-list-failure-"));
+    cleanupPaths.push(stateDir);
+
+    const server = await createFakeHubServer();
+    cleanupServers.push(server.close);
+
+    const gateway = new FakeGateway();
+    gateway.failListSessionPageMessage = "gateway unavailable";
+
+    const bridge = createHub53AIBridge({
+      stateDir,
+      config: {
+        enabled: true,
+        botId: "bot-123",
+        secret: "sk-secret",
+        wsUrl: server.url,
+        accessPolicy: "open",
+        allowFrom: [],
+        sendThinkingMessage: false,
+        reconnectBaseMs: 20,
+        maxReconnectAttempts: 2
+      },
+      gateway,
+      callbacks: {
+        onSessionUpsert: async (session) => {
+          gateway.upsertSession(session);
+        },
+        onUserMessage: async () => undefined,
+        onSessionStatus: async () => undefined,
+        onEnsureSessionStream: async () => undefined,
+        getLastEventSeq: () => 0,
+        onStatusChange: () => undefined
+      }
+    });
+
+    await bridge.start();
+    try {
+      const connection = await server.connected;
+      connection.socket.send(
+        JSON.stringify({
+          req_id: "rpc-list-failure-messages",
+          action: "sessions.messages",
+          status: "request",
+          data: { session_id: "possibly-existing-session" }
+        })
+      );
+
+      await waitFor(() => {
+        expect(frameByReq(server.frames, "rpc-list-failure-messages")).toMatchObject({
+          action: "sessions.messages",
+          status: "error"
+        });
+        expect(frameByReq(server.frames, "rpc-list-failure-messages")?.data).not.toMatchObject({
+          code: "NOT_FOUND"
+        });
+      });
+    } finally {
+      await bridge.stop();
+    }
+  });
 });
 
 class FakeGateway {
@@ -9810,11 +10327,13 @@ class FakeGateway {
   eventsToEmit?: GatewayEvent[];
   disconnectOnNextSend = false;
   disconnectCompletionDelayMs = 0;
+  failNextAttachmentSendMessage = "";
   beforeEmit?: (sessionId: string) => void | Promise<void>;
   createdTitles: string[] = [];
   renames: Array<{ sessionId: string; title: string }> = [];
   controls: Array<{ sessionId: string; action: string }> = [];
   private createTitleFailures = new Map<string, string>();
+  failListSessionPageMessage = "";
   sessionPage?: { sessions: GatewaySession[]; pagination: { limit: number; offset: number; total?: number; hasMore: boolean } };
   messagesBySession = new Map<string, SessionMessage[]>();
   eventsBySession = new Map<string, GatewayEvent[]>();
@@ -9829,14 +10348,46 @@ class FakeGateway {
     return [...this.sessions.values()];
   }
 
-  async listSessionPage(): Promise<{ sessions: GatewaySession[]; pagination: { limit: number; offset: number; total?: number; hasMore: boolean } }> {
-    return this.sessionPage ?? {
-      sessions: [...this.sessions.values()],
+  async listSessionPage(options: { limit?: number; offset?: number } = {}): Promise<{
+    sessions: GatewaySession[];
+    pagination: { limit: number; offset: number; total?: number; hasMore: boolean; nextOffset?: number };
+  }> {
+    if (this.failListSessionPageMessage) {
+      const message = this.failListSessionPageMessage;
+      this.failListSessionPageMessage = "";
+      throw new Error(message);
+    }
+    if (this.sessionPage) {
+      return this.sessionPage;
+    }
+    const allSessions = [...this.sessions.values()];
+    const knownSessionIds = new Set(allSessions.map((session) => session.id));
+    for (const sessionId of new Set([...this.messagesBySession.keys(), ...this.eventsBySession.keys()])) {
+      if (knownSessionIds.has(sessionId)) continue;
+      knownSessionIds.add(sessionId);
+      allSessions.push({
+        id: sessionId,
+        title: sessionId,
+        status: "idle",
+        hostKind: "qclaw",
+        runnerCommand: "gateway",
+        createdAt: "2026-05-20T10:00:00.000Z",
+        updatedAt: "2026-05-20T10:00:00.000Z",
+        lastEventSeq: 0
+      });
+    }
+    const offset = Math.max(0, options.offset ?? 0);
+    const limit = Math.max(1, options.limit ?? (allSessions.length || 1));
+    const sessions = allSessions.slice(offset, offset + limit);
+    const hasMore = offset + sessions.length < allSessions.length;
+    return {
+      sessions,
       pagination: {
-        limit: this.sessions.size,
-        offset: 0,
-        total: this.sessions.size,
-        hasMore: false
+        limit,
+        offset,
+        total: allSessions.length,
+        hasMore,
+        ...(hasMore ? { nextOffset: offset + sessions.length } : {})
       }
     };
   }
@@ -9892,6 +10443,11 @@ class FakeGateway {
   }
 
   async sendMessage(sessionId: string, content: string, options: { attachments?: any[] } = {}): Promise<void> {
+    if (options.attachments?.length && this.failNextAttachmentSendMessage) {
+      const message = this.failNextAttachmentSendMessage;
+      this.failNextAttachmentSendMessage = "";
+      throw new Error(message);
+    }
     this.sentMessages.push({
       sessionId,
       content,
