@@ -6262,9 +6262,6 @@ export function createHub53AIBridge(input: HubBridgeInput) {
     sessionId: string,
     eventScope: GatewayEventScope
   ) {
-    if (eventScope.localOutputFilesSent) {
-      return;
-    }
     const localOutputRuntime = {
       config: input.config,
       configPath: input.configPath,
@@ -6337,11 +6334,11 @@ export function createHub53AIBridge(input: HubBridgeInput) {
     }
 
     const freshFiles = files.filter((file) => {
-      const key = getOutputFileEmissionKey(file);
-      if (key && eventScope.emittedOutputFileKeys.has(key)) {
+      const keys = getOutputFileEmissionKeys(file);
+      if (keys.some((key) => eventScope.emittedOutputFileKeys.has(key))) {
         return false;
       }
-      if (key) {
+      for (const key of keys) {
         eventScope.emittedOutputFileKeys.add(key);
       }
       return true;
@@ -6508,11 +6505,11 @@ export function createHub53AIBridge(input: HubBridgeInput) {
       return false;
     }
     const freshFiles = files.filter((file) => {
-      const key = getOutputFileEmissionKey(file);
-      if (key && eventScope.emittedOutputFileKeys.has(key)) {
+      const keys = getOutputFileEmissionKeys(file);
+      if (keys.some((key) => eventScope.emittedOutputFileKeys.has(key))) {
         return false;
       }
-      if (key) {
+      for (const key of keys) {
         eventScope.emittedOutputFileKeys.add(key);
       }
       return true;
@@ -8023,14 +8020,44 @@ function getOutputFileEmissionKey(file: Hub53AIOutputFile): string {
   return `snapshot:${createHash("sha256").update(parts.join("\0")).digest("hex").slice(0, 24)}`;
 }
 
+function getOutputFileEmissionKeys(file: Hub53AIOutputFile): string[] {
+  const keys = new Set<string>();
+  const primaryKey = getOutputFileEmissionKey(file);
+  if (primaryKey) {
+    keys.add(primaryKey);
+  }
+
+  const fileName = typeof file.file_name === "string" ? file.file_name.trim() : "";
+  const sha256 = typeof file.sha256 === "string" ? file.sha256.trim().toLowerCase() : "";
+  const contentFingerprint = getOutputFileContentFingerprint(file);
+  const size = typeof file.size === "number" && Number.isFinite(file.size) ? String(file.size) : "";
+  if (fileName && sha256) {
+    keys.add(`logical:${fileName}:sha256:${sha256}`);
+  }
+  if (fileName && contentFingerprint) {
+    keys.add(`logical:${fileName}:content:${contentFingerprint}`);
+  }
+  if (fileName && size && (sha256 || contentFingerprint)) {
+    keys.add(`logical:${fileName}:size:${size}:${sha256 || contentFingerprint}`);
+  }
+  return [...keys];
+}
+
 function getOutputFileContentFingerprint(file: Hub53AIOutputFile): string {
   const base64 = typeof file.base64 === "string" ? file.base64 : "";
   if (base64) {
-    return createHash("sha256").update("base64\0").update(base64).digest("hex").slice(0, 24);
+    try {
+      const bytes = Buffer.from(base64, "base64");
+      if (bytes.length) {
+        return createHash("sha256").update("bytes\0").update(bytes).digest("hex").slice(0, 24);
+      }
+    } catch {
+      return createHash("sha256").update("base64\0").update(base64).digest("hex").slice(0, 24);
+    }
   }
   const content = typeof file.content === "string" ? file.content : "";
   if (content) {
-    return createHash("sha256").update("content\0").update(content).digest("hex").slice(0, 24);
+    return createHash("sha256").update("bytes\0").update(Buffer.from(content, "utf8")).digest("hex").slice(0, 24);
   }
   return "";
 }

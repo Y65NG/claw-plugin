@@ -2458,6 +2458,277 @@ describe("53AIHub client", () => {
     }
   });
 
+  it("emits the final local file revision after an earlier write output was sent", async () => {
+    const stateDir = await mkdtemp(join(tmpdir(), "claw-53aihub-"));
+    cleanupPaths.push(stateDir);
+    const workspaceDir = join(stateDir, "workspace");
+    const reportPath = join(workspaceDir, "revision.txt");
+    await mkdir(workspaceDir, { recursive: true });
+
+    const server = await createFakeHubServer();
+    cleanupServers.push(server.close);
+    const gateway = new FakeGateway();
+    gateway.beforeEmit = async () => {
+      await writeFile(reportPath, "final revision");
+    };
+    gateway.eventsToEmit = [
+      {
+        id: "evt-started",
+        sessionId: "session-1",
+        seq: 1,
+        kind: "run.started",
+        payload: { runId: "run-edit-file" },
+        createdAt: new Date().toISOString()
+      },
+      {
+        id: "evt-write-call",
+        sessionId: "session-1",
+        seq: 2,
+        kind: "tool.call",
+        payload: {
+          runId: "run-edit-file",
+          data: {
+            name: "write",
+            toolCallId: "tool-write-revision",
+            args: {
+              path: reportPath,
+              content: "draft revision"
+            }
+          }
+        },
+        createdAt: new Date().toISOString()
+      },
+      {
+        id: "evt-write-result",
+        sessionId: "session-1",
+        seq: 3,
+        kind: "tool.result",
+        payload: {
+          runId: "run-edit-file",
+          data: {
+            name: "write",
+            toolCallId: "tool-write-revision",
+            isError: false
+          }
+        },
+        createdAt: new Date().toISOString()
+      },
+      {
+        id: "evt-completed",
+        sessionId: "session-1",
+        seq: 4,
+        kind: "run.completed",
+        payload: { runId: "run-edit-file", status: "completed" },
+        createdAt: new Date().toISOString()
+      }
+    ];
+
+    const bridge = createHub53AIBridge({
+      stateDir,
+      configPath: join(stateDir, "openclaw.json"),
+      config: {
+        enabled: true,
+        botId: "bot-123",
+        secret: "sk-secret",
+        wsUrl: server.url,
+        accessPolicy: "open",
+        allowFrom: [],
+        sendThinkingMessage: false,
+        reconnectBaseMs: 20,
+        maxReconnectAttempts: 2,
+        detectCreatedFiles: true,
+        fileWorkspaceDirs: [workspaceDir],
+        createdFilesMaxFileBytes: 1024,
+        createdFilesMaxCount: 5
+      },
+      gateway,
+      callbacks: {
+        onSessionUpsert: async (session) => {
+          gateway.upsertSession(session);
+        },
+        onUserMessage: async () => undefined,
+        onSessionStatus: async () => undefined,
+        onEnsureSessionStream: async () => undefined,
+        getLastEventSeq: () => 0,
+        onStatusChange: () => undefined
+      }
+    });
+
+    await bridge.start();
+    try {
+      const connection = await server.connected;
+      connection.socket.send(
+        JSON.stringify({
+          req_id: "req-final-file-revision",
+          action: "chat",
+          data: {
+            user: "user-a",
+            conversation_id: "chat-final-file-revision",
+            messages: [{ role: "user", content: "创建并修正本地文件" }]
+          }
+        })
+      );
+
+      await waitFor(() => {
+        const outputSteps = server.frames.filter(
+          (frame) =>
+            frame.req_id === "req-final-file-revision" &&
+            frame.action === "chat" &&
+            frame.data?.object === "process.step" &&
+            frame.data.process_step?.step_code === "output_files"
+        );
+        expect(outputSteps.length).toBeGreaterThanOrEqual(2);
+        expect(outputSteps[0]!.data.process_step.data.files[0]).toMatchObject({
+          file_name: "revision.txt",
+          content: "draft revision"
+        });
+        expect(outputSteps.at(-1)!.data.process_step.data.files[0]).toMatchObject({
+          file_name: "revision.txt",
+          base64: Buffer.from("final revision").toString("base64")
+        });
+      });
+    } finally {
+      await bridge.stop();
+    }
+  });
+
+  it("does not re-emit an unchanged local file revision after write output", async () => {
+    const stateDir = await mkdtemp(join(tmpdir(), "claw-53aihub-"));
+    cleanupPaths.push(stateDir);
+    const workspaceDir = join(stateDir, "workspace");
+    const reportPath = join(workspaceDir, "unchanged.txt");
+    await mkdir(workspaceDir, { recursive: true });
+
+    const server = await createFakeHubServer();
+    cleanupServers.push(server.close);
+    const gateway = new FakeGateway();
+    gateway.beforeEmit = async () => {
+      await writeFile(reportPath, "same revision");
+    };
+    gateway.eventsToEmit = [
+      {
+        id: "evt-started",
+        sessionId: "session-1",
+        seq: 1,
+        kind: "run.started",
+        payload: { runId: "run-same-file" },
+        createdAt: new Date().toISOString()
+      },
+      {
+        id: "evt-write-call",
+        sessionId: "session-1",
+        seq: 2,
+        kind: "tool.call",
+        payload: {
+          runId: "run-same-file",
+          data: {
+            name: "write",
+            toolCallId: "tool-write-same",
+            args: {
+              path: reportPath,
+              content: "same revision"
+            }
+          }
+        },
+        createdAt: new Date().toISOString()
+      },
+      {
+        id: "evt-write-result",
+        sessionId: "session-1",
+        seq: 3,
+        kind: "tool.result",
+        payload: {
+          runId: "run-same-file",
+          data: {
+            name: "write",
+            toolCallId: "tool-write-same",
+            isError: false
+          }
+        },
+        createdAt: new Date().toISOString()
+      },
+      {
+        id: "evt-completed",
+        sessionId: "session-1",
+        seq: 4,
+        kind: "run.completed",
+        payload: { runId: "run-same-file", status: "completed" },
+        createdAt: new Date().toISOString()
+      }
+    ];
+
+    const bridge = createHub53AIBridge({
+      stateDir,
+      configPath: join(stateDir, "openclaw.json"),
+      config: {
+        enabled: true,
+        botId: "bot-123",
+        secret: "sk-secret",
+        wsUrl: server.url,
+        accessPolicy: "open",
+        allowFrom: [],
+        sendThinkingMessage: false,
+        reconnectBaseMs: 20,
+        maxReconnectAttempts: 2,
+        detectCreatedFiles: true,
+        fileWorkspaceDirs: [workspaceDir],
+        createdFilesMaxFileBytes: 1024,
+        createdFilesMaxCount: 5
+      },
+      gateway,
+      callbacks: {
+        onSessionUpsert: async (session) => {
+          gateway.upsertSession(session);
+        },
+        onUserMessage: async () => undefined,
+        onSessionStatus: async () => undefined,
+        onEnsureSessionStream: async () => undefined,
+        getLastEventSeq: () => 0,
+        onStatusChange: () => undefined
+      }
+    });
+
+    await bridge.start();
+    try {
+      const connection = await server.connected;
+      connection.socket.send(
+        JSON.stringify({
+          req_id: "req-unchanged-file-revision",
+          action: "chat",
+          data: {
+            user: "user-a",
+            conversation_id: "chat-unchanged-file-revision",
+            messages: [{ role: "user", content: "创建本地文件" }]
+          }
+        })
+      );
+
+      await waitFor(() => {
+        const doneFrame = server.frames.find(
+          (frame) =>
+            frame.req_id === "req-unchanged-file-revision" &&
+            frame.action === "chat" &&
+            frame.status === "done"
+        );
+        expect(doneFrame).toBeTruthy();
+      });
+      const outputSteps = server.frames.filter(
+        (frame) =>
+          frame.req_id === "req-unchanged-file-revision" &&
+          frame.action === "chat" &&
+          frame.data?.object === "process.step" &&
+          frame.data.process_step?.step_code === "output_files"
+      );
+      expect(outputSteps).toHaveLength(1);
+      expect(outputSteps[0]!.data.process_step.data.files[0]).toMatchObject({
+        file_name: "unchanged.txt",
+        content: "same revision"
+      });
+    } finally {
+      await bridge.stop();
+    }
+  });
+
   it("emits manifest output_files and skips legacy workspace scan when the manifest matches", async () => {
     const stateDir = await mkdtemp(join(tmpdir(), "claw-53aihub-"));
     cleanupPaths.push(stateDir);
