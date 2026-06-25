@@ -10,6 +10,7 @@ import type {
   GatewayEvent,
   GatewayMessageAttachment,
   GatewayRuntimeInfo,
+  GatewaySessionPage,
   GatewaySession
 } from "./gateway-client";
 import {
@@ -391,6 +392,8 @@ const CANONICAL_MESSAGE_PAGE_SEQ_WINDOW_AFTER = 160;
 const PERSIST_STATE_DEBOUNCE_MS = 300;
 const OPENCLAW_ORPHAN_RUNNING_TURN_TERMINAL_MS = 30_000;
 const RUN_WAIT_TIMEOUT_MS = 30 * 60 * 1000;
+const HUB_SESSION_VALIDATION_PAGE_LIMIT = 50;
+const HUB_SESSION_VALIDATION_MAX_PAGES = 100;
 const HUB_SESSION_TITLE_PREFIX = "53AI Hub-";
 const CONTROL_CENTER_SESSION_TITLE = "Claw Control Center";
 const HUB_TITLE_SUMMARY_LENGTH = 40;
@@ -742,6 +745,7 @@ export function createHub53AIBridge(input: HubBridgeInput) {
     if (request.action === "sessions.messages") {
       const payload = toRecord(request.data);
       const sessionId = readRPCSessionId(payload);
+      await ensureKnownGatewaySession(sessionId);
       const pagination = readRPCPagination(payload, 100);
       const requestedFetchLimit = pagination.offset + pagination.limit;
       const fetchLimit = requestedFetchLimit + MAX_SESSION_MESSAGE_TURN_BOUNDARY_OVERSCAN;
@@ -770,6 +774,7 @@ export function createHub53AIBridge(input: HubBridgeInput) {
     if (request.action === "sessions.events") {
       const payload = toRecord(request.data);
       const sessionId = readRPCSessionId(payload);
+      await ensureKnownGatewaySession(sessionId);
       const pagination = readRPCPagination(payload, 100);
       const afterSeq = readRPCAfterSeq(payload);
       const events = (await listSessionEvents(sessionId)).filter((event) => event.seq > afterSeq);
@@ -786,6 +791,7 @@ export function createHub53AIBridge(input: HubBridgeInput) {
     if (request.action === "sessions.snapshot") {
       const payload = toRecord(request.data);
       const sessionId = readRPCSessionId(payload);
+      await ensureKnownGatewaySession(sessionId);
       const afterSeq = readRPCAfterSeq(payload);
       await ensureCanonicalLedgerBackfill(sessionId);
       return buildOpenClawSessionSnapshot(sessionId, listCanonicalLedgerEvents(sessionId), afterSeq);
@@ -847,6 +853,33 @@ export function createHub53AIBridge(input: HubBridgeInput) {
     }
 
     throw new HubRPCError("FEATURE_NOT_AVAILABLE", `Unsupported RPC action: ${request.action}`);
+  }
+
+  async function ensureKnownGatewaySession(sessionId: string): Promise<void> {
+    let offset = 0;
+    for (let pageIndex = 0; pageIndex < HUB_SESSION_VALIDATION_MAX_PAGES; pageIndex += 1) {
+      const page: GatewaySessionPage = await input.gateway.listSessionPage({
+        limit: HUB_SESSION_VALIDATION_PAGE_LIMIT,
+        offset
+      });
+      if (page.sessions.some((session) => session.id === sessionId)) {
+        return;
+      }
+      if (!page.pagination?.hasMore) {
+        throw new HubRPCError("NOT_FOUND", `OpenClaw session not found: ${sessionId}`);
+      }
+      const nextOffset = page.pagination.nextOffset;
+      if (typeof nextOffset === "number" && nextOffset > offset) {
+        offset = nextOffset;
+        continue;
+      }
+      if (page.sessions.length > 0) {
+        offset += page.sessions.length;
+        continue;
+      }
+      break;
+    }
+    throw new HubRPCError("NOT_FOUND", `OpenClaw session not found: ${sessionId}`);
   }
 
   async function listSessionEvents(sessionId: string): Promise<TimelineEvent[]> {
@@ -2498,8 +2531,8 @@ export function createHub53AIBridge(input: HubBridgeInput) {
     let sessionId = "";
     try {
       const session = await resolveSession(message);
-      const preparedMessage = await prepareIncomingFiles(message);
-      const messageAttachments = await buildGatewayMessageAttachments(preparedMessage);
+      const preparedMessage = await prepareIncomingFilesWithPromptFallback(message);
+      const messageAttachments = await buildGatewayMessageAttachmentsWithPromptFallback(preparedMessage);
       const requestIdentity = message.clientMessageId || message.reqId;
       const turnId = buildOpenClawTimelineTurnId(session.id, requestIdentity);
       const outputManifestPath = resolveLocalOutputManifestPath({
@@ -2607,7 +2640,7 @@ export function createHub53AIBridge(input: HubBridgeInput) {
         }
       });
 
-      await input.gateway.sendMessage(session.id, prompt, { attachments: messageAttachments });
+      await sendGatewayMessageWithAttachmentFallback(session.id, prompt, messageAttachments);
       await terminalPromise;
     } catch (error) {
       const messageText = error instanceof Error ? error.message : String(error);
@@ -2628,6 +2661,19 @@ export function createHub53AIBridge(input: HubBridgeInput) {
       }
       clearTerminalResolver(message.reqId);
       lastReplyByReq.delete(message.reqId);
+    }
+  }
+
+  async function prepareIncomingFilesWithPromptFallback(message: Hub53AIIncomingMessage): Promise<Hub53AIIncomingMessage> {
+    try {
+      return await prepareIncomingFiles(message);
+    } catch (error) {
+      input.logger?.warn?.(
+        `[53aihub] failed to prepare input files; continuing with runtime prompt context fallback: ${
+          error instanceof Error ? error.message : String(error)
+        }`
+      );
+      return message;
     }
   }
 
@@ -2689,6 +2735,21 @@ export function createHub53AIBridge(input: HubBridgeInput) {
     return targetPath;
   }
 
+  async function buildGatewayMessageAttachmentsWithPromptFallback(
+    message: Hub53AIIncomingMessage
+  ): Promise<GatewayMessageAttachment[]> {
+    try {
+      return await buildGatewayMessageAttachments(message);
+    } catch (error) {
+      input.logger?.warn?.(
+        `[53aihub] failed to build native attachments; continuing with runtime prompt context fallback: ${
+          error instanceof Error ? error.message : String(error)
+        }`
+      );
+      return [];
+    }
+  }
+
   async function buildGatewayMessageAttachments(message: Hub53AIIncomingMessage): Promise<GatewayMessageAttachment[]> {
     const attachments: GatewayMessageAttachment[] = [];
     for (const file of message.files ?? []) {
@@ -2711,6 +2772,36 @@ export function createHub53AIBridge(input: HubBridgeInput) {
       }
     }
     return attachments;
+  }
+
+  async function sendGatewayMessageWithAttachmentFallback(
+    sessionId: string,
+    prompt: string,
+    attachments: GatewayMessageAttachment[]
+  ): Promise<void> {
+    if (!attachments.length) {
+      await input.gateway.sendMessage(sessionId, prompt);
+      return;
+    }
+
+    try {
+      await input.gateway.sendMessage(sessionId, prompt, { attachments });
+    } catch (error) {
+      if (!isNativeAttachmentSendError(error)) {
+        throw error;
+      }
+      input.logger?.warn?.(
+        `[53aihub] native attachment send failed; retrying with runtime prompt context fallback: ${
+          error instanceof Error ? error.message : String(error)
+        }`
+      );
+      await input.gateway.sendMessage(sessionId, prompt);
+    }
+  }
+
+  function isNativeAttachmentSendError(error: unknown): boolean {
+    const message = error instanceof Error ? error.message : String(error || "");
+    return /attachment|attached|file|base64|payload|request entity too large|body too large|unsupported/i.test(message);
   }
 
   function resolveHubHTTPURL(rawURL: string): URL {
