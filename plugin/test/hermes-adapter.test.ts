@@ -994,4 +994,273 @@ asyncio.run(main())
       chat_id: "chat-1"
     });
   });
+
+  it("returns OpenClaw ledger events and snapshots for Hermes history recovery", async () => {
+    const adapterPath = join(__dirname, "..", "hermes", "platforms", "53aihub", "adapter.py");
+    const script = String.raw`
+import asyncio
+import importlib.util
+import json
+import sys
+import tempfile
+import types
+
+gateway = types.ModuleType("gateway")
+gateway_config = types.ModuleType("gateway.config")
+gateway_platforms = types.ModuleType("gateway.platforms")
+gateway_base = types.ModuleType("gateway.platforms.base")
+
+class Platform(str):
+    def __new__(cls, value):
+        return str.__new__(cls, value)
+
+class HomeChannel:
+    def __init__(self, **kwargs):
+        self.__dict__.update(kwargs)
+
+class PlatformConfig:
+    def __init__(self, extra=None, enabled=True):
+        self.extra = extra or {}
+        self.enabled = enabled
+        self.home_channel = None
+
+class SendResult:
+    def __init__(self, success=True, message_id=None, error=None):
+        self.success = success
+        self.message_id = message_id
+        self.error = error
+
+class BasePlatformAdapter:
+    SUPPORTS_MESSAGE_EDITING = True
+    def __init__(self, config=None, platform=None):
+        self.config = config
+        self.platform = platform
+    def build_source(self, **kwargs):
+        return kwargs
+    async def handle_message(self, event):
+        return None
+
+class MessageType:
+    TEXT = "text"
+
+class MessageEvent:
+    def __init__(self, **kwargs):
+        self.__dict__.update(kwargs)
+
+gateway_config.HomeChannel = HomeChannel
+gateway_config.Platform = Platform
+gateway_config.PlatformConfig = PlatformConfig
+gateway_base.BasePlatformAdapter = BasePlatformAdapter
+gateway_base.MessageEvent = MessageEvent
+gateway_base.MessageType = MessageType
+gateway_base.SendResult = SendResult
+sys.modules["gateway"] = gateway
+sys.modules["gateway.config"] = gateway_config
+sys.modules["gateway.platforms"] = gateway_platforms
+sys.modules["gateway.platforms.base"] = gateway_base
+
+spec = importlib.util.spec_from_file_location("adapter_under_test", sys.argv[1])
+module = importlib.util.module_from_spec(spec)
+assert spec.loader is not None
+spec.loader.exec_module(module)
+
+async def main():
+    state_path = tempfile.NamedTemporaryFile(delete=True).name
+    adapter = module.Hermes53AIHubAdapter(PlatformConfig(extra={
+        "bot_id": "bot",
+        "secret": "secret",
+        "ws_url": "ws://example.test/connect",
+        "state_path": state_path,
+    }))
+    frames = []
+
+    async def fake_send_or_queue(frame):
+        frames.append(frame)
+
+    adapter._send_or_queue = fake_send_or_queue
+    await adapter._upsert_conversation("chat-1", "53AI Hub-Y65NG：天气", "req-1", "Y65NG")
+    await adapter._record_user_message("chat-1", "user-1", "查询天气", {"raw": {}})
+    await adapter._record_event("chat-1", "user.message", {"message_id": "user-1", "content": "查询天气"})
+    await adapter.send("chat-1", "天气晴朗，注意补水。")
+
+    await adapter._upsert_conversation("chat-2", "53AI Hub-Y65NG：长任务", "req-2", "Y65NG")
+    await adapter._record_user_message("chat-2", "user-2", "执行长任务", {"raw": {}})
+    await adapter._record_event("chat-2", "user.message", {"message_id": "user-2", "content": "执行长任务"})
+    await adapter.send_or_update_status("chat-2", "provider", "正在执行")
+
+    messages = await adapter._resolve_rpc("sessions.messages", {"session_id": "agent:main:53aihub:dm:chat-1"})
+    events = await adapter._resolve_rpc("sessions.events", {"session_id": "agent:main:53aihub:dm:chat-1"})
+    completed_snapshot = await adapter._resolve_rpc("sessions.snapshot", {"session_id": "agent:main:53aihub:dm:chat-1"})
+    running_snapshot = await adapter._resolve_rpc("sessions.snapshot", {"session_id": "agent:main:53aihub:dm:chat-2"})
+
+    print(json.dumps({
+        "frame": frames[-2],
+        "messages": messages,
+        "events": events,
+        "completed_snapshot": completed_snapshot,
+        "running_snapshot": running_snapshot,
+    }))
+
+asyncio.run(main())
+`;
+    const { stdout } = await execFileAsync("python3", ["-c", script, adapterPath], {
+      maxBuffer: 1024 * 1024
+    });
+    const result = JSON.parse(stdout.trim());
+
+    const finalFrameLedger = result.frame.data.payload.openclaw_ledger;
+    expect(finalFrameLedger.protocol_version).toBe("openclaw.ledger.v1");
+    expect(finalFrameLedger.terminal_status).toBe("completed");
+    expect(finalFrameLedger.text).toBe("天气晴朗，注意补水。");
+    expect(result.messages.ledger_events.map((event: { protocol_version: string }) => event.protocol_version)).toContain("openclaw.ledger.v1");
+    expect(result.events.ledger_events.some((event: { terminal_status?: string }) => event.terminal_status === "completed")).toBe(true);
+    expect(result.completed_snapshot.active_turns).toEqual([]);
+    expect(result.completed_snapshot.recent_events.some((event: { text?: string }) => event.text === "天气晴朗，注意补水。")).toBe(true);
+    expect(result.running_snapshot.active_turns).toHaveLength(1);
+    expect(result.running_snapshot.active_turns[0]).toMatchObject({
+      active_request_id: "req-2",
+      status: "running"
+    });
+  });
+
+  it("delivers Hermes attachments as OpenClaw output_files process steps", async () => {
+    const adapterPath = join(__dirname, "..", "hermes", "platforms", "53aihub", "adapter.py");
+    const script = String.raw`
+import asyncio
+import importlib.util
+import json
+import sys
+import tempfile
+import types
+from pathlib import Path
+from urllib.parse import quote
+
+gateway = types.ModuleType("gateway")
+gateway_config = types.ModuleType("gateway.config")
+gateway_platforms = types.ModuleType("gateway.platforms")
+gateway_base = types.ModuleType("gateway.platforms.base")
+
+class Platform(str):
+    def __new__(cls, value):
+        return str.__new__(cls, value)
+
+class HomeChannel:
+    def __init__(self, **kwargs):
+        self.__dict__.update(kwargs)
+
+class PlatformConfig:
+    def __init__(self, extra=None, enabled=True):
+        self.extra = extra or {}
+        self.enabled = enabled
+        self.home_channel = None
+
+class SendResult:
+    def __init__(self, success=True, message_id=None, error=None):
+        self.success = success
+        self.message_id = message_id
+        self.error = error
+
+class BasePlatformAdapter:
+    SUPPORTS_MESSAGE_EDITING = True
+    def __init__(self, config=None, platform=None):
+        self.config = config
+        self.platform = platform
+    def build_source(self, **kwargs):
+        return kwargs
+    async def handle_message(self, event):
+        return None
+
+class MessageType:
+    TEXT = "text"
+
+class MessageEvent:
+    def __init__(self, **kwargs):
+        self.__dict__.update(kwargs)
+
+gateway_config.HomeChannel = HomeChannel
+gateway_config.Platform = Platform
+gateway_config.PlatformConfig = PlatformConfig
+gateway_base.BasePlatformAdapter = BasePlatformAdapter
+gateway_base.MessageEvent = MessageEvent
+gateway_base.MessageType = MessageType
+gateway_base.SendResult = SendResult
+sys.modules["gateway"] = gateway
+sys.modules["gateway.config"] = gateway_config
+sys.modules["gateway.platforms"] = gateway_platforms
+sys.modules["gateway.platforms.base"] = gateway_base
+
+spec = importlib.util.spec_from_file_location("adapter_under_test", sys.argv[1])
+module = importlib.util.module_from_spec(spec)
+assert spec.loader is not None
+spec.loader.exec_module(module)
+
+async def main():
+    state_path = tempfile.NamedTemporaryFile(delete=True).name
+    adapter = module.Hermes53AIHubAdapter(PlatformConfig(extra={
+        "bot_id": "bot",
+        "secret": "secret",
+        "ws_url": "ws://example.test/api/v1/openclaw/ws/connect",
+        "state_path": state_path,
+    }))
+    frames = []
+
+    async def fake_send_or_queue(frame):
+        frames.append(frame)
+
+    adapter._send_or_queue = fake_send_or_queue
+    await adapter._upsert_conversation("chat-1", "53AI Hub-Y65NG：文件", "req-1", "Y65NG")
+
+    with tempfile.TemporaryDirectory() as tmp_dir:
+        report_path = Path(tmp_dir) / "report.md"
+        report_path.write_text("# Report\nHermes generated this file.\n", encoding="utf-8")
+        image_path = Path(tmp_dir) / "chart.png"
+        image_path.write_bytes(b"\x89PNG\r\n\x1a\n")
+
+        doc_result = await adapter.send_document("chat-1", str(report_path), caption="报告已生成", file_name="report.md")
+        await adapter.send_multiple_images("chat-1", [(f"file://{quote(str(image_path))}", "chart")])
+
+    events = await adapter._resolve_rpc("sessions.events", {"session_id": "agent:main:53aihub:dm:chat-1"})
+    print(json.dumps({
+        "doc_result": {
+            "success": doc_result.success,
+            "message_id": doc_result.message_id,
+            "error": doc_result.error,
+        },
+        "frames": frames,
+        "events": events,
+    }))
+
+asyncio.run(main())
+`;
+    const { stdout } = await execFileAsync("python3", ["-c", script, adapterPath], {
+      maxBuffer: 1024 * 1024
+    });
+    const result = JSON.parse(stdout.trim());
+
+    expect(result.doc_result.success).toBe(true);
+    expect(result.frames).toHaveLength(2);
+    const [docFrame, imageFrame] = result.frames;
+    expect(docFrame.data.object).toBe("process.step");
+    expect(docFrame.data.process_step.step_code).toBe("output_files");
+    expect(docFrame.data.process_step.data.files[0]).toMatchObject({
+      file_name: "report.md",
+      source_kind: "hermes_generated"
+    });
+    expect(docFrame.data.process_step.data.files[0].mime_type).toBeTruthy();
+    expect(docFrame.data.process_step.data.files[0].base64).toBeTruthy();
+    expect(docFrame.data.process_step.data.media_attachments[0].kind).toBe("file");
+    expect(docFrame.data.process_step.data.openclaw_timeline).toMatchObject({
+      protocol_version: "openclaw.timeline.v2",
+      segment_type: "output_files",
+      visibility: "final"
+    });
+    expect(docFrame.data.process_step.data.openclaw_ledger).toMatchObject({
+      protocol_version: "openclaw.ledger.v1",
+      part_type: "output_file",
+      event_type: "part.done",
+      visibility: "final"
+    });
+    expect(imageFrame.data.process_step.data.media_attachments[0].kind).toBe("image");
+    expect(result.events.ledger_events.some((event: { part_type?: string }) => event.part_type === "output_file")).toBe(true);
+  });
 });

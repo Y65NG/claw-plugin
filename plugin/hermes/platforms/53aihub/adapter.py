@@ -2,9 +2,12 @@ from __future__ import annotations
 
 import asyncio
 import base64
+import copy
+import hashlib
 import inspect
 import json
 import logging
+import mimetypes
 import os
 import re
 import time
@@ -12,6 +15,7 @@ import uuid
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Dict, List, Optional
+from urllib.parse import unquote, urlparse, urlunparse
 
 from gateway.config import HomeChannel, Platform, PlatformConfig
 from gateway.platforms.base import BasePlatformAdapter, MessageEvent, MessageType, SendResult
@@ -33,6 +37,7 @@ HEARTBEAT_INTERVAL_SECONDS = 30
 RECONNECT_BASE_SECONDS = 2
 RECONNECT_MAX_SECONDS = 30
 MAX_STORED_OUTBOX = 200
+MAX_OUTPUT_FILE_INLINE_BYTES = 512 * 1024
 HOME_CHANNEL_ENV = "HUB53AI_HOME_CHANNEL"
 HOME_CHANNEL_THREAD_ENV = "HUB53AI_HOME_CHANNEL_THREAD_ID"
 
@@ -41,6 +46,7 @@ RPC_ACTIONS = {
     "sessions.current",
     "sessions.messages",
     "sessions.events",
+    "sessions.snapshot",
     "sessions.control",
     "runtime.get",
     "cron.tasks",
@@ -88,6 +94,14 @@ def _string_or(*values: Any) -> str:
         if isinstance(value, (int, float)):
             return str(value)
     return ""
+
+
+def _int_or(value: Any, default: int) -> int:
+    try:
+        parsed = int(value)
+    except (TypeError, ValueError):
+        return default
+    return parsed if parsed > 0 else default
 
 
 def _coerce_text(content: Any) -> str:
@@ -242,6 +256,15 @@ class Hermes53AIHubAdapter(BasePlatformAdapter):
         self.bot_id = _string_or(extra.get("bot_id"), extra.get("hub_bot_id"), os.getenv("HUB53AI_BOT_ID"))
         self.secret = _string_or(extra.get("secret"), extra.get("hub_secret"), os.getenv("HUB53AI_SECRET"))
         self.ws_url = _string_or(extra.get("ws_url"), extra.get("hub_ws_url"), os.getenv("HUB53AI_WS_URL"))
+        self.artifact_upload_url = _string_or(
+            extra.get("artifact_upload_url"),
+            extra.get("hub_artifact_upload_url"),
+            os.getenv("HUB53AI_ARTIFACT_UPLOAD_URL"),
+        )
+        self.inline_file_max_bytes = _int_or(
+            _string_or(extra.get("inline_file_max_bytes"), os.getenv("HUB53AI_INLINE_FILE_MAX_BYTES")),
+            MAX_OUTPUT_FILE_INLINE_BYTES,
+        )
         state_path = _string_or(extra.get("state_path"), os.getenv("HUB53AI_STATE_PATH"))
         self.state_path = Path(state_path) if state_path else Path(get_hermes_home()) / STATE_FILENAME
         self._session: Any = None
@@ -330,10 +353,19 @@ class Hermes53AIHubAdapter(BasePlatformAdapter):
 
         status = "streaming" if streaming else self._terminal_send_status(final_content)
         await self._record_assistant_message(chat_id, message_id, final_content)
-        await self._send_chat_chunk(chat_id, final_content, status=status, message_id=message_id, replace=False)
+        event_payload: Optional[Dict[str, Any]] = None
         if not streaming:
             event_kind = "run.failed" if status == "error" else "run.completed"
-            await self._record_event(chat_id, event_kind, {"message_id": message_id, "content": final_content})
+            event = await self._record_event(chat_id, event_kind, {"message_id": message_id, "content": final_content})
+            event_payload = _as_dict(event.get("payload"))
+        await self._send_chat_chunk(
+            chat_id,
+            final_content,
+            status=status,
+            message_id=message_id,
+            replace=False,
+            payload=event_payload,
+        )
         return SendResult(success=True, message_id=message_id)
 
     async def send_or_update_status(
@@ -383,16 +415,114 @@ class Hermes53AIHubAdapter(BasePlatformAdapter):
             )
 
         await self._record_assistant_message(chat_id, message_id, final_content, replace=True)
+        event_payload: Optional[Dict[str, Any]] = None
+        if finalize:
+            event = await self._record_event(
+                chat_id,
+                "run.completed",
+                {"ok": True, "message_id": message_id, "content": final_content},
+            )
+            event_payload = _as_dict(event.get("payload"))
         await self._send_chat_chunk(
             chat_id,
             final_content,
             status="done" if finalize else "streaming",
             message_id=message_id,
             replace=True,
+            payload=event_payload,
         )
-        if finalize:
-            await self._record_event(chat_id, "run.completed", {"ok": True})
         return SendResult(success=True, message_id=message_id)
+
+    async def send_document(
+        self,
+        chat_id: str,
+        file_path: str,
+        caption: Optional[str] = None,
+        file_name: Optional[str] = None,
+        reply_to: Optional[str] = None,
+        metadata: Optional[Dict[str, Any]] = None,
+        **kwargs,
+    ) -> SendResult:
+        return await self._send_single_output_file(
+            chat_id=chat_id,
+            file_path=file_path,
+            caption=caption,
+            file_name=file_name,
+            media_kind="file",
+            metadata=metadata,
+        )
+
+    async def send_image_file(
+        self,
+        chat_id: str,
+        image_path: str,
+        caption: Optional[str] = None,
+        reply_to: Optional[str] = None,
+        metadata: Optional[Dict[str, Any]] = None,
+        **kwargs,
+    ) -> SendResult:
+        return await self._send_single_output_file(
+            chat_id=chat_id,
+            file_path=image_path,
+            caption=caption,
+            media_kind="image",
+            metadata=metadata,
+        )
+
+    async def send_voice(
+        self,
+        chat_id: str,
+        audio_path: str,
+        caption: Optional[str] = None,
+        reply_to: Optional[str] = None,
+        metadata: Optional[Dict[str, Any]] = None,
+        **kwargs,
+    ) -> SendResult:
+        return await self._send_single_output_file(
+            chat_id=chat_id,
+            file_path=audio_path,
+            caption=caption,
+            media_kind="audio",
+            metadata=metadata,
+        )
+
+    async def send_video(
+        self,
+        chat_id: str,
+        video_path: str,
+        caption: Optional[str] = None,
+        reply_to: Optional[str] = None,
+        metadata: Optional[Dict[str, Any]] = None,
+        **kwargs,
+    ) -> SendResult:
+        return await self._send_single_output_file(
+            chat_id=chat_id,
+            file_path=video_path,
+            caption=caption,
+            media_kind="video",
+            metadata=metadata,
+        )
+
+    async def send_multiple_images(
+        self,
+        chat_id: str,
+        images: List[tuple[str, str]],
+        metadata: Optional[Dict[str, Any]] = None,
+        human_delay: float = 0.0,
+    ) -> None:
+        files: List[Dict[str, Any]] = []
+        errors: List[str] = []
+        for image_url, alt_text in images:
+            if human_delay > 0:
+                await asyncio.sleep(human_delay)
+            try:
+                files.append(await self._output_file_from_image_reference(chat_id, image_url, alt_text, metadata))
+            except Exception as exc:
+                errors.append(f"{image_url}: {exc}")
+        if files:
+            await self._send_output_files_step(chat_id, files, caption=None)
+        if errors:
+            logger.warning("53AIHub: failed to deliver %d Hermes image attachment(s): %s", len(errors), "; ".join(errors))
 
     async def get_chat_info(self, chat_id: str) -> Dict[str, Any]:
         session = await self._latest_conversation(chat_id)
@@ -528,11 +658,14 @@ class Hermes53AIHubAdapter(BasePlatformAdapter):
             limit, offset = self._pagination(record, 100)
             messages = await self._messages_for(chat_id)
             events = await self._events_for(chat_id, 0)
+            ledger_events = await self._ledger_events_for(chat_id, 0)
             page = self._slice_latest(messages, limit, offset)
             total = len(messages)
             return {
                 "messages": page,
                 "events": events,
+                "ledger_events": ledger_events,
+                "ledgerEvents": ledger_events,
                 "pagination": self._pagination_response(limit, offset, total, len(page)),
             }
         if action == "sessions.events":
@@ -541,11 +674,19 @@ class Hermes53AIHubAdapter(BasePlatformAdapter):
             limit, offset = self._pagination(record, 100)
             after_seq = int(record.get("after_seq") or record.get("afterSeq") or 0)
             events = await self._events_for(chat_id, after_seq)
+            ledger_events = await self._ledger_events_for(chat_id, after_seq)
             page = events[offset:offset + limit]
             return {
                 "events": page,
+                "ledger_events": ledger_events,
+                "ledgerEvents": ledger_events,
                 "pagination": self._pagination_response(limit, offset, len(events), len(page)),
             }
+        if action == "sessions.snapshot":
+            session_id = self._read_session_id(record)
+            chat_id = self._internal_chat_id(session_id)
+            after_seq = int(record.get("after_seq") or record.get("afterSeq") or 0)
+            return await self._session_snapshot(chat_id, after_seq)
         if action == "sessions.control":
             session_id = self._read_session_id(record)
             chat_id = self._internal_chat_id(session_id)
@@ -618,6 +759,21 @@ class Hermes53AIHubAdapter(BasePlatformAdapter):
             delta_content = "Used a tool"
         elif event_kind == "tool.result":
             delta_content = "Tool returned a result"
+        chunk_payload = payload
+        if chunk_payload is None:
+            chunk_payload = self._payload_with_openclaw_ledger(
+                chat_id,
+                self._event_kind_for_chunk_status(status, event_kind),
+                {
+                    "message_id": message_id,
+                    "content": content,
+                    "mode": "replace" if replace else "append",
+                    "replace": replace,
+                },
+                max(self._seq + 1, 1),
+                f"{chat_id}:chunk:{message_id}",
+                _now_iso(),
+            )
         frame = {
             "req_id": req_id,
             "action": "chat",
@@ -631,7 +787,7 @@ class Hermes53AIHubAdapter(BasePlatformAdapter):
                 "mode": "replace" if replace else "append",
                 "replace": replace,
                 **({"event_kind": event_kind} if event_kind else {}),
-                **({"payload": payload} if payload else {}),
+                **({"payload": chunk_payload} if chunk_payload else {}),
                 "session_id": session_id,
                 "conversation_id": session_id,
                 "chat_id": chat_id,
@@ -677,7 +833,7 @@ class Hermes53AIHubAdapter(BasePlatformAdapter):
                 event_kind = "tool.call"
                 event_payload = tool_payload
 
-        await self._record_event(chat_id, event_kind, event_payload)
+        event = await self._record_event(chat_id, event_kind, event_payload)
         await self._send_chat_chunk(
             chat_id,
             text,
@@ -685,8 +841,352 @@ class Hermes53AIHubAdapter(BasePlatformAdapter):
             message_id=message_id,
             replace=replace,
             event_kind=event_kind,
-            payload=event_payload,
+            payload=_as_dict(event.get("payload")),
         )
+
+    async def _send_single_output_file(
+        self,
+        *,
+        chat_id: str,
+        file_path: str,
+        caption: Optional[str],
+        media_kind: str,
+        file_name: Optional[str] = None,
+        metadata: Optional[Dict[str, Any]] = None,
+    ) -> SendResult:
+        try:
+            file = await self._build_local_output_file(
+                chat_id=chat_id,
+                file_path=file_path,
+                file_name=file_name,
+                media_kind=media_kind,
+                metadata=metadata,
+            )
+            return await self._send_output_files_step(chat_id, [file], caption=caption)
+        except Exception as exc:
+            logger.warning("53AIHub: failed to deliver Hermes output file %s: %s", file_path, exc)
+            return SendResult(success=False, error=str(exc))
+
+    async def _output_file_from_image_reference(
+        self,
+        chat_id: str,
+        image_url: str,
+        alt_text: str,
+        metadata: Optional[Dict[str, Any]],
+    ) -> Dict[str, Any]:
+        value = _string_or(image_url)
+        parsed = urlparse(value)
+        if parsed.scheme == "file":
+            path_value = unquote(parsed.path or "")
+            if parsed.netloc and not path_value.startswith("/"):
+                path_value = f"{parsed.netloc}/{path_value}"
+            return await self._build_local_output_file(
+                chat_id=chat_id,
+                file_path=path_value,
+                media_kind="image",
+                metadata=metadata,
+            )
+        if parsed.scheme in {"http", "https"}:
+            return self._build_remote_output_file(value, alt_text, "image")
+        if Path(value).expanduser().exists():
+            return await self._build_local_output_file(
+                chat_id=chat_id,
+                file_path=value,
+                media_kind="image",
+                metadata=metadata,
+            )
+        return self._build_remote_output_file(value, alt_text, "image")
+
+    async def _build_local_output_file(
+        self,
+        *,
+        chat_id: str,
+        file_path: str,
+        media_kind: str,
+        file_name: Optional[str] = None,
+        metadata: Optional[Dict[str, Any]] = None,
+    ) -> Dict[str, Any]:
+        path = Path(file_path).expanduser()
+        if not path.is_file():
+            raise FileNotFoundError(file_path)
+        path = path.resolve()
+        resolved_name = _string_or(file_name, path.name, "file")
+        mime_type = mimetypes.guess_type(resolved_name)[0] or "application/octet-stream"
+        size = path.stat().st_size
+        sha256 = await asyncio.to_thread(self._sha256_file, path)
+        active_request_id = self._ledger_active_request_id(chat_id)
+        turn_id = self._ledger_turn_id(chat_id, active_request_id)
+        part_id = self._output_file_part_id(chat_id, resolved_name, sha256)
+
+        if self._ws is not None or self.artifact_upload_url:
+            uploaded = await self._upload_output_file(
+                chat_id=chat_id,
+                path=path,
+                file_name=resolved_name,
+                mime_type=mime_type,
+                sha256=sha256,
+                turn_id=turn_id,
+                active_request_id=active_request_id,
+                part_id=part_id,
+            )
+            if uploaded:
+                uploaded.setdefault("source_kind", "hermes_generated")
+                uploaded.setdefault("sha256", sha256)
+                uploaded["kind"] = media_kind
+                return uploaded
+
+        if size > self.inline_file_max_bytes:
+            raise ValueError(
+                f"{resolved_name} is {size} bytes, above inline limit {self.inline_file_max_bytes}; artifact upload is unavailable"
+            )
+
+        content = await asyncio.to_thread(path.read_bytes)
+        return {
+            "id": f"hermes-output:{sha256[:16]}",
+            "file_name": resolved_name,
+            "mime_type": mime_type,
+            "size": size,
+            "sha256": sha256,
+            "base64": base64.b64encode(content).decode("ascii"),
+            "source_kind": "hermes_generated",
+            "kind": media_kind,
+        }
+
+    def _build_remote_output_file(self, url: str, label: str, media_kind: str) -> Dict[str, Any]:
+        parsed = urlparse(url)
+        file_name = Path(unquote(parsed.path or "")).name or _string_or(label, "file")
+        mime_type = mimetypes.guess_type(file_name)[0] or "application/octet-stream"
+        digest = hashlib.sha256(url.encode("utf-8")).hexdigest()
+        return {
+            "id": f"hermes-output:{digest[:16]}",
+            "file_name": file_name,
+            "url": url,
+            "preview_url": url if media_kind == "image" else "",
+            "mime_type": mime_type,
+            "sha256": digest,
+            "source_kind": "hermes_remote",
+            "kind": media_kind,
+        }
+
+    async def _upload_output_file(
+        self,
+        *,
+        chat_id: str,
+        path: Path,
+        file_name: str,
+        mime_type: str,
+        sha256: str,
+        turn_id: str,
+        active_request_id: str,
+        part_id: str,
+    ) -> Optional[Dict[str, Any]]:
+        upload_url = self._artifact_upload_endpoint()
+        if not upload_url:
+            return None
+        try:
+            import aiohttp
+        except ImportError:
+            return None
+
+        owns_session = self._session is None or getattr(self._session, "closed", False)
+        session = self._session
+        if owns_session:
+            session = aiohttp.ClientSession()
+        try:
+            form = aiohttp.FormData()
+            form.add_field("agent_id", self.bot_id)
+            form.add_field("user_id", self._internal_chat_id(chat_id))
+            form.add_field("conversation_id", self._external_session_id(chat_id))
+            form.add_field("turn_id", turn_id)
+            form.add_field("active_request_id", active_request_id)
+            form.add_field("part_id", part_id)
+            form.add_field("logical_path", file_name)
+            with path.open("rb") as file_obj:
+                form.add_field("file", file_obj, filename=file_name, content_type=mime_type)
+                async with session.post(upload_url, data=form, headers=self._auth_headers()) as response:
+                    if response.status < 200 or response.status >= 300:
+                        logger.warning("53AIHub: artifact upload failed status=%s file=%s", response.status, file_name)
+                        return None
+                    body = await response.json(content_type=None)
+            return self._normalize_uploaded_output_file(body, fallback_name=file_name, fallback_mime=mime_type, fallback_sha256=sha256)
+        except Exception as exc:
+            logger.warning("53AIHub: artifact upload failed for %s: %s", file_name, exc)
+            return None
+        finally:
+            if owns_session and session is not None:
+                await session.close()
+
+    def _artifact_upload_endpoint(self) -> str:
+        explicit = _string_or(self.artifact_upload_url)
+        if explicit:
+            return explicit
+        parsed = urlparse(self.ws_url)
+        if parsed.scheme not in {"ws", "wss", "http", "https"} or not parsed.netloc:
+            return ""
+        scheme = "https" if parsed.scheme in {"wss", "https"} else "http"
+        path = parsed.path or ""
+        marker = "/v1/openclaw/ws"
+        if marker in path:
+            upload_path = path.split(marker, 1)[0] + "/v1/openclaw/artifacts"
+        else:
+            upload_path = "/api/v1/openclaw/artifacts"
+        return urlunparse((scheme, parsed.netloc, upload_path, "", "", ""))
+
+    def _normalize_uploaded_output_file(
+        self,
+        response_body: Any,
+        *,
+        fallback_name: str,
+        fallback_mime: str,
+        fallback_sha256: str,
+    ) -> Optional[Dict[str, Any]]:
+        body = _as_dict(response_body)
+        data = _as_dict(body.get("data")) or body
+        file_id = _string_or(data.get("id"), data.get("artifact_id"), data.get("upload_file_id"))
+        preview_url = _string_or(data.get("preview_url"), data.get("previewUrl"), data.get("url"))
+        download_url = _string_or(data.get("download_url"), data.get("downloadUrl"))
+        signed_download_url = _string_or(data.get("signed_download_url"), data.get("signedDownloadUrl"))
+        if not file_id and not preview_url and not download_url and not signed_download_url:
+            return None
+        result = {
+            "id": file_id or preview_url or download_url or signed_download_url,
+            "artifact_id": _string_or(data.get("artifact_id"), data.get("artifactId")),
+            "upload_file_id": _string_or(data.get("upload_file_id"), data.get("uploadFileId")),
+            "file_name": _string_or(data.get("file_name"), data.get("fileName"), fallback_name),
+            "mime_type": _string_or(data.get("mime_type"), data.get("mimeType"), fallback_mime),
+            "sha256": _string_or(data.get("sha256"), data.get("hash"), fallback_sha256),
+            "preview_key": _string_or(data.get("preview_key"), data.get("previewKey")),
+            "preview_url": preview_url,
+            "url": _string_or(data.get("url"), preview_url, download_url, signed_download_url),
+            "download_url": download_url,
+            "signed_download_url": signed_download_url,
+            "source_kind": _string_or(data.get("source_kind"), data.get("sourceKind"), "openclaw_artifact"),
+        }
+        size = _int_or(data.get("size"), 0)
+        if size > 0:
+            result["size"] = size
+        return {key: value for key, value in result.items() if value is not None and value != ""}
+
+    async def _send_output_files_step(
+        self,
+        chat_id: str,
+        files: List[Dict[str, Any]],
+        *,
+        caption: Optional[str],
+    ) -> SendResult:
+        if not files:
+            return SendResult(success=False, error="No files to deliver")
+        req_id = await self._req_id_for(chat_id)
+        session_id = self._external_session_id(chat_id)
+        active_request_id = self._ledger_active_request_id(chat_id)
+        turn_id = self._ledger_turn_id(chat_id, active_request_id)
+        step_id = f"process:{uuid.uuid4()}"
+        message = _string_or(caption, f"生成了 {len(files)} 个文件")
+        timeline = self._build_output_files_timeline(chat_id, files, turn_id)
+        process_step = {
+            "step_code": "output_files",
+            "name": "生成文件",
+            "status": "completed",
+            "message": message,
+            "data": {
+                "files": [self._frame_output_file(file) for file in files],
+                "contract_version": "v1",
+                "openclaw_timeline": timeline,
+                "media_attachments": self._media_attachments_for(files),
+                "media_contract_version": "v1",
+            },
+            "timestamp": _now_unix(),
+        }
+        event = await self._record_event(chat_id, "process.step", {
+            "message_id": step_id,
+            "content": message,
+            "process_step": process_step,
+        })
+        ledger = _as_dict(_as_dict(event.get("payload")).get("openclaw_ledger"))
+        frame_process_step = copy.deepcopy(process_step)
+        if ledger:
+            frame_process_step["data"]["openclaw_ledger"] = ledger
+        frame = {
+            "req_id": req_id,
+            "action": "chat",
+            "status": "streaming",
+            "data": {
+                "id": step_id,
+                "object": "process.step",
+                "created": _now_unix(),
+                "model": MODEL_NAME,
+                "status": "streaming",
+                "session_id": session_id,
+                "conversation_id": session_id,
+                "process_step": frame_process_step,
+            },
+        }
+        await self._send_or_queue(frame)
+        return SendResult(success=True, message_id=step_id)
+
+    def _frame_output_file(self, file: Dict[str, Any]) -> Dict[str, Any]:
+        return {key: value for key, value in file.items() if key != "kind" and value is not None and value != ""}
+
+    def _media_attachments_for(self, files: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
+        attachments: List[Dict[str, Any]] = []
+        for file in files:
+            attachment = {
+                key: value
+                for key, value in self._frame_output_file(file).items()
+                if key not in {"base64", "content"}
+            }
+            attachment["kind"] = self._media_kind_for_output_file(file)
+            attachments.append(attachment)
+        return attachments
+
+    def _build_output_files_timeline(self, chat_id: str, files: List[Dict[str, Any]], turn_id: str) -> Dict[str, Any]:
+        file_key = ",".join(sorted(
+            _string_or(file.get("id"), file.get("sha256"), file.get("url"), file.get("file_name"))
+            for file in files
+        ))
+        safe_key = re.sub(r"[^A-Za-z0-9_.:-]+", "_", file_key)[:160] or "generated"
+        return {
+            "protocol_version": "openclaw.timeline.v2",
+            "turn_id": turn_id,
+            "segment_id": f"{turn_id}:output_files:{safe_key}",
+            "segment_type": "output_files",
+            "segment_index": 0,
+            "delta_index": max(self._seq + 1, 1),
+            "operation": "replace",
+            "visibility": "final",
+            "final": True,
+        }
+
+    def _media_kind_for_output_file(self, file: Dict[str, Any]) -> str:
+        explicit = _string_or(file.get("kind"))
+        if explicit in {"image", "audio", "video", "text", "file"}:
+            return explicit
+        mime_type = _string_or(file.get("mime_type")).lower()
+        file_name = _string_or(file.get("file_name")).lower()
+        if mime_type.startswith("image/"):
+            return "image"
+        if mime_type.startswith("audio/"):
+            return "audio"
+        if mime_type.startswith("video/"):
+            return "video"
+        if mime_type.startswith("text/") or file_name.endswith((".md", ".json", ".csv", ".tsv", ".txt", ".html", ".css", ".js", ".ts", ".py")):
+            return "text"
+        return "file"
+
+    def _ledger_turn_id(self, chat_id: str, active_request_id: Optional[str] = None) -> str:
+        request_id = _string_or(active_request_id, self._ledger_active_request_id(chat_id))
+        return f"{self._external_session_id(chat_id)}:turn:{request_id}"
+
+    def _output_file_part_id(self, chat_id: str, file_name: str, sha256: str) -> str:
+        safe_name = re.sub(r"[^A-Za-z0-9_.:-]+", "_", file_name or "file")
+        return f"{self._ledger_turn_id(chat_id)}:output_file:{sha256[:16]}:{safe_name}"
+
+    def _sha256_file(self, path: Path) -> str:
+        digest = hashlib.sha256()
+        with path.open("rb") as file_obj:
+            for chunk in iter(lambda: file_obj.read(1024 * 1024), b""):
+                digest.update(chunk)
+        return digest.hexdigest()
 
     async def _send_app_ping(self) -> None:
         await self._send_raw(json.dumps({"action": "ping", "data": {"botId": self.bot_id}}, ensure_ascii=False))
@@ -807,16 +1307,26 @@ class Hermes53AIHubAdapter(BasePlatformAdapter):
         async with self._state_lock:
             self._seq += 1
             session_id = self._external_session_id(chat_id)
+            event_id = f"{chat_id}:event:{self._seq}"
+            created_at = _now_iso()
+            event_payload = self._payload_with_openclaw_ledger(
+                chat_id,
+                kind,
+                payload,
+                self._seq,
+                event_id,
+                created_at,
+            )
             event = {
-                "id": f"{chat_id}:event:{self._seq}",
+                "id": event_id,
                 "sessionId": session_id,
                 "session_id": session_id,
                 "chat_id": chat_id,
                 "seq": self._seq,
                 "kind": kind,
-                "payload": payload,
-                "createdAt": _now_iso(),
-                "created_at": _now_iso(),
+                "payload": event_payload,
+                "createdAt": created_at,
+                "created_at": created_at,
             }
             events_by_chat = _as_dict(self._state.setdefault("events", {}))
             events = list(_as_list(events_by_chat.get(chat_id)))
@@ -824,6 +1334,156 @@ class Hermes53AIHubAdapter(BasePlatformAdapter):
             events_by_chat[chat_id] = events
         await self._persist_state()
         return event
+
+    def _payload_with_openclaw_ledger(
+        self,
+        chat_id: str,
+        kind: str,
+        payload: Dict[str, Any],
+        seq: int,
+        event_id: str,
+        created_at: str,
+    ) -> Dict[str, Any]:
+        next_payload = dict(_as_dict(payload))
+        if _as_dict(next_payload.get("openclaw_ledger")).get("protocol_version") == "openclaw.ledger.v1":
+            return next_payload
+        ledger = self._build_openclaw_ledger_event(chat_id, kind, next_payload, seq, event_id, created_at)
+        if ledger is not None:
+            next_payload["openclaw_ledger"] = ledger
+        return next_payload
+
+    def _build_openclaw_ledger_event(
+        self,
+        chat_id: str,
+        kind: str,
+        payload: Dict[str, Any],
+        seq: int,
+        event_id: str,
+        created_at: str,
+    ) -> Optional[Dict[str, Any]]:
+        session_id = self._external_session_id(chat_id)
+        active_request_id = self._ledger_active_request_id(chat_id)
+        turn_id = f"{session_id}:turn:{active_request_id}"
+        content = _string_or(payload.get("content"), payload.get("message"), payload.get("text"))
+        message_id = _string_or(
+            payload.get("message_id"),
+            payload.get("messageId"),
+            payload.get("status_key"),
+            _as_dict(payload.get("data")).get("toolCallId"),
+            event_id,
+        )
+        source_kind = self._source_kind_for_event(kind)
+        ledger_payload = {key: value for key, value in payload.items() if key != "openclaw_ledger"}
+        ledger_payload.setdefault("source_kind", source_kind)
+
+        part_type = "status"
+        event_type = "part.replace"
+        operation = "replace"
+        visibility = "hidden"
+        terminal_status: Optional[str] = None
+        text: Optional[str] = content
+
+        if kind == "user.message":
+            part_type = "status"
+            event_type = "turn.started"
+            operation = "noop"
+            visibility = "hidden"
+            terminal_status = "running"
+            text = None
+        elif kind == "assistant.thinking":
+            part_type = "thinking"
+            event_type = "part.replace"
+            operation = "replace"
+            visibility = "stream"
+        elif kind in {"tool.call", "tool.result"}:
+            part_type = "tool"
+            event_type = "part.replace" if kind == "tool.call" else "part.done"
+            operation = "replace"
+            visibility = "stream"
+        elif kind == "process.step" and _as_dict(payload.get("process_step")).get("step_code") == "output_files":
+            part_type = "output_file"
+            event_type = "part.done"
+            operation = "replace"
+            visibility = "final"
+            text = _string_or(content, _as_dict(payload.get("process_step")).get("message"))
+        elif kind == "assistant.delta":
+            part_type = "answer"
+            event_type = "part.delta"
+            operation = "append"
+            visibility = "stream"
+        elif kind == "run.completed":
+            part_type = "answer"
+            event_type = "part.replace"
+            operation = "replace"
+            visibility = "final"
+            terminal_status = "completed"
+        elif kind == "run.failed":
+            part_type = "answer"
+            event_type = "part.replace"
+            operation = "replace"
+            visibility = "final"
+            terminal_status = "failed"
+        elif kind == "run.interrupted":
+            part_type = "status"
+            event_type = "turn.interrupted"
+            operation = "close"
+            visibility = "hidden"
+            terminal_status = "interrupted"
+            text = None
+
+        safe_message_id = re.sub(r"[^A-Za-z0-9_.:-]+", "_", message_id or event_id)
+        part_id = f"{turn_id}:{part_type}:{safe_message_id}"
+        return {
+            "protocol_version": "openclaw.ledger.v1",
+            "seq": seq,
+            "session_id": session_id,
+            "conversation_id": session_id,
+            "turn_id": turn_id,
+            "run_id": active_request_id,
+            "active_request_id": active_request_id,
+            "part_id": part_id,
+            "part_type": part_type,
+            "event_type": event_type,
+            "operation": operation,
+            "visibility": visibility,
+            **({"text": text} if text is not None else {}),
+            "payload": ledger_payload,
+            **({"terminal_status": terminal_status} if terminal_status else {}),
+            "created_at": created_at,
+            "raw_event_ref": event_id,
+        }
+
+    def _event_kind_for_chunk_status(self, status: str, event_kind: str = "") -> str:
+        if event_kind:
+            return event_kind
+        if status == "thinking":
+            return "assistant.thinking"
+        if status == "done":
+            return "run.completed"
+        if status == "error":
+            return "run.failed"
+        return "assistant.delta"
+
+    def _source_kind_for_event(self, kind: str) -> str:
+        return {
+            "user.message": "hermes.user",
+            "assistant.thinking": "hermes.thinking",
+            "tool.call": "hermes.tool_call",
+            "tool.result": "hermes.tool_result",
+            "process.step": "hermes.output_files",
+            "run.completed": "hermes.final",
+            "run.failed": "hermes.error",
+            "run.interrupted": "hermes.interrupted",
+            "assistant.delta": "hermes.delta",
+        }.get(kind, f"hermes.{kind.replace('.', '_')}")
+
+    def _ledger_active_request_id(self, chat_id: str) -> str:
+        conversations = _as_dict(self._state.get("conversations"))
+        for key in self._chat_state_keys(chat_id):
+            req_id = _string_or(_as_dict(conversations.get(key)).get("reqId"))
+            if req_id:
+                return req_id
+        return self._internal_chat_id(chat_id) or str(uuid.uuid4())
 
     async def _set_conversation_status(self, chat_id: str, status: str) -> None:
         async with self._state_lock:
@@ -915,6 +1575,74 @@ class Hermes53AIHubAdapter(BasePlatformAdapter):
                     seen.add(dedupe_key)
                     events.append(item)
         return [event for event in events if int(event.get("seq", 0)) > after_seq]
+
+    async def _ledger_events_for(self, chat_id: str, after_seq: int) -> List[Dict[str, Any]]:
+        events = await self._events_for(chat_id, 0)
+        ledger_events: List[Dict[str, Any]] = []
+        seen: set[str] = set()
+        for event in events:
+            payload = _as_dict(event.get("payload"))
+            ledger = _as_dict(payload.get("openclaw_ledger"))
+            if ledger.get("protocol_version") != "openclaw.ledger.v1":
+                continue
+            seq = int(ledger.get("seq") or event.get("seq") or 0)
+            if seq <= after_seq:
+                continue
+            dedupe_key = _string_or(
+                ledger.get("raw_event_ref"),
+                f"{ledger.get('session_id')}:{seq}:{ledger.get('turn_id')}:{ledger.get('part_id')}:{ledger.get('event_type')}",
+            )
+            if dedupe_key in seen:
+                continue
+            seen.add(dedupe_key)
+            ledger_events.append(ledger)
+        return sorted(ledger_events, key=lambda item: (int(item.get("seq") or 0), _string_or(item.get("part_id"))))
+
+    async def _session_snapshot(self, chat_id: str, after_seq: int) -> Dict[str, Any]:
+        all_ledger_events = await self._ledger_events_for(chat_id, 0)
+        delta_ledger_events = [event for event in all_ledger_events if int(event.get("seq") or 0) > after_seq]
+        last_seq = max((int(event.get("seq") or 0) for event in all_ledger_events), default=0)
+        session_id = self._external_session_id(chat_id)
+        return {
+            "session_id": session_id,
+            "conversation_id": session_id,
+            "last_seq": last_seq,
+            "active_turns": self._active_turns_from_ledger_events(all_ledger_events),
+            "recent_events": all_ledger_events[-100:],
+            "ledger_events": delta_ledger_events,
+            "ledgerEvents": delta_ledger_events,
+        }
+
+    def _active_turns_from_ledger_events(self, ledger_events: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
+        turns: Dict[str, Dict[str, Any]] = {}
+        for event in ledger_events:
+            turn_id = _string_or(event.get("turn_id"))
+            if not turn_id:
+                continue
+            seq = int(event.get("seq") or 0)
+            turn = turns.setdefault(turn_id, {
+                "turn_id": turn_id,
+                "run_id": _string_or(event.get("run_id")),
+                "active_request_id": _string_or(event.get("active_request_id")),
+                "status": "running",
+                "last_seq": 0,
+                "part_ids": [],
+            })
+            if _string_or(event.get("run_id")):
+                turn["run_id"] = _string_or(event.get("run_id"))
+            if _string_or(event.get("active_request_id")):
+                turn["active_request_id"] = _string_or(event.get("active_request_id"))
+            terminal_status = _string_or(event.get("terminal_status"))
+            if terminal_status:
+                turn["status"] = terminal_status
+            turn["last_seq"] = max(int(turn.get("last_seq") or 0), seq)
+            part_id = _string_or(event.get("part_id"))
+            if part_id and part_id not in turn["part_ids"]:
+                turn["part_ids"].append(part_id)
+        return [
+            turn for turn in sorted(turns.values(), key=lambda item: int(item.get("last_seq") or 0))
+            if turn.get("status") == "running"
+        ]
 
     async def _req_id_for(self, chat_id: str) -> str:
         async with self._state_lock:
@@ -1081,12 +1809,24 @@ class Hermes53AIHubAdapter(BasePlatformAdapter):
             chat_id,
         ))
         session_id = self._external_session_id(internal_chat_id)
+        seq = int(record.get("seq") or 0)
+        event_id = _string_or(record.get("id"), f"{internal_chat_id}:event:{seq}")
+        created_at = _string_or(record.get("createdAt"), record.get("created_at"), _now_iso())
+        payload = self._payload_with_openclaw_ledger(
+            internal_chat_id,
+            _string_or(record.get("kind")),
+            _as_dict(record.get("payload")),
+            seq,
+            event_id,
+            created_at,
+        )
         return {
             **record,
             "sessionId": session_id,
             "session_id": session_id,
             "conversation_id": session_id,
             "chat_id": internal_chat_id,
+            "payload": payload,
         }
 
     def _external_session_id(self, chat_id: str) -> str:

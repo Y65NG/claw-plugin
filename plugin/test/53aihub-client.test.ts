@@ -7772,7 +7772,8 @@ describe("53AIHub client", () => {
       );
 
       await waitFor(() => {
-        expect(frameByReq(server.frames, "rpc-assistant-boundary")).toMatchObject({
+        const assistantBoundaryFrame = frameByReq(server.frames, "rpc-assistant-boundary");
+        expect(assistantBoundaryFrame).toMatchObject({
           action: "sessions.messages",
           status: "done",
           data: {
@@ -7780,9 +7781,10 @@ describe("53AIHub client", () => {
               { id: "u1", content: "first question" },
               { id: "a1", content: "first answer" }
             ],
-            pagination: { limit: 1, offset: 2, total: 4, hasMore: true, nextOffset: 3 }
+            pagination: { limit: 1, offset: 2, total: 4, hasMore: false }
           }
         });
+        expect(assistantBoundaryFrame?.data?.pagination?.nextOffset).toBeUndefined();
         expect(frameByReq(server.frames, "rpc-user-boundary")).toMatchObject({
           action: "sessions.messages",
           status: "done",
@@ -7794,6 +7796,107 @@ describe("53AIHub client", () => {
             pagination: { limit: 1, offset: 1, total: 4, hasMore: true, nextOffset: 2 }
           }
         });
+      });
+    } finally {
+      await bridge.stop();
+    }
+  });
+
+  it("advances sessions.messages pagination past expanded turn-boundary pages", async () => {
+    const stateDir = await mkdtemp(join(tmpdir(), "claw-53aihub-rpc-message-turn-cursor-"));
+    cleanupPaths.push(stateDir);
+
+    const server = await createFakeHubServer();
+    cleanupServers.push(server.close);
+    const gateway = new FakeGateway();
+    gateway.messagesBySession.set("session-1", [
+      { id: "u1", sessionId: "session-1", role: "user", content: "first question", createdAt: "2026-06-18T08:00:00.000Z" },
+      { id: "a1", sessionId: "session-1", role: "assistant", content: "first answer", createdAt: "2026-06-18T08:00:01.000Z" },
+      { id: "u2", sessionId: "session-1", role: "user", content: "second question", createdAt: "2026-06-18T08:01:00.000Z" },
+      { id: "a2", sessionId: "session-1", role: "assistant", content: "second answer", createdAt: "2026-06-18T08:01:01.000Z" }
+    ]);
+
+    const bridge = createHub53AIBridge({
+      stateDir,
+      config: {
+        enabled: true,
+        botId: "bot-123",
+        secret: "sk-secret",
+        wsUrl: server.url,
+        accessPolicy: "open",
+        allowFrom: [],
+        sendThinkingMessage: false,
+        reconnectBaseMs: 20,
+        maxReconnectAttempts: 2
+      },
+      gateway,
+      callbacks: {
+        onSessionUpsert: async (session) => {
+          gateway.upsertSession(session);
+        },
+        onUserMessage: async () => undefined,
+        onSessionStatus: async () => undefined,
+        onEnsureSessionStream: async () => undefined,
+        listSessionEvents: () => [],
+        getLastEventSeq: () => 0,
+        onStatusChange: () => undefined
+      }
+    });
+
+    await bridge.start();
+    try {
+      const connection = await server.connected;
+      connection.socket.send(
+        JSON.stringify({
+          req_id: "rpc-latest-page",
+          action: "sessions.messages",
+          status: "request",
+          data: { session_id: "session-1", limit: 1, offset: 0 }
+        })
+      );
+
+      let latestFrame: ReturnType<typeof frameByReq> | undefined;
+      await waitFor(() => {
+        latestFrame = frameByReq(server.frames, "rpc-latest-page");
+        expect(latestFrame).toMatchObject({
+          action: "sessions.messages",
+          status: "done",
+          data: {
+            messages: [
+              { id: "u2", content: "second question" },
+              { id: "a2", content: "second answer" }
+            ],
+            pagination: { limit: 1, offset: 0, total: 4, hasMore: true, nextOffset: 2 }
+          }
+        });
+      });
+
+      connection.socket.send(
+        JSON.stringify({
+          req_id: "rpc-next-page",
+          action: "sessions.messages",
+          status: "request",
+          data: { session_id: "session-1", limit: 1, offset: latestFrame?.data?.pagination?.nextOffset }
+        })
+      );
+
+      await waitFor(() => {
+        const nextFrame = frameByReq(server.frames, "rpc-next-page");
+        expect(nextFrame).toMatchObject({
+          action: "sessions.messages",
+          status: "done",
+          data: {
+            messages: [
+              { id: "u1", content: "first question" },
+              { id: "a1", content: "first answer" }
+            ],
+            pagination: { limit: 1, offset: 2, total: 4, hasMore: false }
+          }
+        });
+        expect(nextFrame?.data?.pagination?.nextOffset).toBeUndefined();
+        const latestIds = new Set((latestFrame?.data?.messages ?? []).map((message: SessionMessage) => message.id));
+        const nextIds = (nextFrame?.data?.messages ?? []).map((message: SessionMessage) => message.id);
+        expect(nextIds.filter((id: string) => latestIds.has(id))).toEqual([]);
       });
     } finally {
       await bridge.stop();

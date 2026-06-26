@@ -754,11 +754,18 @@ export function createHub53AIBridge(input: HubBridgeInput) {
         ? await Promise.resolve(input.callbacks.listSessionMessages(sessionId)).catch(() => [])
         : [];
       const rawPageMessages = sliceLatestWindowPage(messages, pagination.limit, pagination.offset);
+      const boundaryPage = sliceLatestWindowPageWithTurnBoundary(messages, pagination.limit, pagination.offset);
       const pageMessages = mergeHubUserMessageMetadata(
-        sliceLatestWindowPageWithTurnBoundary(messages, pagination.limit, pagination.offset),
+        boundaryPage.items,
         Array.isArray(localMessages) ? localMessages : []
       );
-      const total = messages.length >= fetchLimit ? requestedFetchLimit + 1 : messages.length;
+      const nextOffset = Math.max(
+        pagination.offset + rawPageMessages.length,
+        messages.length - boundaryPage.start
+      );
+      const total = messages.length >= fetchLimit
+        ? Math.max(requestedFetchLimit + 1, nextOffset + 1)
+        : messages.length;
       await ensureCanonicalLedgerBackfill(sessionId);
       const ledgerEvents = listCanonicalLedgerEventsForMessagePage(sessionId, pageMessages, 0, pagination);
       const events = listCanonicalTimelineEventsForLedgerEvents(sessionId, ledgerEvents);
@@ -767,7 +774,7 @@ export function createHub53AIBridge(input: HubBridgeInput) {
         events,
         ledger_events: ledgerEvents,
         ledgerEvents,
-        pagination: buildPagination(pagination.limit, pagination.offset, total, rawPageMessages.length)
+        pagination: buildPaginationWithNextOffset(pagination.limit, pagination.offset, total, nextOffset)
       };
     }
 
@@ -7266,13 +7273,18 @@ function clampNonNegativeInteger(value: unknown, fallback: number): number {
 
 function buildPagination(limit: number, offset: number, total: number, pageSize: number) {
   const nextOffset = offset + pageSize;
-  const hasMore = nextOffset < total;
+  return buildPaginationWithNextOffset(limit, offset, total, nextOffset);
+}
+
+function buildPaginationWithNextOffset(limit: number, offset: number, total: number, nextOffset: number) {
+  const safeNextOffset = Math.max(offset, nextOffset);
+  const hasMore = safeNextOffset < total;
   return {
     limit,
     offset,
     total,
     hasMore,
-    ...(hasMore ? { nextOffset } : {})
+    ...(hasMore ? { nextOffset: safeNextOffset } : {})
   };
 }
 
@@ -7282,15 +7294,21 @@ function getLatestWindowPageBounds<T>(items: T[], limit: number, offset: number)
   return { start, end };
 }
 
+type LatestWindowPage<T> = {
+  items: T[];
+  start: number;
+  end: number;
+};
+
 export function sliceLatestWindowPage<T>(items: T[], limit: number, offset: number): T[] {
   const { start, end } = getLatestWindowPageBounds(items, limit, offset);
   return items.slice(start, end);
 }
 
-function sliceLatestWindowPageWithTurnBoundary(items: SessionMessage[], limit: number, offset: number): SessionMessage[] {
+function sliceLatestWindowPageWithTurnBoundary(items: SessionMessage[], limit: number, offset: number): LatestWindowPage<SessionMessage> {
   const { start, end } = getLatestWindowPageBounds(items, limit, offset);
   if (start >= end) {
-    return [];
+    return { items: [], start, end };
   }
 
   let expandedStart = start;
@@ -7313,7 +7331,11 @@ function sliceLatestWindowPageWithTurnBoundary(items: SessionMessage[], limit: n
     }
   }
 
-  return items.slice(expandedStart, expandedEnd);
+  return {
+    items: items.slice(expandedStart, expandedEnd),
+    start: expandedStart,
+    end: expandedEnd
+  };
 }
 
 function findPreviousTurnUserIndex(items: SessionMessage[], assistantIndex: number): number {
